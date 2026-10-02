@@ -1,5 +1,16 @@
 """
-family_router.py — Routes a symbol to its correct family module.
+signals/router.py — Routes a symbol to its correct family module.
+
+REV 19.18 (2026-10-02) — DOCSTRING PATH + LOG PREFIX FIX:
+  ✅ Top docstring was `family_router.py` (legacy name from before
+     the folder/file rename). Actual path is `signals/router.py`.
+  ✅ Fixed internal reference `families/base.py` → `signals/base.py`.
+  ✅ Log prefixes `[family_router]` → `[router]` for consistency
+     with the module's actual name. Zero behaviour change — the
+     prefix is only used in diagnostic prints.
+  ✅ Fixed ARCHITECTURE note: `family_router only maps...` →
+     `router only maps...`.
+  ✅ Zero code change.
 
 REV 19.17 (2026-09-28) — DYNAMIC ROUTING REVERTED (CRITICAL FIX):
   ✅ Reverted _resolve() to static get_family() routing.
@@ -20,7 +31,7 @@ REV 19.17 (2026-09-28) — DYNAMIC ROUTING REVERTED (CRITICAL FIX):
 
      get_family_dynamic() remains available in coins_config.py for
      future use, but is NOT consumed by the router. To re-enable,
-     ALSO fix the is_family_coin guard in families/base.py to
+     ALSO fix the is_family_coin guard in signals/base.py to
      accept dynamically-routed symbols (or remove the guard).
 
 REV 19.16 (2026-09-28) — DYNAMIC FAMILY ROUTING. [superseded]
@@ -29,7 +40,7 @@ REV 19.14 (2026-09-25) — IDIOMATIC IMPORT.
 REV 19.12 (2026-09-25) — HARDENING PASS.
 
 ARCHITECTURE:
-  family_router only maps family-STRING → family-MODULE.
+  router only maps family-STRING → family-MODULE.
   Coin → family mapping lives in coins/*.py and is read at runtime
   via coins_config.get_family(symbol).
 
@@ -89,7 +100,7 @@ def _safe_import(modname: str):
         return importlib.import_module(modname)
     except Exception as e:
         _IMPORT_ERRORS[modname] = f"{type(e).__name__}: {e}"
-        print(f"[family_router] WARNING: failed to import {modname}: {e}")
+        print(f"[router] WARNING: failed to import {modname}: {e}")
         return None
 
 
@@ -159,7 +170,7 @@ def _resolve(symbol: str) -> tuple[str, object | None]:
         try:
             family_name = get_family(symbol)
         except Exception as e:
-            print(f"[family_router] get_family({symbol!r}) raised: "
+            print(f"[router] get_family({symbol!r}) raised: "
                   f"{type(e).__name__}: {e}")
             family_name = DEFAULT_FAMILY
     else:
@@ -283,10 +294,10 @@ def generate_signal_live(ind_1h, ind_4h, ind_1d=None,
             mode=mode,
         )
     except AttributeError as e:
-        print(f"[ROUTER] {mod_name} missing generate_signal_live: {e}")
+        print(f"[router] {mod_name} missing generate_signal_live: {e}")
         return "NEUTRAL", 0.0, [f"router_error_{mod_name}"], empty_lvl, "NONE"
     except Exception as e:
-        print(f"[ROUTER] {mod_name} raised {type(e).__name__}: {e}")
+        print(f"[router] {mod_name} raised {type(e).__name__}: {e}")
         return "NEUTRAL", 0.0, [f"router_exception_{type(e).__name__}"], empty_lvl, "NONE"
 
 
@@ -309,7 +320,7 @@ def route_signal(ind_1h, ind_4h, ind_1d=None,
             profile=profile, symbol=symbol, mode=mode,
         )
     except Exception as e:
-        print(f"[ROUTER] route_signal error for {symbol}: "
+        print(f"[router] route_signal error for {symbol}: "
               f"{type(e).__name__}: {e}")
         return None
 
@@ -334,7 +345,7 @@ if __name__ == "__main__":
     from core.coins_config import enabled_coins, all_coins
 
     print("=" * 70)
-    print("  FAMILY ROUTER DIAGNOSTIC  (static — no hardcoded coins)")
+    print("  ROUTER DIAGNOSTIC  (static — no hardcoded coins)")
     print("=" * 70)
 
     # ── 0. Import errors ──

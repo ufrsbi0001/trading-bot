@@ -1,5 +1,11 @@
 """
-families/base.py — Shared signal-engine core for all 4 families.
+signals/base.py — Shared signal-engine core for all 4 families.
+
+REV 23.5 (2026-10-02) — DOCSTRING PATH FIX:
+  ✅ Top docstring was `families/base.py` (legacy path from before
+     the folder rename). Actual path is `signals/base.py`. Fixed
+     for consistency with the rest of the codebase.
+  ✅ Zero code change.
 
 REV 23.4 (2026-10-02) — LIVE CONFIG READS + DEAD IMPORT CLEANUP:
   ✅ Removed dead `from core.config import CONFIG` import — never

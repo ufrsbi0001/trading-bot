@@ -1,5 +1,19 @@
 """
-coins_config.py — Wrapper around coins/ directory.
+core/coins_config.py — Wrapper around coins/ directory.
+
+REV 23.1 (2026-10-02) — FALLBACK VALUE ALIGNMENT:
+  ✅ Emergency fallback values (used only when `config_center` import
+     fails — practically never) now match `config_center.GLOBAL`
+     defaults:
+       • ST_PARAMS fallback: sl_atr=1.8, tp1_atr=2.5, tp2_atr=5.0
+         (was stale 2.5 / 3.75 / 6.25)
+       • CAPS fallback: sl=0.045, tp1=0.0675, tp2=0.125
+         (matches trend_coins, the DEFAULT_FAMILY)
+       • `get_caps()` fallback aligned to same values
+       • `get_coin_st_params()` fallback aligned to same values
+     Prevents silent behavior drift in the pathological case where
+     config_center fails to import.
+  ✅ Zero behaviour change for the normal path (config_center available).
 
 REV 23.0 (2026-10-02) — UNIFIED CONFIG SOURCE:
   ✅ Migrated from core/family_baselines.py → core/config_center.py.
@@ -7,20 +21,7 @@ REV 23.0 (2026-10-02) — UNIFIED CONFIG SOURCE:
      multipliers now come from config_center.py — the single source
      of truth for the entire system.
 
-     Changed:
-       • Top import block: family_baselines → config_center
-     
-     Unchanged:
-       • get_caps()            → reads baseline CAPS
-       • get_coin_filters()    → reads baseline FILTERS
-       • get_coin_st_params()  → reads baseline ST_PARAMS
-       • get_vol_class_mult()  → reads VOL_CLASS_CAP_MULT
-       • All other accessors
-
-REV 22.0 (2026-10-02) — FAMILY-LEVEL BASELINES:
-  ✅ Config now comes from core/family_baselines.py.
-     Coin files are IDENTITY-ONLY.
-
+REV 22.0 (2026-10-02) — FAMILY-LEVEL BASELINES.
 REV 21.7 (2026-09-30) — FALLBACK RR FIX.
 REV 19.16 (2026-09-29) — DEAD DYNAMIC ROUTING REMOVED.
 REV 19.14 (2026-09-26) — GET_CAPS() FALLBACK RATIO FIX.
@@ -32,6 +33,7 @@ from __future__ import annotations
 from coins import get_coin, all_coins, load_errors as _coin_load_errors
 
 # ── REV 23.0 — Unified config source (single source of truth) ──
+# ── REV 23.1 — Fallback values aligned to config_center.GLOBAL defaults ──
 try:
     from core.config_center import (
         get_baseline as _get_family_baseline,
@@ -39,14 +41,23 @@ try:
         VOL_CLASS_CAP_MULT as _VOL_CLASS_CAP_MULT,
     )
 except ImportError:
-    def _get_family_baseline(family):  # pragma: no cover — fallback
+    # ── EMERGENCY FALLBACK ONLY ──
+    # Values mirror core/config_center.GLOBAL / FAMILY[trend_coins].
+    # This block should NEVER execute in practice — config_center is
+    # a core dependency. Kept for defensive import safety.
+    _FALLBACK_ST_PARAMS = {"sl_atr": 1.8, "tp1_atr": 2.5, "tp2_atr": 5.0}
+    _FALLBACK_CAPS      = {"sl": 0.045, "tp1": 0.0675, "tp2": 0.125}
+
+    def _get_family_baseline(family):  # pragma: no cover
         return {
-            "ST_PARAMS": {"sl_atr": 2.5, "tp1_atr": 3.75, "tp2_atr": 6.25},
-            "CAPS":      {"sl": 0.045, "tp1": 0.0675, "tp2": 0.1125},
+            "ST_PARAMS": dict(_FALLBACK_ST_PARAMS),
+            "CAPS":      dict(_FALLBACK_CAPS),
             "FILTERS":   {},
         }
+
     def _get_vol_class_mult(vcls):  # pragma: no cover
         return 1.0
+
     _VOL_CLASS_CAP_MULT = {"LOW": 1.0, "MED": 1.0, "HIGH": 1.0}
 
 
@@ -136,13 +147,16 @@ def get_caps(symbol: str) -> dict:
     Note: caps are the MAX allowed distances. Actual SL/TP are
     computed by strategy functions (using ATR × st_params), then
     clamped to these caps.
+
+    REV 23.1 — Emergency fallback aligned to trend_coins CAPS
+    (matches config_center.FAMILY[DEFAULT_FAMILY]["CAPS"]).
     """
     try:
         family = get_family(symbol)
         baseline = _get_family_baseline(family)
         return dict(baseline["CAPS"])
     except Exception:
-        return {"sl": 0.045, "tp1": 0.0675, "tp2": 0.1125}
+        return {"sl": 0.045, "tp1": 0.0675, "tp2": 0.125}
 
 
 def get_coin_filters(symbol: str) -> dict:
@@ -171,13 +185,16 @@ def get_coin_st_params(symbol: str) -> dict:
 
     Returns {sl_atr, tp1_atr, tp2_atr} — the ATR multipliers for
     SL and TP distances. Actual distances computed as ATR × multiplier.
+
+    REV 23.1 — Emergency fallback aligned to config_center.GLOBAL
+    defaults (sl_atr=1.8, tp1_atr=2.5, tp2_atr=5.0).
     """
     try:
         family = get_family(symbol)
         baseline = _get_family_baseline(family)
         return dict(baseline["ST_PARAMS"])
     except Exception:
-        return {"sl_atr": 2.5, "tp1_atr": 3.75, "tp2_atr": 6.25}
+        return {"sl_atr": 1.8, "tp1_atr": 2.5, "tp2_atr": 5.0}
 
 
 def get_vol_class_mult(vol_class: str) -> float:
@@ -264,11 +281,11 @@ def known_families() -> list[str]:
 
 
 # ═══════════════════════════════════════════════════════════
-#  DIAGNOSTIC — REV 23.0
+#  DIAGNOSTIC — REV 23.1
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print("=" * 70)
-    print("  COINS_CONFIG DIAGNOSTIC — REV 23.0 (unified config)")
+    print("  COINS_CONFIG DIAGNOSTIC — REV 23.1 (unified config)")
     print("=" * 70)
 
     errs = load_errors()
@@ -300,7 +317,7 @@ if __name__ == "__main__":
 
     # ── REV 23.0 — Baseline preview ──
     print("\n" + "=" * 70)
-    print("  FAMILY BASELINE PREVIEW (REV 23.0 — from config_center)")
+    print("  FAMILY BASELINE PREVIEW (REV 23.1 — from config_center)")
     print("=" * 70)
     for fam in fams:
         baseline = _get_family_baseline(fam)
