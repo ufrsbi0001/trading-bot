@@ -1,0 +1,72 @@
+# ─── Secrets — NEVER upload ─────────────────────
+.env
+.env.local
+.env.*.local
+
+# ─── Python ─────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ─── Virtual Environments ───────────────────────
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ─── Runtime Data (contains live positions) ─────
+data/*.json
+data/Logs/
+data/*.csv
+unmanaged_positions.json
+*.log
+*.log.*
+
+# ─── Backups ────────────────────────────────────
+Bot_backup_*/
+coins_backup_*/
+backup_*/
+*.bak
+*.backup
+
+# ─── IDE ────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-*
+
+# ─── OS ─────────────────────────────────────────
+Thumbs.db
+.DS_Store
+desktop.ini
+$RECYCLE.BIN/
+
+# ─── Temporary / Migration Scripts ──────────────
+tree.txt
+structure.txt
+test_config.py
+fix_corruption.py
+
+# ─── Keep these (override patterns above) ───────
+!data/.gitkeep
+!data/Logs/.gitkeep
