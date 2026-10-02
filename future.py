@@ -1,6 +1,20 @@
 """
 future.py — Trading engine orchestrator + main scan loop.
 
+REV 1.4.27 (2026-10-02) — DEAD RE-EXPORT CLEANUP:
+  ✅ Removed 3 dead re-exports (verified unused via grep):
+       • retry_on_rate_limit    (was from core.client)
+       • HARDCODED_FILTERS      (was from core.client)
+       • detect_candle_patterns (was from market.indicators)
+     Zero behaviour change — nothing imported them from future.py.
+
+REV 1.4.26 (2026-10-02) — PHASE 3 CLEANUP:
+  ✅ `_format_be_lock_config()` simplified — dead Layers 2/3 removed
+     (unreachable since VOL_CLASS_R_THRESHOLDS always exists).
+     Function now takes no args and returns `str` only.
+  ✅ `_EXPECTED_R_KEYS` constant removed (was only used by Layer 2).
+  ✅ Caller updated — legacy warning block removed (was dead code).
+
 REV 1.4.25 (2026-10-02) — UNIFIED CONFIG CLEANUP:
   ✅ `_format_be_lock_config()` no longer reads `_PER_CLASS_CFG` from
      the `orders` package (which was removed in orders/utils.py
@@ -85,12 +99,13 @@ adjust_qty                = _c.adjust_qty
 adjust_price              = _c.adjust_price
 fetch_position_raw        = _c.fetch_position_raw
 refresh_timestamp         = _c.refresh_timestamp
-retry_on_rate_limit       = _c.retry_on_rate_limit
+# NOTE (REV 1.4.27): `retry_on_rate_limit` and `HARDCODED_FILTERS`
+# re-exports removed — no live consumer (verified via grep).
+# `client.py` still exports them; import directly if needed.
 _run_with_timeout         = _c._run_with_timeout
 _get_open_algo_orders     = _c._get_open_algo_orders
 _cancel_algo_order        = _c._cancel_algo_order
 _position_amt             = _c._position_amt
-HARDCODED_FILTERS         = _c.HARDCODED_FILTERS
 
 clear_stop                = _s.clear_stop
 request_stop              = _s.request_stop
@@ -145,7 +160,8 @@ get_fear_greed_index      = _i.get_fear_greed_index
 get_cached_indicator      = _i.get_cached_indicator
 set_cached_indicator      = _i.set_cached_indicator
 cleanup_indicator_cache   = _i.cleanup_indicator_cache
-detect_candle_patterns    = _i.detect_candle_patterns
+# NOTE (REV 1.4.27): `detect_candle_patterns` re-export removed —
+# no live consumer. `indicators.py` still exports it.
 
 RISK_PERCENT               = CONFIG.risk_percent
 MAX_OPEN_POSITIONS         = CONFIG.max_open_positions
@@ -167,7 +183,8 @@ CSV_FILE          = _s.CSV_FILE
 CSV_EXIT_FILE     = _s.CSV_EXIT_FILE
 PAUSE_FILE        = _s.PAUSE_FILE
 
-_EXPECTED_R_KEYS = ("be_r_min", "lock1_r_min", "lock2_r_min")
+# NOTE (REV 1.4.26): _EXPECTED_R_KEYS removed — was only used by the
+# now-deleted Layer 2 of _format_be_lock_config.
 
 _PARALLEL_FETCH_WORKERS = 8
 
@@ -235,46 +252,33 @@ def _reconcile_on_startup():
         logger.warning(f"[RECONCILE-STARTUP] failed: {e}")
 
 
-def _format_be_lock_config(cfg: dict) -> tuple[str, bool]:
+def _format_be_lock_config() -> str:
     """
-    REV 1.4.25 — now reads VOL_CLASS_R_THRESHOLDS directly from
-    config_center instead of getattr(_o, "_PER_CLASS_CFG", None).
-    Same structure — LOW/MED/HIGH with be_r / lock1_r / lock2_r.
+    REV 1.4.26 (PHASE 3) — Simplified.
+
+    Previously had 3 fallback layers (per-class, R-scaled MED, legacy %).
+    Layers 2 and 3 were 100% dead because VOL_CLASS_R_THRESHOLDS is
+    always populated (LOW/MED/HIGH present in config_center). Removed.
+
+    Returns a single string like:
+        "BE/LOCK per-class [LOW BE0.7R L1@1.0R L2@1.6R | MED ...]"
     """
-    try:
-        per_class = _VOL_CLASS_R_THRESHOLDS
-        if isinstance(per_class, dict) and per_class:
-            parts: list[str] = []
-            for cls in ("LOW", "MED", "HIGH"):
-                c = per_class.get(cls)
-                if not isinstance(c, dict):
-                    continue
-                try:
-                    be_r  = c["be_r"]; l1_r = c["lock1_r"]; l2_r = c["lock2_r"]
-                    parts.append(f"{cls} BE{be_r}R L1@{l1_r}R L2@{l2_r}R")
-                except (KeyError, TypeError):
-                    continue
-            if parts:
-                return ("BE/LOCK per-class [" + " | ".join(parts) + "]", True)
-    except Exception as e:
-        logger.debug(f"_format_be_lock_config layer-1 failed: {e}")
-
-    try:
-        has_r = all(k in cfg for k in _EXPECTED_R_KEYS)
-        if has_r:
-            return (f"BE {cfg['be_r_min']}R | "
-                    f"LOCK {cfg['lock1_r_min']}R/{cfg['lock2_r_min']}R "
-                    f"(R-scaled, MED fallback)", True)
-    except Exception as e:
-        logger.debug(f"_format_be_lock_config layer-2 failed: {e}")
-
-    try:
-        return (f"BE {cfg.get('be_factor', 0.6)} | "
-                f"LOCK {cfg.get('lock1_pct', 0.9)}/{cfg.get('lock2_pct', 2.2)} "
-                f"(legacy %)", False)
-    except Exception as e:
-        logger.debug(f"_format_be_lock_config failed: {e}")
-        return ("BE/LOCK config unavailable", False)
+    per_class = _VOL_CLASS_R_THRESHOLDS
+    parts: list[str] = []
+    for cls in ("LOW", "MED", "HIGH"):
+        c = per_class.get(cls)
+        if not isinstance(c, dict):
+            continue
+        try:
+            be_r = c["be_r"]
+            l1_r = c["lock1_r"]
+            l2_r = c["lock2_r"]
+            parts.append(f"{cls} BE{be_r}R L1@{l1_r}R L2@{l2_r}R")
+        except (KeyError, TypeError):
+            continue
+    if parts:
+        return "BE/LOCK per-class [" + " | ".join(parts) + "]"
+    return "BE/LOCK config unavailable"
 
 
 def stop_bot() -> None:
@@ -456,13 +460,9 @@ def main_loop():
         return
 
     _cfg = _i.get_trading_config()
-    _be_lock_str, _is_r_scaled = _format_be_lock_config(_cfg)
-
-    if not _is_r_scaled:
-        logger.warning(
-            "⚠️  indicators.py has LEGACY (%) BE/LOCK config. "
-            "REV 13.0 expects R-scaled keys."
-        )
+    _be_lock_str = _format_be_lock_config()
+    # NOTE (REV 1.4.26): _is_r_scaled always True now (VOL_CLASS_R_THRESHOLDS
+    # always populated) — legacy warning removed.
 
     logger.info(f"PRO TRADING v13.3.22 - {TRADING_MODE} | Risk {RISK_PERCENT}% | "
                 f"Max {MAX_OPEN_POSITIONS} | DD {MAX_DAILY_DRAWDOWN_PERCENT}% | "
