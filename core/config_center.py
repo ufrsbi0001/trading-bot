@@ -1,6 +1,51 @@
 """
 core/config_center.py — SINGLE SOURCE OF TRUTH for ALL trading config.
 
+REV 4.4 (2026-10-02) — ENV OVERRIDE ROBUSTNESS:
+  ✅ `_apply_env_overrides()` ab unknown `CC_*` keys pe WARNING
+     print karta hai (pehle silently skip hota tha — typos pakadna
+     mushkil tha).
+  ✅ `.env MIN_CONFIDENCE` ab config_center khud padhta hai
+     (import order independent). Pehle ye sync sirf config.py ke
+     import pe hota tha — agar koi directly config_center import
+     kare to 60 default reh jata tha.
+     Priority: CC_MIN_CONFIDENCE > .env MIN_CONFIDENCE > default 60.
+  ✅ `load_dotenv()` ab config_center ke top pe bhi call hota hai —
+     standalone import mein bhi .env load hoti hai.
+
+REV 4.3 (2026-10-02) — PHASE 3 CLEANUP:
+  ✅ Added per-family FILTERS keys: st_rsi_sell_floor,
+     rsi_buy_overbought, rsi_sell_oversold. Yeh pehle sirf FamilySpec
+     mein thin (family files). Ab config_center single source.
+     FamilySpec values fallback ke taur par rehti hain.
+
+REV 4.2 (2026-10-02) — PHASE 2:
+  ✅ Added GLOBAL["min_confidence"] default (60). config.py syncs
+     CONFIG.min_confidence here at import time — .env MIN_CONFIDENCE
+     still works. signals/base._mk() reads from here.
+
+REV 4.1 (2026-10-02) — PHASE 1 CLEANUP (dead keys removed):
+  ✅ Removed GLOBAL["adx_counter_trend_hard_max"] — duplicate of
+     DECISION["adx_counter_trend_hard_max"]. decision_engine.py
+     sirf DECISION wala padhta hai, GLOBAL wala 100% dead tha.
+  ✅ Removed GLOBAL["atr_ratio_min"] / ["atr_ratio_max"] — never read
+     anywhere. decision_engine uses DECISION["atr_ratio_extreme"].
+  ✅ Removed GLOBAL["cvd_z_min"] — never read. Only cvd_slope + cvd_div
+     are used in _filter_volume_confirmation.
+  ✅ Removed GLOBAL["min_adx"] — dead. future.py uses CONFIG.min_adx
+     (from .env), strategy code uses FAMILY[*]["FILTERS"]["min_adx_st"].
+
+REV 4.0 (2026-10-02) — DECISION ENGINE CENTRALIZATION:
+  ✅ Added `DECISION` dict — decision_engine.py ki saari hardcoded
+     values ab yahan hain (min_approvals, btc_bias_mode, adx cutoffs,
+     loss_streak, wr_mult bounds).
+  ✅ Added `get_decision_cfg()` helper — parsed copy return karta hai
+     (high_risk_coins frozenset ban jata hai).
+  ✅ `_apply_env_overrides()` extended — ab dono handle karta hai:
+       • CC_<key>       → GLOBAL overrides
+       • CC_DEC_<key>   → DECISION overrides
+     e.g., CC_DEC_MIN_APPROVALS=4 .env mein set karein.
+
 REV 3.2 (2026-10-02) — INDICATORS MIGRATION (Option B):
   ✅ GLOBAL now contains ALL keys previously in indicators._BASE_CFG
      (tp1_qty, cooldown_hours, min_dist_pct/max_dist_pct, atr_ratio_*,
@@ -22,6 +67,17 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
+
+# ── REV 4.4 — Load .env at import time ──
+# Ensures _apply_env_overrides() can read .env MIN_CONFIDENCE even
+# when config.py hasn't been imported yet (e.g., direct
+# `from core.config_center import ...`). config.py also calls
+# load_dotenv(); duplicate call is a no-op (python-dotenv caches).
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except ImportError:
+    pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -82,9 +138,56 @@ COUNTER_TREND_STRATEGIES: frozenset = frozenset({
 
 
 # ═══════════════════════════════════════════════════════════════
+#  DECISION ENGINE CONFIG (REV 4.0 — centralized)
+#  Yeh sab values pehle signals/decision_engine.py mein hardcoded
+#  thin. Ab yahan hain — tuning ke liye sirf yahan ya .env change.
+#
+#  Env override: CC_DEC_<KEY> (e.g., CC_DEC_MIN_APPROVALS=4)
+# ═══════════════════════════════════════════════════════════════
+DECISION: dict = {
+    # ── Approval threshold ──
+    # 5 = strict (kam trades), 4 = relaxed (zyada trades), 3 = aggressive
+    "min_approvals":              5,
+    "total_filters":              6,
+
+    # ── BTC bias gate ──
+    # "full"           = har TREND_UP mein SHORT block,
+    #                    TREND_DOWN mein LONG block
+    # "high_risk_only" = sirf high-risk meme coins block (RECOMMENDED)
+    # "disabled"       = gate band, counter-trend allowed
+    "btc_bias_enabled":           True,
+    "btc_bias_mode":              "full",
+    "btc_bias_high_risk_coins":   (
+        "1000BONKUSDT,1000PEPEUSDT,1000SHIBUSDT,1000FLOKIUSDT,"
+        "WIFUSDT,TRUMPUSDT,PENGUUSDT,BOMEUSDT,PUMPBTCUSDT"
+    ),
+    "btc_regime_ttl_sec":         600,
+
+    # ── Counter-trend ADX thresholds ──
+    "adx_counter_trend_hard_max": 45.0,
+    "adx_counter_trend_soft_max": 35.0,
+
+    # ── Volatility filter ──
+    "atr_ratio_extreme":          2.5,
+
+    # ── Loss streak guard ──
+    "loss_streak_trigger":        4,
+    "loss_streak_cooldown_min":   60,
+
+    # ── Win-rate confidence multiplier ──
+    "wr_mult_min":                0.85,
+    "wr_mult_max":                1.10,
+    "wr_mult_min_trades":         15,
+}
+
+
+# ═══════════════════════════════════════════════════════════════
 #  GLOBAL DEFAULTS
 #  REV 3.2 — now includes everything previously in
 #            market/indicators.py `_BASE_CFG`.
+#  REV 4.1 — dead keys removed (adx_counter_trend_hard_max,
+#            atr_ratio_min/max, cvd_z_min, min_adx).
+#  REV 4.2 — added min_confidence (single source, .env synced).
 # ═══════════════════════════════════════════════════════════════
 GLOBAL: dict = {
     # ── Supertrend / ATR distances (fallback; family overrides) ──
@@ -99,6 +202,14 @@ GLOBAL: dict = {
     # ── Min RR (scalar fallback — see MIN_RR dict for per-strategy) ──
     "min_rr":                  1.5,     # REV 3.2
 
+    # ── Confidence floor ──
+    # REV 4.2 — single source for signals/base._mk().
+    # REV 4.4 — .env MIN_CONFIDENCE read directly here (import-order
+    #           independent). config.py also syncs CONFIG.min_confidence
+    #           here at import time for backward compat.
+    # Priority: CC_MIN_CONFIDENCE > .env MIN_CONFIDENCE > default 60.
+    "min_confidence":          60,
+
     # ── Entry guards ──
     "signal_drift_pct":        0.5,
     "min_sl_pct":              0.0075,
@@ -109,13 +220,6 @@ GLOBAL: dict = {
     # ── Distance filters (percent-based) ──
     "min_dist_pct":            0.0025,  # REV 3.2
     "max_dist_pct":            0.050,   # REV 3.2
-
-    # ── ATR ratio band ──
-    "atr_ratio_min":           0.30,    # REV 3.2
-    "atr_ratio_max":           2.00,    # REV 3.2
-
-    # ── Min ADX fallback ──
-    "min_adx":                 22.0,    # REV 3.2 — from indicators._BASE_CFG
 
     # ── Late-entry guard ──
     "late_guard_adx":          35.0,
@@ -173,8 +277,10 @@ GLOBAL: dict = {
     "rsi_sell_max":            66.0,
 
     # ── Counter-trend ADX cutoff ──
+    # NOTE: `adx_counter_trend_hard_max` was removed in REV 4.1 —
+    #       it lives ONLY in DECISION dict now (decision_engine reads
+    #       from there). This GLOBAL key was 100% dead.
     "counter_trend_adx_cutoff": 35.0,
-    "adx_counter_trend_hard_max": 45.0,
 
     # ── Late guard for TD_FADE ──
     "td_fade_rsi_sell":        65.0,
@@ -185,7 +291,7 @@ GLOBAL: dict = {
     "td_fade_min_adx":         20.0,
 
     # ── Sentiment cutoffs ──
-    "cvd_z_min":               0.4,     # REV 3.2
+    # NOTE: `cvd_z_min` was removed in REV 4.1 — never read anywhere.
     "funding_extreme":         0.0008,  # REV 3.2
 }
 
@@ -268,6 +374,9 @@ STRATEGY_REGIME: dict = {
 
 # ═══════════════════════════════════════════════════════════════
 #  FAMILY BASELINES
+#  REV 4.3 — added per-family FILTERS keys:
+#            st_rsi_sell_floor, rsi_buy_overbought, rsi_sell_oversold
+#            (previously only in FamilySpec files).
 # ═══════════════════════════════════════════════════════════════
 FAMILY: dict = {
     "momentum_coins": {
@@ -280,6 +389,9 @@ FAMILY: dict = {
             "top_chase_rsi": 68.0, "top_chase_flips": 4,
             "rsi_buy_min": 36.0, "rsi_buy_max": 74.0,
             "rsi_sell_min": 26.0, "rsi_sell_max": 66.0,
+            "st_rsi_sell_floor": 25.0,
+            "rsi_buy_overbought": 86.0,
+            "rsi_sell_oversold": 20.0,
         },
     },
     "volatility_coins": {
@@ -292,6 +404,9 @@ FAMILY: dict = {
             "top_chase_rsi": 68.0, "top_chase_flips": 4,
             "rsi_buy_min": 34.0, "rsi_buy_max": 72.0,
             "rsi_sell_min": 28.0, "rsi_sell_max": 66.0,
+            "st_rsi_sell_floor": 25.0,
+            "rsi_buy_overbought": 84.0,
+            "rsi_sell_oversold": 22.0,
         },
     },
     "trend_coins": {
@@ -304,6 +419,9 @@ FAMILY: dict = {
             "top_chase_rsi": 68.0, "top_chase_flips": 4,
             "rsi_buy_min": 34.0, "rsi_buy_max": 70.0,
             "rsi_sell_min": 30.0, "rsi_sell_max": 65.0,
+            "st_rsi_sell_floor": 28.0,
+            "rsi_buy_overbought": 82.0,
+            "rsi_sell_oversold": 25.0,
         },
     },
     "range_coins": {
@@ -316,6 +434,9 @@ FAMILY: dict = {
             "top_chase_rsi": 68.0, "top_chase_flips": 4,
             "rsi_buy_min": 40.0, "rsi_buy_max": 68.0,
             "rsi_sell_min": 33.0, "rsi_sell_max": 60.0,
+            "st_rsi_sell_floor": 30.0,
+            "rsi_buy_overbought": 78.0,
+            "rsi_sell_oversold": 22.0,
         },
     },
 }
@@ -336,6 +457,31 @@ def get_regime_cfg(regime: str) -> dict:
 
 def get_min_rr(strategy: str) -> float:
     return float(MIN_RR.get(strategy, 1.5))
+
+
+def get_decision_cfg() -> dict:
+    """
+    REV 4.0 — Decision engine config accessor.
+
+    Returns DECISION dict (copy) with high_risk_coins parsed as frozenset.
+    Called by signals/decision_engine.py at import time.
+
+    Usage:
+        from core.config_center import get_decision_cfg
+        cfg = get_decision_cfg()
+        min_appr = cfg["min_approvals"]
+    """
+    out = dict(DECISION)
+    raw = out.get("btc_bias_high_risk_coins", "")
+    if isinstance(raw, str):
+        out["btc_bias_high_risk_coins"] = frozenset(
+            c.strip().upper() for c in raw.split(",") if c.strip()
+        )
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        out["btc_bias_high_risk_coins"] = frozenset(
+            str(c).strip().upper() for c in raw if c
+        )
+    return out
 
 
 def get_vol_class_mult(vol_class: str) -> float:
@@ -424,28 +570,63 @@ def describe(symbol: str, strategy: str, regime: str,
 
 
 # ═══════════════════════════════════════════════════════════════
-#  ENV OVERRIDES (CC_<KEY>=value overrides GLOBAL)
+#  ENV OVERRIDES
+#  REV 4.0 — now handles BOTH GLOBAL and DECISION:
+#    • CC_<key>=value       → GLOBAL overrides
+#    • CC_DEC_<key>=value   → DECISION overrides
+#  REV 4.4 — unknown CC_* keys now log a WARNING (was silent skip).
+#    Also reads .env MIN_CONFIDENCE directly (import-order independent).
 # ═══════════════════════════════════════════════════════════════
 def _apply_env_overrides() -> None:
     for env_key, raw_val in os.environ.items():
         if not env_key.startswith("CC_"):
             continue
-        cfg_key = env_key[3:].lower()
-        if cfg_key not in GLOBAL:
+
+        # ── Pick target dict ──
+        if env_key.startswith("CC_DEC_"):
+            cfg_key = env_key[7:].lower()
+            target = DECISION
+        else:
+            cfg_key = env_key[3:].lower()
+            target = GLOBAL
+
+        if cfg_key not in target:
+            # REV 4.4 — surface silent skip so typos don't go unnoticed
+            print(f"[config_center] ⚠️  env override IGNORED: "
+                  f"{env_key}={raw_val} — key {cfg_key!r} not in "
+                  f"{'DECISION' if target is DECISION else 'GLOBAL'}")
             continue
+
         try:
-            original = GLOBAL[cfg_key]
+            original = target[cfg_key]
             if isinstance(original, bool):
-                GLOBAL[cfg_key] = raw_val.strip().lower() in ("1", "true", "yes", "on")
+                target[cfg_key] = raw_val.strip().lower() in ("1", "true", "yes", "on")
             elif isinstance(original, int):
-                GLOBAL[cfg_key] = int(raw_val)
+                target[cfg_key] = int(raw_val)
             elif isinstance(original, float):
-                GLOBAL[cfg_key] = float(raw_val)
+                target[cfg_key] = float(raw_val)
             else:
-                GLOBAL[cfg_key] = raw_val
-            print(f"[config_center] env override: {cfg_key} = {GLOBAL[cfg_key]}")
+                target[cfg_key] = raw_val
+            print(f"[config_center] env override: {env_key} = {target[cfg_key]}")
         except Exception as e:
             print(f"[config_center] env override failed {env_key}={raw_val}: {e}")
+
+    # ── REV 4.4 — MIN_CONFIDENCE (no CC_ prefix) sync from .env ──
+    # Fallback for when config.py hasn't imported config_center yet
+    # (e.g., direct `python -c "from core.config_center import ..."`).
+    # Priority: CC_MIN_CONFIDENCE > .env MIN_CONFIDENCE > default 60.
+    #
+    # If CC_MIN_CONFIDENCE is set, the loop above already handled it
+    # (via CC_ prefix) — skip the .env fallback to avoid double-logging.
+    if "CC_MIN_CONFIDENCE" not in os.environ:
+        _raw = os.environ.get("MIN_CONFIDENCE")
+        if _raw:
+            try:
+                GLOBAL["min_confidence"] = float(_raw.strip())
+                print(f"[config_center] env override: MIN_CONFIDENCE = "
+                      f"{GLOBAL['min_confidence']}")
+            except (ValueError, TypeError):
+                pass
 
 
 _apply_env_overrides()
@@ -453,7 +634,7 @@ _apply_env_overrides()
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("  CONFIG CENTER DIAGNOSTIC — REV 3.2 (unified + indicators migration)")
+    print("  CONFIG CENTER DIAGNOSTIC — REV 4.4 (unified + decision)")
     print("=" * 70)
     samples = [
         ("POLUSDT",  "SUPERTREND_RIDE",  "TREND_DOWN"),
@@ -473,5 +654,34 @@ if __name__ == "__main__":
     print(f"  Keys: {len(flat)}")
     print(f"  sl_atr={flat['sl_atr']} tp1_atr={flat['tp1_atr']} tp2_atr={flat['tp2_atr']}")
     print(f"  min_rr={flat['min_rr']} tp1_qty={flat['tp1_qty']}")
+    print(f"  min_confidence={flat.get('min_confidence')}")
     print(f"  sl_mult={flat['sl_mult']} tp_mult={flat['tp_mult']} rsi_period={flat['rsi_period']}")
+    print()
+    print("=" * 70)
+    print("  FAMILY FILTERS new keys (REV 4.3):")
+    for _fam in ("momentum_coins", "volatility_coins", "trend_coins", "range_coins"):
+        _f = FAMILY[_fam]["FILTERS"]
+        print(f"  {_fam:20} "
+              f"floor={_f.get('st_rsi_sell_floor')} "
+              f"ob={_f.get('rsi_buy_overbought')} "
+              f"os={_f.get('rsi_sell_oversold')}")
+    print()
+    print("=" * 70)
+    print("  DECISION config test (REV 4.0):")
+    dec = get_decision_cfg()
+    print(f"  min_approvals              = {dec['min_approvals']}")
+    print(f"  total_filters              = {dec['total_filters']}")
+    print(f"  btc_bias_enabled           = {dec['btc_bias_enabled']}")
+    print(f"  btc_bias_mode              = {dec['btc_bias_mode']}")
+    print(f"  btc_bias_high_risk_coins   = {len(dec['btc_bias_high_risk_coins'])} coins")
+    print(f"    → {sorted(dec['btc_bias_high_risk_coins'])[:3]} ...")
+    print(f"  btc_regime_ttl_sec         = {dec['btc_regime_ttl_sec']}")
+    print(f"  adx_counter_trend_hard_max = {dec['adx_counter_trend_hard_max']}")
+    print(f"  adx_counter_trend_soft_max = {dec['adx_counter_trend_soft_max']}")
+    print(f"  atr_ratio_extreme          = {dec['atr_ratio_extreme']}")
+    print(f"  loss_streak_trigger        = {dec['loss_streak_trigger']}")
+    print(f"  loss_streak_cooldown_min   = {dec['loss_streak_cooldown_min']}")
+    print(f"  wr_mult_min                = {dec['wr_mult_min']}")
+    print(f"  wr_mult_max                = {dec['wr_mult_max']}")
+    print(f"  wr_mult_min_trades         = {dec['wr_mult_min_trades']}")
     print("=" * 70)

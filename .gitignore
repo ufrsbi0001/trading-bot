@@ -1,75 +1,48 @@
-# ─── Secrets — NEVER upload ─────────────────────
+# ─── Secrets ───────────────────────────────────────
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
-# ─── Python ─────────────────────────────────────
+# ─── Data files ────────────────────────────────────
+data/
+Logs/
+*.log
+bot.log
+trading_log.csv
+trades_exit.csv
+active_trades.json
+cooldowns.json
+daily_tracker.json
+coin_rotation.json
+pause.txt
+unmanaged_positions.json
+
+# ─── Python ────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# ─── Virtual Environments ───────────────────────
 venv/
-.venv/
 env/
 ENV/
-env.bak/
-venv.bak/
+.venv/
 
-# ─── Runtime Data (contains live positions) ─────
-data/*.json
-data/Logs/
-data/*.csv
-unmanaged_positions.json
-*.log
-*.log.*
-
-# ─── Backups ────────────────────────────────────
-Bot_backup_*/
-coins_backup_*/
-backup_*/
-*.bak
-*.backup
-
-# ─── IDE ────────────────────────────────────────
+# ─── IDE ───────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
-*.sublime-*
 
-# ─── OS ─────────────────────────────────────────
-Thumbs.db
+# ─── OS ────────────────────────────────────────────
 .DS_Store
-desktop.ini
-$RECYCLE.BIN/
+Thumbs.db
 
-# ─── Temporary / Migration Scripts ──────────────
-tree.txt
-structure.txt
-test_config.py
-fix_corruption.py
+# ─── Temporary test scripts ────────────────────────
+verify_dead_code.py
+verify_final.py
+test_phase2.py
+test_phase3.py
 
-# ─── Keep these (override patterns above) ───────
-!data/.gitkeep
-!data/Logs/.gitkeep
-
-# Audit report (temp)
-audit_coin_tuning.json
+# ─── Scripts output (diagnostic) ───────────────────
+scripts/*.json

@@ -1,6 +1,16 @@
 """
 config.py — Single source of truth for environment configuration.
 
+REV 1.6.0 (2026-10-02) — MIN_CONFIDENCE SYNC TO CONFIG_CENTER:
+  ✅ After CONFIG is loaded, syncs `min_confidence` into
+     core.config_center.GLOBAL["min_confidence"] so it becomes the
+     single source of truth for the signal-side confidence floor.
+     Used by signals/base._mk().
+  ✅ Backward compat preserved:
+       • .env MIN_CONFIDENCE still works (synced here)
+       • CC_MIN_CONFIDENCE env var (native config_center override)
+         takes priority if set — sync is skipped in that case.
+
 REV 1.5.1 (2026-09-30) — USE_5M_TREND_FILTER RENAME:
   ✅ Renamed `use_1m_trend_filter` → `use_5m_trend_filter`. The check
      actually uses 5m klines (indicators.check_short_term_trend), so
@@ -556,6 +566,36 @@ def _validate(cfg: Config) -> None:
 CONFIG: Config = load_config()
 
 
+# ─────────────────────────────────────────────────────────────
+# REV 1.6.0 — SYNC min_confidence INTO config_center
+# ─────────────────────────────────────────────────────────────
+# config_center.GLOBAL["min_confidence"] is the new single source of
+# truth for the signal-side confidence floor (used by signals/base._mk).
+#
+# Backward compat: .env MIN_CONFIDENCE still works — we sync CONFIG's
+# value into config_center at import time.
+#
+# Priority (highest wins):
+#   1. CC_MIN_CONFIDENCE env var (native config_center override)
+#   2. .env MIN_CONFIDENCE (synced here)
+#   3. config_center.GLOBAL["min_confidence"] default (60)
+#
+# Note: guarded so a config_center import failure never crashes
+# config.py's own load. If it fails, base._mk() falls back to
+# spec.min_confidence (which is CONFIG.min_confidence via FamilySpec).
+# ─────────────────────────────────────────────────────────────
+try:
+    if not os.getenv("CC_MIN_CONFIDENCE"):
+        from core import config_center as _cc
+        _cc.GLOBAL["min_confidence"] = CONFIG.min_confidence
+except Exception as _sync_err:
+    # Never crash config load over a sync issue
+    print(
+        f"[config] min_confidence sync to config_center failed: {_sync_err}",
+        file=sys.stderr,
+    )
+
+
 def _partial_close_label() -> str:
     if CONFIG.partial_close_usdt == 0:
         return "DISABLED (TP1/TP2 mode)"
@@ -599,6 +639,7 @@ def print_config_banner() -> None:
         f"{CONFIG.max_daily_drawdown_percent}% DD",
         f"  Partial close:  {_partial_close_label()}",
         f"  Min ADX:        {CONFIG.min_adx} (fallback — runtime per-family floors printed by future.py)",
+        f"  Min confidence: {CONFIG.min_confidence}",          # ← REV 1.6.0
         f"  Max hold:       {CONFIG.max_hold_minutes} min",
         f"  History window: {CONFIG.history_lookback_days} days",
         f"  Modern flags:   taker={CONFIG.use_taker_volume} "
