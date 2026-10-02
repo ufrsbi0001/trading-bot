@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1.0">
   <meta name="web-token" content="{{ web_token|default('') }}">
   <meta name="format-detection" content="telephone=no">
-  <title>Trading Desk · Terminal Pro v13.3.22</title>
+  <title>Trading Desk · Terminal Pro v13.4.0</title>
   <meta name="description" content="Live futures trading terminal — positions, scanner, execution history and system logs.">
   <meta name="theme-color" content="#08090d">
   <meta name="color-scheme" content="dark">
@@ -19,85 +19,6 @@
   <script src="https://cdn.tailwindcss.com"></script>
 
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-
-  <!-- ════════════════════════════════════════════════════════════
-       FINAL POLISH PASS — inline overrides
-       (Move these into style.css later if you prefer; kept here
-        so the HTML is self-contained and pixel-perfect.)
-       ════════════════════════════════════════════════════════════ -->
-  <style>
-    /* ── Unify header pill heights (was 26 vs 27 mismatch) ── */
-    .conn-pill,
-    .keys-tag,
-    .mode-chip,
-    .clock-chip,
-    .status-pill,
-    #regime-chip,
-    #killzone-chip { height: 27px; }
-
-    /* ── Chip utility variants (replaces inline styles) ── */
-    .chip-gold {
-      background: var(--gold-soft);
-      color: var(--gold-bright);
-      border-color: var(--line-gold);
-      font-weight: 700;
-      letter-spacing: .05em;
-    }
-    .chip-danger {
-      background: var(--red-soft);
-      color: var(--red-hi);
-      border-color: var(--red-line);
-      font-weight: 700;
-      letter-spacing: .06em;
-    }
-
-    /* ── Totals / count chips get proper accent ── */
-    #history-total-pnl-chip {
-      color: var(--gold-bright);
-      background: var(--gold-soft);
-      border-color: var(--line-gold);
-      font-weight: 700;
-    }
-    #fills-total-count {
-      color: var(--ink-dim);
-      background: rgba(255,255,255,.03);
-      border-color: var(--line-strong);
-      font-weight: 600;
-    }
-    #fills-total-pnl {
-      color: var(--gold-bright);
-      background: var(--gold-soft);
-      border-color: var(--line-gold);
-      font-weight: 700;
-    }
-
-    /* ── "SL LEVELS" chip is a static label — kill hover-lift ── */
-    .chip-static {
-      pointer-events: none;
-      cursor: default;
-    }
-    .chip-static:hover { transform: none; }
-
-    /* ── Stat sub — push trailing chip to the right edge ── */
-    .stat-sub .chip-mini { margin-left: auto; }
-
-    /* ── Popover focus outline — give it breathing room ── */
-    .stat-hoverable:focus-visible { outline-offset: 4px; }
-
-    /* ── Canvas: never stretch beyond native 240px (preserves sparkline aspect) ── */
-    #pnl-spark {
-      display: block;
-      width: 100%;
-      max-width: 240px;
-      height: 30px;
-      margin-top: 8px;
-      opacity: .95;
-      filter: drop-shadow(0 0 8px rgba(224,184,104,.15));
-    }
-
-    /* ── Body min-height fallback (in case Tailwind CDN is removed later) ── */
-    body { min-height: 100vh; }
-  </style>
 </head>
 <body class="min-h-screen">
 
@@ -200,6 +121,35 @@
       <div id="last-update" class="stat-value" style="font-size:15px">--</div>
       <div id="scan-time" class="stat-sub mono">--</div>
     </div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════
+       TIME EXIT CONTROL (REV 1.4.1)
+       Toggle TIME_EXIT on/off at runtime via /api/time_exit
+       ════════════════════════════════════════════════════════════ -->
+  <div class="te-control-card" id="te-control">
+    <div class="te-title">
+      <span class="te-dot" aria-hidden="true"></span>
+      <span>TIME EXIT CONTROL</span>
+    </div>
+
+    <span id="te-badge" class="te-badge te-off" aria-live="polite">OFF</span>
+
+    <label class="te-switch" for="te-toggle" title="Enable or disable time-based exits">
+      <input type="checkbox" id="te-toggle" role="switch" aria-label="Toggle TIME_EXIT">
+      <span class="te-track" aria-hidden="true"></span>
+      <span id="te-toggle-label">TIME_EXIT</span>
+    </label>
+
+    <label class="te-field" for="te-hold-minutes">
+      Hold min
+      <input type="number" id="te-hold-minutes" min="0" step="5" value="180"
+             aria-label="Hold minutes before time exit">
+    </label>
+
+    <button type="button" class="te-save" id="te-save-btn">Save</button>
+
+    <span class="te-status" id="te-status" aria-live="polite"></span>
   </div>
 
   <div class="tab-bar-row">

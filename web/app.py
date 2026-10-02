@@ -1,6 +1,21 @@
 """
 TRADING DESK · Flask Backend — Production Refactor
 ─────────────────────────────────────────────────────────────
+REV 1.4.2 (2026-10-02) — DAILY LOSS DASHBOARD WIRING:
+  ✅ get_bot_status() now reads daily_tracker.get_loss_count()
+     and writes it into bot_state["daily_loss"].
+     Bug fix: dashboard previously ALWAYS showed 0/10 even
+     when real SL hits were logged, because bot_state["daily_loss"]
+     was hardcoded to 0 and never updated.
+  ✅ Uses try/except ImportError for graceful UI-only mode.
+
+REV 1.4.1 (2026-10-02) — TIME_EXIT TOGGLE API:
+  ✅ Added GET  /api/time_exit  → current state (public read)
+  ✅ Added POST /api/time_exit  → toggle on/off at runtime
+     Body: {"enabled": true|false, "hold_minutes": 180}
+     Uses core.config_center.update_runtime().
+  ✅ Rate-limited + token-required on POST.
+
 REV 1.4.0 (2026-10-02) — PHASE 4 WEB MIGRATION:
   ✅ Moved app.py → web/app.py.
   ✅ Templates moved to web/templates/ (Flask auto-detects via __name__).
@@ -211,6 +226,21 @@ def add_log(msg: str) -> None:
     log.info(msg)
 
 
+def _read_daily_loss_count() -> int:
+    """
+    REV 1.4.2 — Read the current day's loss count from DailyTracker.
+
+    Returns 0 on any error (UI-only mode, import failure, etc.) so
+    the dashboard never breaks just because the tracker is unavailable.
+    """
+    try:
+        from core.state import daily_tracker
+        return int(daily_tracker.get_loss_count())
+    except Exception as e:
+        log.debug(f"[daily_loss] read failed (using 0): {e}")
+        return 0
+
+
 # ─────────────────────────────────────────────────────────────
 # AUTH + RATE LIMITING
 # ─────────────────────────────────────────────────────────────
@@ -386,7 +416,12 @@ def _normalize_position(client: Any, pos: dict) -> Optional[dict]:
 
 
 def get_bot_status() -> dict[str, Any]:
-    """No network call inside state_lock — prevents UI freeze / DoS."""
+    """
+    No network call inside state_lock — prevents UI freeze / DoS.
+
+    REV 1.4.2 — now reads daily_tracker.get_loss_count() and mirrors
+    it into bot_state["daily_loss"]. Previously hardcoded to 0.
+    """
     with state_lock:
         is_running = bot_state["running"]
 
@@ -398,13 +433,16 @@ def get_bot_status() -> dict[str, Any]:
     else:
         uptime_str = "00:00:00"
 
+    # ── REV 1.4.2 — read live daily-loss count ──
+    daily_loss_now = _read_daily_loss_count()
+
     if not is_running:
         with state_lock:
             bot_state.update(
                 balance=0.0,
                 position_count=0,
                 active_trades=[],
-                daily_loss=0,
+                daily_loss=daily_loss_now,
                 last_update=datetime.now().strftime("%H:%M:%S"),
                 uptime=uptime_str,
             )
@@ -438,6 +476,7 @@ def get_bot_status() -> dict[str, Any]:
             balance=balance,
             position_count=len(trades),
             active_trades=trades,
+            daily_loss=daily_loss_now,
             last_update=datetime.now().strftime("%H:%M:%S"),
             uptime=uptime_str,
         )
@@ -1224,6 +1263,93 @@ def api_decision_stats() -> Response:
             "by_strategy": {},
             "paused_strategies": {},
         }), 500
+
+
+# ─────────────────────────────────────────────────────────────
+# TIME EXIT TOGGLE (REV 1.4.1)
+# ─────────────────────────────────────────────────────────────
+@app.route("/api/time_exit", methods=["GET"])
+def api_time_exit_get() -> Response:
+    """
+    Current TIME_EXIT config (public read — no secrets exposed).
+
+    Returns:
+        {
+          "success": true,
+          "time_exit_enabled": bool,
+          "hold_minutes": int
+        }
+    """
+    try:
+        from core import config_center as cc
+        return jsonify({
+            "success": True,
+            "time_exit_enabled": bool(cc.GLOBAL.get("time_exit_enabled", False)),
+            "hold_minutes": int(cc.GLOBAL.get("hold_minutes", 180)),
+        })
+    except Exception as e:
+        log.exception("api_time_exit_get failed")
+        return api_error(f"config_center unavailable: {e}", 500)
+
+
+@app.route("/api/time_exit", methods=["POST"])
+@token_required
+@rate_limit(2)
+def api_time_exit_set() -> Any:
+    """
+    Toggle TIME_EXIT on/off at runtime.
+
+    Body:
+        {
+          "enabled": true|false,       # required
+          "hold_minutes": 180          # optional (int >= 0)
+        }
+
+    Response:
+        {
+          "success": true,
+          "time_exit_enabled": bool,
+          "hold_minutes": int
+        }
+    """
+    try:
+        from core import config_center as cc
+    except Exception as e:
+        return api_error(f"config_center unavailable: {e}", 500)
+
+    data = request.get_json(silent=True) or {}
+    updates: dict = {}
+
+    if "enabled" in data:
+        updates["time_exit_enabled"] = bool(data["enabled"])
+
+    if "hold_minutes" in data:
+        try:
+            hm = int(data["hold_minutes"])
+            if hm < 0:
+                return api_error("hold_minutes must be >= 0", 400)
+            updates["hold_minutes"] = hm
+        except (ValueError, TypeError):
+            return api_error("invalid hold_minutes", 400)
+
+    if not updates:
+        return api_error("no valid fields (enabled / hold_minutes)", 400)
+
+    try:
+        cc.update_runtime(**updates)
+    except Exception as e:
+        log.exception("update_runtime failed")
+        return api_error(f"update failed: {e}", 500)
+
+    enabled_now = bool(cc.GLOBAL.get("time_exit_enabled", False))
+    hold_now = int(cc.GLOBAL.get("hold_minutes", 180))
+    add_log(f"⚙️ TIME_EXIT updated → enabled={enabled_now} hold={hold_now}m")
+
+    return jsonify({
+        "success": True,
+        "time_exit_enabled": enabled_now,
+        "hold_minutes": hold_now,
+    })
 
 
 # ─────────────────────────────────────────────────────────────

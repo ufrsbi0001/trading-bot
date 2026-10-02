@@ -1,6 +1,17 @@
 """
 orders/manage.py — Trade management loop.
 
+REV 1.8.0 (2026-10-02) — TIME_EXIT TOGGLE GATE:
+  ✅ TIME_EXIT block ab `is_time_exit_enabled()` se gated hai.
+     • False (default) → poora time-exit block skip
+     • True            → purana regime-aware hold-time logic chalta hai
+  ✅ Toggle karne ke 3 tarike:
+       1. Dashboard UI:  POST /api/time_exit {"enabled": true}
+       2. Runtime:       cc.update_runtime(time_exit_enabled=True)
+       3. .env:          CC_TIME_EXIT_ENABLED=true
+  ✅ Jab OFF ho, sirf SL / TP / RR_COLLAPSE exits kaam karte hain.
+  ✅ SL/TP/trailing/partial logic me koi change nahi.
+
 REV 1.7.1 (2026-10-02) — UNIFIED CONFIG CLEANUP:
   ✅ Time-exit fallback now uses `config_center.get_config().hold_minutes`
      instead of removed `_STRATEGY_HOLD_MIN`.
@@ -48,7 +59,11 @@ from core.state import (
 from market.indicators import calculate_pro_indicators, get_trading_config
 
 # ── REV 1.7.1 — Unified config source for hold_minutes fallback ──
-from core.config_center import get_config as _get_central_config
+# ── REV 1.8.0 — is_time_exit_enabled() for TIME_EXIT toggle gate ──
+from core.config_center import (
+    get_config as _get_central_config,
+    is_time_exit_enabled,
+)
 
 from .utils import (
     MAX_HOLD_MINUTES, PARTIAL_CLOSE_USDT,
@@ -247,69 +262,83 @@ def manage_single_trade(symbol):
         logger.debug(f"[{symbol}] TP1-fill detect failed: {e}")
 
     # ═══════════════════════════════════════════════════════════
-    #  TIME EXIT — REV 1.7.0: prefer stored regime-aware hold time
-    #             REV 1.7.1: fallback via config_center
+    #  TIME EXIT — REV 1.8.0: TOGGLE-GATED
+    #    • time_exit_enabled = False (default) → poora block skip
+    #    • time_exit_enabled = True            → regime-aware hold-time
+    #  Toggle: dashboard UI / update_runtime() / CC_TIME_EXIT_ENABLED
+    #  Jab OFF ho, sirf SL / TP / RR_COLLAPSE exits kaam karte hain.
     # ═══════════════════════════════════════════════════════════
     try:
         entry_time_str = active.get('entry_time', '')
         if entry_time_str:
-            entry_dt = datetime.strptime(entry_time_str, '%Y-%m-%d %I:%M:%S %p')
-            entry_dt = entry_dt.replace(tzinfo=PKT)
-            held_min = (datetime.now(PKT) - entry_dt).total_seconds() / 60
-
-            r_th_early = _r_thresholds_per_class(symbol, get_trading_config())
-            bars_cap_min = float(r_th_early.get("max_hold_bars", 28)) * 60.0
-
             strat_name = active.get("strategy", "UNKNOWN")
 
-            # ── REV 1.7.0 — prefer stored regime-aware hold time ──
-            # `hold_time_minutes` was frozen at entry time (entry.py
-            # REV 1.7.0) so regime flips mid-trade don't retroactively
-            # change the hold budget. Falls back gracefully for old
-            # trades that don't have the field.
-            stored_hold = active.get('hold_time_minutes')
-            _source = None
-            effective_cap = None
-            if stored_hold is not None:
-                try:
-                    effective_cap = float(stored_hold)
-                    _source = f"regime={active.get('regime_at_entry', '?')}"
-                except (TypeError, ValueError):
-                    effective_cap = None
+            # ── REV 1.8.0 — TIME_EXIT gate ──
+            _time_exit_on = False
+            try:
+                _time_exit_on = bool(is_time_exit_enabled())
+            except Exception:
+                _time_exit_on = False
 
-            if effective_cap is None:
-                # ── REV 1.7.1 — fallback: config_center hold_minutes (regime-aware) ──
-                try:
-                    _cfg_hold = _get_central_config(symbol, strat_name, "UNKNOWN")
-                    effective_cap = float(_cfg_hold.get("hold_minutes", MAX_HOLD_MINUTES))
-                    _source = f"config_center={effective_cap:.0f}m"
-                except Exception:
-                    effective_cap = min(float(MAX_HOLD_MINUTES), bars_cap_min)
-                    _source = "bars_cap"
+            if not _time_exit_on:
+                # TIME_EXIT OFF — skip (SL/TP/RR_COLLAPSE still active)
+                logger.debug(f"[{symbol}] TIME_EXIT skipped (disabled)")
+            else:
+                entry_dt = datetime.strptime(entry_time_str, '%Y-%m-%d %I:%M:%S %p')
+                entry_dt = entry_dt.replace(tzinfo=PKT)
+                held_min = (datetime.now(PKT) - entry_dt).total_seconds() / 60
 
-            if held_min > effective_cap:
-                logger.warning(
-                    f"[{symbol}] MAX HOLD {held_min:.0f}m exceeded "
-                    f"(cap {effective_cap:.0f}m, source={_source}, "
-                    f"strategy={strat_name}) - exiting"
-                )
-                try:
-                    qty_str_exit = adjust_qty(abs(float(amt)), f['stepSize'], f['minQty'])
-                    with _requests_lock:
-                        client.futures_create_order(
-                            symbol=pair, side=close_side, type='MARKET',
-                            quantity=qty_str_exit, reduceOnly=True
-                        )
-                    time.sleep(1.5)
-                    for _ in range(5):
-                        time.sleep(0.8)
-                        p = fetch_position_raw(symbol)
-                        if p and abs(float(p.get('positionAmt', '0') or 0)) == 0:
-                            break
-                    handle_trade_close(symbol, pair, reason="TIME_EXIT")
-                    return
-                except Exception as tex:
-                    logger.error(f"[{symbol}] time exit failed: {tex}")
+                r_th_early = _r_thresholds_per_class(symbol, get_trading_config())
+                bars_cap_min = float(r_th_early.get("max_hold_bars", 28)) * 60.0
+
+                # ── REV 1.7.0 — prefer stored regime-aware hold time ──
+                # `hold_time_minutes` was frozen at entry time (entry.py
+                # REV 1.7.0) so regime flips mid-trade don't retroactively
+                # change the hold budget. Falls back gracefully for old
+                # trades that don't have the field.
+                stored_hold = active.get('hold_time_minutes')
+                _source = None
+                effective_cap = None
+                if stored_hold is not None:
+                    try:
+                        effective_cap = float(stored_hold)
+                        _source = f"regime={active.get('regime_at_entry', '?')}"
+                    except (TypeError, ValueError):
+                        effective_cap = None
+
+                if effective_cap is None:
+                    # ── REV 1.7.1 — fallback: config_center hold_minutes (regime-aware) ──
+                    try:
+                        _cfg_hold = _get_central_config(symbol, strat_name, "UNKNOWN")
+                        effective_cap = float(_cfg_hold.get("hold_minutes", MAX_HOLD_MINUTES))
+                        _source = f"config_center={effective_cap:.0f}m"
+                    except Exception:
+                        effective_cap = min(float(MAX_HOLD_MINUTES), bars_cap_min)
+                        _source = "bars_cap"
+
+                if held_min > effective_cap:
+                    logger.warning(
+                        f"[{symbol}] MAX HOLD {held_min:.0f}m exceeded "
+                        f"(cap {effective_cap:.0f}m, source={_source}, "
+                        f"strategy={strat_name}) - exiting"
+                    )
+                    try:
+                        qty_str_exit = adjust_qty(abs(float(amt)), f['stepSize'], f['minQty'])
+                        with _requests_lock:
+                            client.futures_create_order(
+                                symbol=pair, side=close_side, type='MARKET',
+                                quantity=qty_str_exit, reduceOnly=True
+                            )
+                        time.sleep(1.5)
+                        for _ in range(5):
+                            time.sleep(0.8)
+                            p = fetch_position_raw(symbol)
+                            if p and abs(float(p.get('positionAmt', '0') or 0)) == 0:
+                                break
+                        handle_trade_close(symbol, pair, reason="TIME_EXIT")
+                        return
+                    except Exception as tex:
+                        logger.error(f"[{symbol}] time exit failed: {tex}")
     except Exception as e:
         logger.debug(f"[{symbol}] time exit check error: {e}")
 

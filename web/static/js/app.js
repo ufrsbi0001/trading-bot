@@ -1215,3 +1215,128 @@ document.addEventListener('keydown', e=>{
   const liveTabBtn = $('tabbtn-live');
   if(liveTabBtn) liveTabBtn.addEventListener('click', ()=> setTimeout(injectRowButtons, 60));
 })();
+
+/* ══════════════════════════════════════════════════════════════
+   TIME EXIT CONTROL — REV 1.4.1
+   Toggle TIME_EXIT on/off at runtime via /api/time_exit
+   ══════════════════════════════════════════════════════════════ */
+(function () {
+  'use strict';
+
+  const API_BASE = '/api/time_exit';
+
+  const toggle    = $('te-toggle');
+  const badge     = $('te-badge');
+  const holdInput = $('te-hold-minutes');
+  const saveBtn   = $('te-save-btn');
+  const statusEl  = $('te-status');
+
+  if (!toggle || !badge || !holdInput || !saveBtn) return;
+
+  function setStatus(msg, kind) {
+    statusEl.textContent = msg || '';
+    statusEl.className = 'te-status' + (kind ? ' ' + kind : '');
+    if (msg) {
+      clearTimeout(setStatus._t);
+      setStatus._t = setTimeout(() => {
+        statusEl.textContent = '';
+        statusEl.className = 'te-status';
+      }, 2500);
+    }
+  }
+
+  function applyBadge(enabled) {
+    if (enabled) {
+      badge.textContent = 'ON';
+      badge.className = 'te-badge te-on';
+    } else {
+      badge.textContent = 'OFF';
+      badge.className = 'te-badge te-off';
+    }
+  }
+
+  function applyState(enabled, holdMinutes) {
+    toggle.checked = !!enabled;
+    applyBadge(!!enabled);
+    if (Number.isFinite(holdMinutes) && holdMinutes >= 0) {
+      holdInput.value = holdMinutes;
+    }
+    holdInput.disabled = !enabled;
+  }
+
+  async function loadState() {
+    try {
+      const res = await fetch(API_BASE, { cache: 'no-store' });
+      const data = await res.json();
+      if (!data || !data.success) {
+        setStatus('Load failed', 'err');
+        return;
+      }
+      applyState(data.time_exit_enabled, data.hold_minutes);
+    } catch (e) {
+      setStatus('Network error', 'err');
+      console.error('[time_exit] loadState failed', e);
+    }
+  }
+
+  async function saveState() {
+    const enabled = !!toggle.checked;
+    const holdRaw = holdInput.value;
+    const holdMinutes = holdRaw === '' ? null : parseInt(holdRaw, 10);
+
+    if (enabled && holdMinutes !== null && (isNaN(holdMinutes) || holdMinutes < 0)) {
+      setStatus('Invalid minutes', 'err');
+      return;
+    }
+
+    const body = { enabled };
+    if (holdMinutes !== null && !isNaN(holdMinutes) && holdMinutes >= 0) {
+      body.hold_minutes = holdMinutes;
+    }
+
+    saveBtn.disabled = true;
+    setStatus('Saving…');
+
+    try {
+      const res = await fetch(API_BASE, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': TOKEN ? ('Bearer ' + TOKEN) : ''
+        },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+
+      if (!res.ok || !data.success) {
+        setStatus('❌ ' + (data.error || ('HTTP ' + res.status)), 'err');
+        return;
+      }
+
+      applyState(data.time_exit_enabled, data.hold_minutes);
+      setStatus('✅ Saved', 'ok');
+      if (typeof toast === 'function') {
+        toast('TIME_EXIT ' + (data.time_exit_enabled ? 'ENABLED' : 'DISABLED'), 'success');
+      }
+    } catch (e) {
+      setStatus('Network error', 'err');
+      console.error('[time_exit] saveState failed', e);
+    } finally {
+      saveBtn.disabled = false;
+    }
+  }
+
+  toggle.addEventListener('change', () => {
+    const on = toggle.checked;
+    applyBadge(on);
+    holdInput.disabled = !on;
+  });
+
+  saveBtn.addEventListener('click', saveState);
+
+  holdInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); saveState(); }
+  });
+
+  loadState();
+})();

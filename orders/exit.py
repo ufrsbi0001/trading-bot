@@ -1,52 +1,16 @@
 """
 orders/exit.py — Trade close and emergency close.
 
-REV 1.5.5 (2026-09-29) — DUPLICATE-CLOSE REASON TRACKING:
-  ✅ P2 FIX (root-cause of ASTER log confusion, 2026-09-29 17:03):
-     When two close paths raced for the same symbol (entry.py's
-     RR_COLLAPSE handler + app.py's MANUAL_UI handler, or
-     RR_COLLAPSE + a late emergency_close_retry thread), the
-     `_JUST_CLOSED` 60s guard correctly suppressed the duplicate —
-     but the log line said nothing about WHICH reason won, so
-     post-mortems saw a misleading "Closed OFF (MANUAL)" and had
-     to guess what really happened.
+REV 1.5.6 (2026-10-02) — DAILY-LOSS COUNT CLARITY:
+  ✅ Comment added to make it explicit that BOTH SL and
+     RR_COLLAPSE (and non-tiny TIME_EXIT losses) increment the
+     daily loss counter. Behaviour unchanged from REV 1.5.5 —
+     only documentation clarity. The actual rollover bug was in
+     core/state.py's DailyTracker (fixed in state REV 1.3.16).
 
-     Fix: a module-local `_CLOSED_REASONS` dict now records the
-     FIRST reason for each symbol alongside the timestamp. When a
-     duplicate call arrives within 60s, the log now shows BOTH
-     the first reason and the current attempt:
-
-       Before:
-         [ASTER] handle_trade_close already done (within 60s),
-                 skipping duplicate
-       After:
-         [ASTER] handle_trade_close skip — already closed
-                 (first_reason=RR_COLLAPSE, this_call=MANUAL_UI,
-                  within 60s)
-
-     No behavioural change — only diagnostic clarity.
-
-  ✅ Defensive: `reason` parameter now normalised to "closed" when
-     None/empty, so downstream logs never print "Closed OFF ()".
-
-REV 1.5.4 (2026-09-28) — DEAD IMPORT CLEANUP:
-  ✅ Removed two unused imports (zero behaviour change):
-       • `import threading`          — no direct `threading.*`
-         usage anywhere in this module (all locking is imported
-         from .utils as _JUST_CLOSED_LOCK, and the emergency
-         close retry loop runs synchronously, not in a spawned
-         thread).
-       • `from core.config import CONFIG` — never referenced; all
-         config values arrive via `state` (COOLDOWN_AFTER_SL_MIN /
-         COOLDOWN_AFTER_TP_MIN) and `indicators.get_trading_config`.
-
-REV 1.5.3 (2026-09-28) — DEAD CONSTANT REMOVAL:
-  ✅ Removed `_MANUAL_OUTPUT_REASONS` frozenset. It was defined
-     but never referenced — the actual manual-close normalization
-     is `_MANUAL_UI_REASONS` a few lines above, and the output
-     reason is computed as `"MANUAL" if reason in _MANUAL_UI_REASONS
-     else reason`. No behaviour change; one less dead symbol.
-
+REV 1.5.5 (2026-09-29) — DUPLICATE-CLOSE REASON TRACKING.
+REV 1.5.4 (2026-09-28) — DEAD IMPORT CLEANUP.
+REV 1.5.3 (2026-09-28) — DEAD CONSTANT REMOVAL.
 REV 1.5.2 (2026-09-28) — MANUAL_UI REASON HANDLING.
 REV 1.5.1 (2026-09-28) — DECISION ENGINE FEEDBACK.
 REV 1.5.0 (2026-09-28) — SPLIT FROM orders.py.
@@ -91,12 +55,6 @@ _TINY_LOSS_R = 0.30
 # ═════════════════════════════════════════════════════════════
 #  REV 1.5.5 — FIRST-REASON TRACKER (diagnostic only)
 # ═════════════════════════════════════════════════════════════
-# Records the FIRST close reason for each symbol, alongside the
-# timestamp in _JUST_CLOSED. Pruned together in the same critical
-# section. When a duplicate close arrives within 60s, the skip log
-# now shows both the first reason and the current attempt — this
-# is the fix for the ASTER 17:03 log confusion where a duplicate
-# MANUAL_UI call silently overwrote the visible reason.
 _CLOSED_REASONS: dict[str, str] = {}
 
 
@@ -236,7 +194,6 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
         pair = symbol + 'USDT'
 
     # ── REV 1.5.5: defensive reason normalization ──
-    # Never let an empty/None reason print as "Closed OFF ()".
     if not reason:
         reason = "closed"
 
@@ -244,8 +201,6 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
 
     # ═══════════════════════════════════════════════════════════
     #  REV 1.5.5 — DUPLICATE-GUARD WITH FIRST-REASON LOOKUP
-    #  Prunes _JUST_CLOSED and _CLOSED_REASONS in the same critical
-    #  section so they can never drift out of sync.
     # ═══════════════════════════════════════════════════════════
     with _JUST_CLOSED_LOCK:
         now = time.time()
@@ -288,8 +243,6 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
         pnl = get_total_pnl(symbol, entry_time_ms)
 
     # ── PnL retry window ──
-    # Auto closes (SL/TP/time/emergency): 10 × 1.5s ≈ 15s
-    # Manual UI close:                     3 × 1.5s ≈ 4.5s
     if pnl == 0.0 and reason != "MANUAL":
         retries = 3 if reason in _MANUAL_UI_REASONS else 10
         for _retry in range(retries):
@@ -308,8 +261,6 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
             reason = "SL" if pnl < 0 else "TP"
 
     # ── PATCH B: R-multiple of this close and "real loss" flag ──
-    # A loss smaller than _TINY_LOSS_R of planned risk (typical for a
-    # TIME_EXIT near entry) must not count as a stop-out.
     _r_mult = None
     try:
         _e = float(active.get('entry', 0) or 0)
@@ -320,6 +271,15 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
             _r_mult = pnl / _risk_usd
     except Exception:
         _r_mult = None
+
+    # ── REV 1.5.6: explicit real-loss classification ──
+    # Any of the following counts as a "real loss" (feeds daily loss
+    # counter AND decision-engine loss-streak guard):
+    #   • SL hit        (pnl < 0, reason="SL")
+    #   • RR_COLLAPSE   (pnl < 0, reason="RR_COLLAPSE")
+    #   • MANUAL close with negative pnl
+    #   • TIME_EXIT with R <= -0.30 (real loss, not tiny noise)
+    # Tiny TIME_EXIT losses (|R| < 0.30) are ignored.
     _is_real_loss = pnl < 0 and (
         reason != "TIME_EXIT" or _r_mult is None or _r_mult <= -_TINY_LOSS_R
     )
@@ -340,8 +300,6 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
         from signals.decision_engine import record_trade_result
         strategy_name = (active.get('strategy', 'UNKNOWN')
                          if active else 'UNKNOWN')
-        # PATCH D: tiny TIME_EXIT losses are neither a win nor a loss -> skip
-        # (sending 0.0 would count as a win and reset the streak guard).
         if pnl < 0 and not _is_real_loss:
             logger.info(f"[{symbol}] tiny TIME_EXIT loss "
                         f"(R={_r_mult if _r_mult is None else round(_r_mult, 2)}) "
@@ -353,7 +311,12 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
 
     _r_txt = "" if _r_mult is None else f" ({_r_mult:+.2f}R)"
     if pnl < 0:
-        # PATCH C: only real losses count toward the daily loss limit
+        # ═══════════════════════════════════════════════════════
+        #  REV 1.5.6 — DAILY LOSS COUNTER
+        #  Both SL and RR_COLLAPSE increment the counter here,
+        #  because both pass the _is_real_loss check (reason is
+        #  not TIME_EXIT). Rollover handling is in DailyTracker.
+        # ═══════════════════════════════════════════════════════
         if _is_real_loss:
             daily_tracker.add_loss()
         cooldown_min = COOLDOWN_AFTER_SL_MIN

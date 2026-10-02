@@ -1295,3 +1295,261 @@ a:hover{text-decoration:underline}
   opacity:.55;cursor:wait;color:var(--ink-faint);
   background:rgba(255,255,255,.03);border-color:var(--line);box-shadow:none;
 }
+
+
+/* ══════════════════════════════════════════════════════════════
+   FINAL POLISH PASS — MOVED FROM index.html INLINE <style>
+   (REV 1.4.1 — was inline in HTML, now consolidated here)
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── Unify header pill heights (was 26 vs 27 mismatch) ── */
+.conn-pill,
+.keys-tag,
+.mode-chip,
+.clock-chip,
+.status-pill,
+#regime-chip,
+#killzone-chip { height: 27px; }
+
+/* ── Chip utility variants (replaces inline styles) ── */
+.chip-gold {
+  background: var(--gold-soft);
+  color: var(--gold-bright);
+  border-color: var(--line-gold);
+  font-weight: 700;
+  letter-spacing: .05em;
+}
+.chip-danger {
+  background: var(--red-soft);
+  color: var(--red-hi);
+  border-color: var(--red-line);
+  font-weight: 700;
+  letter-spacing: .06em;
+}
+
+/* ── Totals / count chips get proper accent ── */
+#history-total-pnl-chip {
+  color: var(--gold-bright);
+  background: var(--gold-soft);
+  border-color: var(--line-gold);
+  font-weight: 700;
+}
+#fills-total-count {
+  color: var(--ink-dim);
+  background: rgba(255,255,255,.03);
+  border-color: var(--line-strong);
+  font-weight: 600;
+}
+#fills-total-pnl {
+  color: var(--gold-bright);
+  background: var(--gold-soft);
+  border-color: var(--line-gold);
+  font-weight: 700;
+}
+
+/* ── "SL LEVELS" chip is a static label — kill hover-lift ── */
+.chip-static {
+  pointer-events: none;
+  cursor: default;
+}
+.chip-static:hover { transform: none; }
+
+/* ── Stat sub — push trailing chip to the right edge ── */
+.stat-sub .chip-mini { margin-left: auto; }
+
+/* ── Popover focus outline — give it breathing room ── */
+.stat-hoverable:focus-visible { outline-offset: 4px; }
+
+/* ── Canvas: never stretch beyond native 240px (preserves sparkline aspect) ── */
+#pnl-spark {
+  display: block;
+  width: 100%;
+  max-width: 240px;
+  height: 30px;
+  margin-top: 8px;
+  opacity: .95;
+  filter: drop-shadow(0 0 8px rgba(224,184,104,.15));
+}
+
+/* ── Body min-height fallback (in case Tailwind CDN is removed later) ── */
+body { min-height: 100vh; }
+
+
+/* ══════════════════════════════════════════════════════════════
+   TIME EXIT CONTROL CARD (REV 1.4.1)
+   ══════════════════════════════════════════════════════════════ */
+.te-control-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 12px 16px;
+  margin: 0;
+  background: linear-gradient(180deg, rgba(255,255,255,.02), rgba(255,255,255,.005));
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  font-family: var(--font-body);
+  box-shadow: var(--shadow-sm);
+  transition: border-color var(--dur) var(--ease);
+}
+.te-control-card:hover {
+  border-color: rgba(255,255,255,.18);
+}
+
+.te-control-card .te-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  color: var(--ink-dim);
+  text-transform: uppercase;
+}
+.te-control-card .te-title .te-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--gold);
+  box-shadow: 0 0 8px var(--gold);
+}
+
+.te-control-card .te-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid;
+  transition: all var(--dur) var(--ease);
+}
+.te-badge.te-on {
+  background: rgba(13,214,138,.12);
+  color: var(--green-hi);
+  border-color: var(--green-line);
+  box-shadow: inset 0 0 10px -4px rgba(13,214,138,.6);
+}
+.te-badge.te-off {
+  background: rgba(255,255,255,.04);
+  color: var(--ink-dim);
+  border-color: var(--line-strong);
+}
+
+.te-control-card .te-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: var(--ink-dim);
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+.te-switch input { display: none; }
+.te-switch .te-track {
+  position: relative;
+  width: 38px;
+  height: 20px;
+  background: rgba(255,255,255,.08);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-pill);
+  transition: all var(--dur) var(--ease);
+}
+.te-switch .te-track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  background: var(--ink-dim);
+  border-radius: 50%;
+  transition: all var(--dur) var(--ease);
+}
+.te-switch input:checked + .te-track {
+  background: rgba(13,214,138,.20);
+  border-color: rgba(13,214,138,.55);
+}
+.te-switch input:checked + .te-track::after {
+  left: 20px;
+  background: var(--green-hi);
+  box-shadow: 0 0 8px rgba(13,214,138,.7);
+}
+
+.te-control-card .te-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--ink-dim);
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.te-control-card .te-field input {
+  width: 70px;
+  padding: 4px 8px;
+  background: rgba(0,0,0,.35);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-xs);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: right;
+  outline: none;
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.te-control-card .te-field input:focus {
+  border-color: var(--line-gold);
+  box-shadow: 0 0 0 3px rgba(224,184,104,.12);
+}
+.te-control-card .te-field input:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+.te-control-card .te-save {
+  margin-left: auto;
+  padding: 5px 14px;
+  background: var(--gold-soft);
+  color: var(--gold-bright);
+  border: 1px solid var(--line-gold);
+  border-radius: var(--r-xs);
+  font-family: var(--font-body);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease);
+}
+.te-control-card .te-save:hover:not(:disabled) {
+  background: rgba(224,184,104,.20);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px -8px rgba(224,184,104,.7);
+}
+.te-control-card .te-save:active:not(:disabled) {
+  transform: scale(.96);
+}
+.te-control-card .te-save:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.te-control-card .te-status {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  min-width: 90px;
+}
+.te-control-card .te-status.ok { color: var(--green-hi); }
+.te-control-card .te-status.err { color: var(--red-hi); }
+
+@media (max-width: 680px) {
+  .te-control-card { gap: 10px; padding: 10px 12px; }
+  .te-control-card .te-save { margin-left: 0; }
+  .te-control-card .te-title { font-size: 10px; }
+}

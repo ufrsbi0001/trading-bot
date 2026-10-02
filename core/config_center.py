@@ -1,6 +1,13 @@
 """
 core/config_center.py — SINGLE SOURCE OF TRUTH for ALL trading config.
 
+REV 4.5 (2026-10-02) — TIME_EXIT TOGGLE:
+  ✅ Added GLOBAL["time_exit_enabled"] (default False).
+     Env override: CC_TIME_EXIT_ENABLED=true/false
+  ✅ Added update_runtime(**kwargs) — UI se runtime toggle ke liye.
+     Sirf GLOBAL keys allow hain (safety). In-memory persist.
+  ✅ Added is_time_exit_enabled() helper.
+
 REV 4.4 (2026-10-02) — ENV OVERRIDE ROBUSTNESS:
   ✅ `_apply_env_overrides()` ab unknown `CC_*` keys pe WARNING
      print karta hai (pehle silently skip hota tha — typos pakadna
@@ -188,6 +195,7 @@ DECISION: dict = {
 #  REV 4.1 — dead keys removed (adx_counter_trend_hard_max,
 #            atr_ratio_min/max, cvd_z_min, min_adx).
 #  REV 4.2 — added min_confidence (single source, .env synced).
+#  REV 4.5 — added time_exit_enabled (toggle via UI / .env).
 # ═══════════════════════════════════════════════════════════════
 GLOBAL: dict = {
     # ── Supertrend / ATR distances (fallback; family overrides) ──
@@ -246,6 +254,16 @@ GLOBAL: dict = {
 
     # ── Hold time (fallback; regime + strategy override) ──
     "hold_minutes":            180,
+
+    # ═══════════════════════════════════════════════════════════
+    #  REV 4.5 — TIME_EXIT TOGGLE
+    #  Default False (OFF). Agar True karna ho to:
+    #    • .env me:  CC_TIME_EXIT_ENABLED=true
+    #    • Ya dashboard UI se: POST /api/time_exit {"enabled": true}
+    #  Jab True ho to `hold_minutes` wala time-exit trigger hoga.
+    #  Jab False ho to TIME_EXIT skip ho jayega (SL/TP still active).
+    # ═══════════════════════════════════════════════════════════
+    "time_exit_enabled":       False,
 
     # ── R-multiple thresholds ──
     "be_r_min":                0.75,
@@ -551,6 +569,76 @@ def get_config(symbol: str = "", strategy: str = "",
     return merged
 
 
+# ═══════════════════════════════════════════════════════════════
+#  REV 4.5 — RUNTIME UPDATE (UI TOGGLE SUPPORT)
+# ═══════════════════════════════════════════════════════════════
+def update_runtime(**kwargs) -> dict:
+    """
+    Runtime update of GLOBAL config keys (in-memory only).
+
+    Sirf woh keys allow hain jo GLOBAL dict me already exist karti hain
+    (safety — koi naya key accidentally add nahi hoga).
+
+    Type coerce hota hai original type ke hisaab se:
+      • bool  → "true"/"false"/"1"/"0"/"yes"/"on"
+      • int   → int(v)
+      • float → float(v)
+
+    Bot restart par default pe wapas aa jayega, JAB TAK .env me
+    CC_<KEY>=value set na ho.
+
+    Args:
+        **kwargs: e.g., time_exit_enabled=False, hold_minutes=180
+
+    Returns:
+        dict of {key: (old_value, new_value)} — logging ke liye.
+
+    Example:
+        >>> from core import config_center as cc
+        >>> cc.update_runtime(time_exit_enabled=True, hold_minutes=60)
+        {'time_exit_enabled': (False, True), 'hold_minutes': (180, 60)}
+    """
+    changes: dict = {}
+    for k, v in kwargs.items():
+        if k not in GLOBAL:
+            print(f"[config_center] runtime update IGNORED: {k!r} "
+                  f"not in GLOBAL")
+            continue
+
+        old = GLOBAL[k]
+        # Type coerce to original type where possible
+        try:
+            if isinstance(old, bool) and not isinstance(v, bool):
+                v = str(v).strip().lower() in ("1", "true", "yes", "on")
+            elif isinstance(old, int) and not isinstance(old, bool):
+                v = int(v)
+            elif isinstance(old, float):
+                v = float(v)
+        except (TypeError, ValueError) as e:
+            print(f"[config_center] runtime update failed {k}={v!r}: {e}")
+            continue
+
+        GLOBAL[k] = v
+        changes[k] = (old, v)
+        print(f"[config_center] runtime update: {k} = {v} (was {old})")
+    return changes
+
+
+def is_time_exit_enabled() -> bool:
+    """
+    REV 4.5 — Quick helper for TIME_EXIT gate.
+
+    Returns:
+        bool: True agar TIME_EXIT enabled hai, warna False.
+
+    Usage (orders/manage.py):
+        from core.config_center import is_time_exit_enabled
+        if is_time_exit_enabled():
+            # ... time-exit logic
+    """
+    return bool(GLOBAL.get("time_exit_enabled", False))
+
+
 def describe(symbol: str, strategy: str, regime: str,
              vol_class: str = "") -> str:
     cfg = get_config(symbol, strategy, regime, vol_class)
@@ -634,8 +722,16 @@ _apply_env_overrides()
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("  CONFIG CENTER DIAGNOSTIC — REV 4.4 (unified + decision)")
+    print("  CONFIG CENTER DIAGNOSTIC — REV 4.5 (unified + decision + time_exit)")
     print("=" * 70)
+
+    # ── REV 4.5 — TIME_EXIT state ──
+    print()
+    print("  TIME_EXIT state:")
+    print(f"    time_exit_enabled = {GLOBAL.get('time_exit_enabled')}")
+    print(f"    hold_minutes      = {GLOBAL.get('hold_minutes')}")
+    print(f"    is_time_exit_enabled() = {is_time_exit_enabled()}")
+
     samples = [
         ("POLUSDT",  "SUPERTREND_RIDE",  "TREND_DOWN"),
         ("APTUSDT",  "SUPERTREND_RIDE",  "TREND_UP"),
@@ -655,6 +751,7 @@ if __name__ == "__main__":
     print(f"  sl_atr={flat['sl_atr']} tp1_atr={flat['tp1_atr']} tp2_atr={flat['tp2_atr']}")
     print(f"  min_rr={flat['min_rr']} tp1_qty={flat['tp1_qty']}")
     print(f"  min_confidence={flat.get('min_confidence')}")
+    print(f"  time_exit_enabled={flat.get('time_exit_enabled')}")
     print(f"  sl_mult={flat['sl_mult']} tp_mult={flat['tp_mult']} rsi_period={flat['rsi_period']}")
     print()
     print("=" * 70)

@@ -1,17 +1,33 @@
 """
 state.py — Runtime state for the trading engine.
 
-REV 1.3.15 (2026-09-29) — DEAD HTF COUNTER REMOVED:
-  ✅ Removed 'htf' from V2_STATS and dropped it from
-     get_v2_stats_str(). Nothing calls increment_v2_stat('htf')
-     anywhere in the codebase — the counter stayed at 0 and only
-     bloated the status line. Family-level trend gate output is
-     already covered by the 'trend' counter.
+REV 1.3.16 (2026-10-02) — DAILY TRACKER DATE-ROLLOVER FIX:
+  ✅ BUG FIX: DailyTracker was saving losses with STALE date.
+     If the bot ran across midnight (e.g. 10-01 → 10-02) and a
+     loss occurred BEFORE reset_if_new_day() was ever called,
+     add_loss() would save the file with the OLD date. On the
+     next restart, _load() would see a date mismatch and reset
+     loss_count to 0 — losing all pre-restart losses.
 
-REV 1.3.14 (2026-09-29) — DEAD COUNTER CLEANUP:
-  ✅ Removed 'mtf' from V2_STATS and dropped it from
-     get_v2_stats_str().
+     Symptoms: dashboard showed 0/10 even though SL hits had
+     happened earlier in the day.
 
+     Fix:
+       • New `_check_date_rollover()` — called at the START of
+         add_loss() AND is_limit_reached(). Detects date change
+         WITHOUT needing balance, resets loss_count, and re-saves
+         with the CURRENT date.
+       • `_load()` now logs when it skips a stale-date file so
+         future debugging is easier.
+       • New `get_loss_count()` public getter (with rollover check)
+         for web/app.py to use.
+
+  ✅ Both SL and RR_COLLAPSE trigger add_loss() (verified in
+     orders/exit.py — any negative PnL with reason != TIME_EXIT,
+     or TIME_EXIT with R <= -0.30, counts as a real loss).
+
+REV 1.3.15 (2026-09-29) — DEAD HTF COUNTER REMOVED.
+REV 1.3.14 (2026-09-29) — DEAD COUNTER CLEANUP.
 REV 1.3.13 (2026-09-28) — PRE-GATE SIGNAL COUNTERS.
 REV 1.3.12 (2026-09-28) — DECISION COUNTER ADDED.
 REV 1.3.11 (2026-09-26) — DEAD IMPORT CLEANUP.
@@ -249,8 +265,6 @@ ATR_CACHE_LOCK = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────
 # V2 STATS
-#   REV 1.3.14 — 'mtf' removed (dead)
-#   REV 1.3.15 — 'htf' removed (dead)
 # ─────────────────────────────────────────────────────────────
 V2_STATS = {
     'signals':  0,      # directional signals that PASSED pre-gate
@@ -295,8 +309,21 @@ def get_v2_stats_str() -> str:
 
 # ─────────────────────────────────────────────────────────────
 # DAILY TRACKER
+#   REV 1.3.16 — date-rollover fix + public getter
 # ─────────────────────────────────────────────────────────────
 class DailyTracker:
+    """
+    Tracks daily loss count + balance peaks.
+
+    Persistence: JSON file (LOSS_FILE from CONFIG).
+    Reset trigger: date change in PKT timezone (UTC+5).
+
+    REV 1.3.16:
+      • `_check_date_rollover()` runs at START of add_loss() and
+        is_limit_reached() — prevents stale-date saves.
+      • `get_loss_count()` public getter — for web/app.py.
+    """
+
     def __init__(self):
         self.file = LOSS_FILE
         self.today = datetime.now(PKT).date()
@@ -305,20 +332,35 @@ class DailyTracker:
         self.peak_balance = 0
         self._load()
 
+    # ── Load from disk (with date guard) ──
     def _load(self):
         try:
-            if os.path.exists(self.file):
-                with open(self.file, 'r', encoding='utf-8') as f:
-                    d = json.load(f)
-                if d.get('date') == str(self.today):
-                    self.loss_count = d.get('loss_count', 0)
-                    self.start_balance = d.get('start_balance', 0)
-                    self.peak_balance = d.get('peak_balance', 0)
-                    if d.get('peak_date') != str(self.today):
-                        self.peak_balance = self.start_balance
+            if not os.path.exists(self.file):
+                logger.info(f" DailyTracker: no file yet ({self.file})")
+                return
+            with open(self.file, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+            saved_date = d.get('date')
+            if saved_date == str(self.today):
+                self.loss_count = int(d.get('loss_count', 0))
+                self.start_balance = float(d.get('start_balance', 0))
+                self.peak_balance = float(d.get('peak_balance', 0))
+                if d.get('peak_date') != str(self.today):
+                    self.peak_balance = self.start_balance
+                logger.info(
+                    f" DailyTracker loaded: date={saved_date} "
+                    f"loss_count={self.loss_count} "
+                    f"start_bal=${self.start_balance:.2f}"
+                )
+            else:
+                logger.info(
+                    f" DailyTracker: stale file date={saved_date} "
+                    f"(today={self.today}) — starting fresh"
+                )
         except Exception as e:
             logger.warning(f"Tracker load error: {e}")
 
+    # ── Save to disk ──
     def _save(self):
         _atomic_json_write(self.file, {
             'date': str(self.today),
@@ -328,6 +370,33 @@ class DailyTracker:
             'peak_date': str(self.today),
         })
 
+    # ── REV 1.3.16: date rollover check (no balance required) ──
+    def _check_date_rollover(self):
+        """
+        Detect date change WITHOUT needing current balance.
+        Called from add_loss() so a loss logged just after midnight
+        doesn't get saved with yesterday's date.
+        """
+        today = datetime.now(PKT).date()
+        if today != self.today:
+            logger.info(
+                f" DailyTracker: date rollover "
+                f"{self.today} → {today} — resetting loss_count"
+            )
+            self.today = today
+            self.loss_count = 0
+            # start_balance will be re-set on next reset_if_new_day()
+            # with a real balance reading.
+            self._save()
+            reset_v2_stats()
+
+    # ── Public getter for web/app.py ──
+    def get_loss_count(self) -> int:
+        """Return the current day's loss count (with rollover check)."""
+        self._check_date_rollover()
+        return self.loss_count
+
+    # ── Reset if new day (needs balance to record start) ──
     def reset_if_new_day(self, current_balance: float):
         today = datetime.now(PKT).date()
         if today != self.today or self.start_balance == 0:
@@ -345,13 +414,19 @@ class DailyTracker:
             self._save()
 
     def add_loss(self):
+        # REV 1.3.16: date rollover check BEFORE incrementing
+        self._check_date_rollover()
         self.loss_count += 1
         self._save()
-        logger.info(f" Daily Loss Count: {self.loss_count}/{MAX_DAILY_LOSS_TRADES}")
+        logger.info(
+            f" Daily Loss Count: {self.loss_count}/{MAX_DAILY_LOSS_TRADES}"
+        )
 
     def is_limit_reached(self, current_equity: float) -> tuple[bool, str]:
         if current_equity < 100:
             return False, ""
+        # REV 1.3.16: date rollover check at start
+        self._check_date_rollover()
         self.reset_if_new_day(current_equity)
         if self.loss_count >= MAX_DAILY_LOSS_TRADES:
             return True, f"Loss count {self.loss_count}"
