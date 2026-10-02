@@ -1,6 +1,24 @@
 """
 orders/entry.py — Order placement.
 
+REV 1.7.3 (2026-10-02) — COSMETIC CLEANUP:
+  ✅ `_apply_vol_class_sizing` — `mult_map` promoted to module-level
+     `_VOL_CLASS_QTY_MULT` (clarity vs config_center's
+     VOL_CLASS_CAP_MULT which is a different concept).
+
+REV 1.7.2 (2026-10-02) — PHASE 2 CLEANUP:
+  ✅ Signal drift cap now uses ACTUAL regime (was hardcoded "UNKNOWN").
+     Fetches regime from cached 1h indicator before resolving
+     signal_drift_pct from config_center. Prevents silent failures
+     if regime-dependent drift tuning is added later.
+
+REV 1.7.1 (2026-10-02) — PHASE 1 CLEANUP:
+  ✅ RR check now uses `config_center.get_min_rr(strategy)` (per-strategy
+     floors from MIN_RR dict) instead of `cfg['min_rr']` (GLOBAL scalar).
+     Fixes mismatch where strategy signal-gen used MIN_RR[strategy]=1.8
+     but entry.py read GLOBAL min_rr=1.5.
+     Fallback: get_min_rr() returns 1.5 if strategy not in MIN_RR.
+
 REV 1.7.0 (2026-10-02) — CONFIG CENTER INTEGRATION (Phase 1):
   ✅ Added `config_center` import.
   ✅ Signal drift cap now reads `signal_drift_pct` from config_center
@@ -49,6 +67,8 @@ from .exit import emergency_close_retry, handle_trade_close
 
 # ── REV 1.7.0 — Centralized config (single source of truth) ──
 from core.config_center import get_config as _get_central_config
+# ── REV 1.7.1 — Per-strategy RR floor (fixes MIN_RR vs GLOBAL mismatch) ──
+from core.config_center import get_min_rr as _get_min_rr_central
 
 # ─── REV 1.5.3 — counter-trend size scaler (guarded import) ───
 try:
@@ -57,16 +77,30 @@ except Exception:
     _CT_STRATS = frozenset()
 
 
+# ── REV 1.7.3 — QTY scaling constants (module-level for clarity) ──
+# NOTE: this is QTY scaling (position size), distinct from
+# config_center.VOL_CLASS_CAP_MULT which scales SL/TP distance caps.
+_VOL_CLASS_QTY_MULT = {
+    "HIGH": Decimal("0.4"),
+    "MED":  Decimal("0.7"),
+    "LOW":  Decimal("1.0"),
+}
+
+
 def _apply_vol_class_sizing(symbol: str, qty_dec: Decimal, step: Decimal, min_qty: Decimal) -> Decimal:
-    """REV 1.5.6 — Vol-class based position sizing."""
+    """REV 1.5.6 — Vol-class based position sizing.
+
+    REV 1.7.3 — uses module-level `_VOL_CLASS_QTY_MULT` (was inline
+    `mult_map`). Renamed for clarity vs config_center's
+    `VOL_CLASS_CAP_MULT` which scales SL/TP distance caps, not qty.
+    """
     try:
         from core.coins_config import get_coin_vol_class
         vcls = get_coin_vol_class(symbol)
     except Exception:
         vcls = "MED"
-    
-    mult_map = {"HIGH": Decimal("0.4"), "MED": Decimal("0.7"), "LOW": Decimal("1.0")}
-    mult = mult_map.get(vcls, Decimal("0.7"))
+
+    mult = _VOL_CLASS_QTY_MULT.get(vcls, Decimal("0.7"))
     try:
         scaled = qty_dec * mult
         scaled = (scaled // step) * step
@@ -136,6 +170,22 @@ def _snapshot_regime(symbol: str, strategy: str) -> tuple[str, int]:
     return _regime_now, _hold_min
 
 
+def _get_regime_now(symbol: str) -> str:
+    """
+    REV 1.7.2 — Fetch current regime from cached 1h indicator.
+    Used by signal-drift check to resolve regime-dependent config.
+    Safe default: "UNKNOWN".
+    """
+    try:
+        from market.indicators import get_cached_indicator
+        _ind = get_cached_indicator(symbol + 'USDT', '1h')
+        if _ind:
+            return _ind.get('regime', 'UNKNOWN') or 'UNKNOWN'
+    except Exception:
+        pass
+    return 'UNKNOWN'
+
+
 def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                       entry_price_est, conf=50, rr=0, pattern="NONE", fg=50,
                       strategy="UNKNOWN", signal_price=None):
@@ -158,13 +208,15 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
 
     # ═══════════════════════════════════════════════════════════
     #  REV 1.7.0 — SIGNAL DRIFT CAP (now from config_center)
+    #  REV 1.7.2 — Regime is now ACTUAL (was hardcoded "UNKNOWN").
     #  Reject entry if price drifted > signal_drift_pct from signal.
     #  Default 0.5% (was hardcoded 0.8%).
     #
     #  NOTE: This check runs BEFORE bot_tracked_symbols.add(),
     #        so no slot cleanup is needed on reject.
     # ═══════════════════════════════════════════════════════════
-    _cfg_drift = _get_central_config(symbol, strategy, "UNKNOWN")
+    _regime_drift = _get_regime_now(symbol)
+    _cfg_drift = _get_central_config(symbol, strategy, _regime_drift)
     _MAX_SIGNAL_DRIFT_PCT = float(_cfg_drift.get("signal_drift_pct", 0.5)) * 100
     if signal_price is not None and signal_price > 0 and entry_price_est > 0:
         try:
@@ -176,6 +228,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                     f"[{symbol}] SIGNAL DRIFT REJECT: "
                     f"signal={_sig_p:.6f} live={_live_p:.6f} "
                     f"drift={_drift_pct:.3f}% > {_MAX_SIGNAL_DRIFT_PCT:.2f}% "
+                    f"[regime={_regime_drift}] "
                     f"— price moved too far since signal"
                 )
                 return False
@@ -660,13 +713,14 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             tp2_price = max(tp2_price, entry_price * (1 - _caps["tp2"]))
 
         # ── REV 1.5.10 — RR RE-CHECK AFTER CAPS (with float tolerance) ──
+        # ── REV 1.7.1 — Now uses per-strategy RR floor from config_center ──
         _risk_final = abs(entry_price - float(sl_price))
         _reward_final = abs(float(tp1_price) - entry_price)
         _rr_final = (_reward_final / _risk_final) if _risk_final > 0 else 0.0
-        _min_rr = float(cfg.get('min_rr', 1.0))
+        _min_rr = _get_min_rr_central(strategy)
         _RR_COLLAPSE_TOL = 0.02
         
-        logger.info(f"[{symbol}] RR check: signal_rr={rr:.2f} → placed_rr={_rr_final:.3f} (min {_min_rr:.2f}, tol {_RR_COLLAPSE_TOL}) | caps sl={_caps['sl']:.4f} tp1={_caps['tp1']:.4f} tp2={_caps['tp2']:.4f} | tp1 {_tp1_before_cap:.6f}→{float(tp1_price):.6f} tp2 {_tp2_before_cap:.6f}→{float(tp2_price):.6f}")
+        logger.info(f"[{symbol}] RR check: signal_rr={rr:.2f} → placed_rr={_rr_final:.3f} (min {_min_rr:.2f}, tol {_RR_COLLAPSE_TOL}) [strategy={strategy}] | caps sl={_caps['sl']:.4f} tp1={_caps['tp1']:.4f} tp2={_caps['tp2']:.4f} | tp1 {_tp1_before_cap:.6f}→{float(tp1_price):.6f} tp2 {_tp2_before_cap:.6f}→{float(tp2_price):.6f}")
         
         if _rr_final < _min_rr - _RR_COLLAPSE_TOL:
             logger.critical(f"[{symbol}] RR COLLAPSE: {rr:.2f} → {_rr_final:.3f} (min {_min_rr:.2f}, tol {_RR_COLLAPSE_TOL}) — closing position immediately")

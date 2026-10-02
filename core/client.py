@@ -4,6 +4,13 @@ positions, account cache, Telegram. Lowest layer of the trading engine.
 
 Does NOT know about strategies or trade lifecycle.
 
+REV 10.9 (2026-10-02) — COSMETIC CLEANUP:
+  ✅ `_position_amt()` — `refresh_timestamp()` moved OUTSIDE the
+     retry loop (matches `fetch_position_raw` pattern). Previously
+     it was called on every retry, causing redundant server-time
+     fetches under rate-limit.
+     Zero behaviour change in practice.
+
 REV 10.8 (2026-09-30) — MAX_QTY FILTER SUPPORT (fix -4005 loop):
   ✅ get_filters() now reads and exposes the LOT_SIZE.maxQty field
      as `maxQty`. Previously only stepSize/minQty were read, so
@@ -633,9 +640,12 @@ def fetch_position_raw(symbol_short: str):
 
 
 def _position_amt(pair: str, retries: int = 3):
+    # REV 10.9 — refresh timestamp ONCE before retry loop (matches
+    # fetch_position_raw pattern; avoids re-fetching server time on
+    # every retry when the API is already rate-limited).
+    refresh_timestamp()
     for attempt in range(retries):
         try:
-            refresh_timestamp()
             with _requests_lock:
                 arr = _global_client.futures_position_information(symbol=pair)
             if arr:

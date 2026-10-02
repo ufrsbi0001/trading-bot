@@ -1,6 +1,14 @@
 """
 indicators.py — V2.9.9 (2026-09-24) for BEST_SCALP_V2.
 
+REV 3.4 (2026-10-02) — DEAD FUNCTION CLEANUP:
+  ✅ Removed legacy functions (no live consumers, verified via grep):
+       • get_futures_sentiment()       — legacy, no callers
+       • get_liquidation_pressure()    — legacy, no callers
+     Also removed their module-level caches (_fut_*, _liq_*,
+     _LIQ_404_*) and the LIQUIDATION 401/404 GUARD block.
+     Zero behaviour change — nothing imported them.
+
 REV 3.3 (2026-10-02) — FULLY DELEGATED TO config_center:
   ✅ `_BASE_CFG` module-level dict REMOVED (was dead code after
      funding threshold migrated). All config reads now go through
@@ -95,13 +103,6 @@ from core.config_center import (
 )
 
 UTC = timezone.utc
-
-
-# ─────────────────────────────────────────────────────────────
-# LIQUIDATION 401/404 GUARD
-# ─────────────────────────────────────────────────────────────
-_LIQ_404_CACHED: dict[str, Any] = {"hit": False, "time": 0.0}
-_LIQ_404_LOCK = threading.Lock()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -264,61 +265,6 @@ def get_fear_greed_index() -> tuple[int, str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# FUTURES SENTIMENT  (legacy — no live consumers; kept public)
-# ─────────────────────────────────────────────────────────────
-_fut_cache: dict[str, dict] = {}
-_fut_lock = threading.Lock()
-_FUT_TTL = 120
-
-
-def get_futures_sentiment(symbol: str) -> dict:
-    now = time.time()
-    with _fut_lock:
-        hit = _fut_cache.get(symbol)
-        if hit and now - hit["time"] < _FUT_TTL:
-            return hit["data"]
-
-    out = {"funding": 0.0, "funding_annual": 0.0, "oi_change_pct": 0.0,
-           "oi_trend": "FLAT", "sentiment": "NEUTRAL"}
-    pair = symbol if symbol.endswith("USDT") else symbol + "USDT"
-
-    pi = _http_get_json("https://fapi.binance.com/fapi/v1/premiumIndex",
-                        {"symbol": pair})
-    if pi:
-        funding = float(pi.get("lastFundingRate", 0.0))
-        out["funding"] = funding
-        out["funding_annual"] = funding * 3 * 365 * 100
-
-    oi_resp = _http_get_json("https://fapi.binance.com/fapi/v1/openInterest",
-                             {"symbol": pair})
-    if oi_resp:
-        oi_now = float(oi_resp.get("openInterest", 0.0))
-        hist = _http_get_json(
-            "https://fapi.binance.com/futures/data/openInterestHist",
-            {"symbol": pair, "period": "5m", "limit": 2},
-        )
-        if hist and len(hist) >= 2:
-            oi_prev = float(hist[-2]["sumOpenInterest"])
-            if oi_prev > 0:
-                out["oi_change_pct"] = (oi_now - oi_prev) / oi_prev * 100
-
-        if out["oi_change_pct"] > 1.0:
-            out["oi_trend"] = "RISING"
-        elif out["oi_change_pct"] < -1.0:
-            out["oi_trend"] = "FALLING"
-
-        # REV 3.3 — funding threshold from config_center (live source)
-        if out["funding"] > _CC_GLOBAL["funding_extreme"]:
-            out["sentiment"] = "LONG_CROWDED"
-        elif out["funding"] < -_CC_GLOBAL["funding_extreme"]:
-            out["sentiment"] = "SHORT_CROWDED"
-
-    with _fut_lock:
-        _fut_cache[symbol] = {"data": out, "time": now}
-    return out
-
-
-# ─────────────────────────────────────────────────────────────
 # FUNDING RATE Z-SCORE
 # ─────────────────────────────────────────────────────────────
 _fr_cache: dict[str, dict] = {}
@@ -356,69 +302,6 @@ def get_funding_rate_z(symbol: str) -> dict:
 
     with _fr_lock:
         _fr_cache[symbol] = {"data": out, "time": now}
-    return out
-
-
-# ─────────────────────────────────────────────────────────────
-# LIQUIDATION CLUSTERS  (legacy — no live consumers; kept public)
-# ─────────────────────────────────────────────────────────────
-_liq_cache: dict[str, dict] = {}
-_liq_lock = threading.Lock()
-_LIQ_TTL = 86400
-
-
-def get_liquidation_pressure(symbol: str) -> dict:
-    now = time.time()
-
-    if _LIQ_404_CACHED.get("hit") and now - _LIQ_404_CACHED.get("time", 0) < 86400:
-        return {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "bias": "BALANCED"}
-
-    with _liq_lock:
-        hit = _liq_cache.get(symbol)
-        if hit and now - hit["time"] < _LIQ_TTL:
-            return hit["data"]
-
-    out = {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "bias": "BALANCED"}
-    pair = symbol if symbol.endswith("USDT") else symbol + "USDT"
-
-    try:
-        from core.client import get_client  # type: ignore
-        cl = get_client()
-        if cl is not None:
-            try:
-                orders = cl.futures_get_force_orders(
-                    symbol=pair, autoCloseType="LIQUIDATION", limit=100
-                )
-                if isinstance(orders, list) and orders:
-                    long_liq = 0.0
-                    short_liq = 0.0
-                    for o in orders:
-                        side = (o.get("side") or "").upper()
-                        qty = float(o.get("origQty", 0) or 0)
-                        price = float(o.get("price", 0) or 0)
-                        usd = qty * price
-                        if side == "SELL":
-                            long_liq += usd
-                        elif side == "BUY":
-                            short_liq += usd
-                    out["long_liq_usd"] = round(long_liq, 2)
-                    out["short_liq_usd"] = round(short_liq, 2)
-                    total = long_liq + short_liq
-                    if total > 0:
-                        if long_liq > short_liq * 1.5:
-                            out["bias"] = "LONG_SQUEEZE"
-                        elif short_liq > long_liq * 1.5:
-                            out["bias"] = "SHORT_SQUEEZE"
-            except Exception as e:
-                with _LIQ_404_LOCK:
-                    _LIQ_404_CACHED["hit"] = True
-                    _LIQ_404_CACHED["time"] = now
-                logger.debug(f"forceOrders client call failed {pair}: {e}")
-    except Exception as e:
-        logger.debug(f"liquidation import fail: {e}")
-
-    with _liq_lock:
-        _liq_cache[symbol] = {"data": out, "time": now}
     return out
 
 
