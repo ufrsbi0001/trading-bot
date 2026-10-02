@@ -1,5 +1,14 @@
 """
-families/base.py — Shared signal-engine core for all 4 families.
+signals/base.py — Shared signal-engine core for all 4 families.
+
+REV 22.2 (2026-10-02) — VOL CLASS CAP ADJUSTMENT:
+  ✅ `_mk()` now applies vol_class multiplier to caps:
+       LOW  × 0.80 (majors — tighter caps)
+       MED  × 1.00 (baseline)
+       HIGH × 1.40 (wild alts — wider caps)
+     BTC (LOW) gets 4.5% × 0.8 = 3.6% SL cap.
+     HYPE (HIGH) gets 4.5% × 1.4 = 6.3% SL cap.
+     Reads from core/family_baselines.py via coins_config.
 
 REV 22.1 (2026-10-02) — CONFIG CENTER INTEGRATION (Phase 1):
   ✅ Added `config_center` import.
@@ -7,30 +16,12 @@ REV 22.1 (2026-10-02) — CONFIG CENTER INTEGRATION (Phase 1):
      and late_guard_* from config_center.get_config() — single source
      of truth. Falls back to st_params / spec defaults if missing.
   ✅ Regime multipliers (sl_mult / tp_mult) now come from
-     config_center.REGIME (VOLATILE 0.70, CHOP 0.45 — indicators.py
-     previously had these INVERTED at 1.3 / 1.0).
+     config_center.REGIME (VOLATILE 0.70, CHOP 0.45).
 
 REV 22.0 (2026-10-01) — PHASE 1 (3 CHANGES):
   ✅ CHANGE 3 — Extended-move guard added.
   ✅ CHANGE 4 — Late-entry guard enforced.
   ✅ CHANGE 5 — Orderbook confidence modifier (±3).
-
-REV 21.7 (2026-09-30) — RR ENFORCEMENT + REVERSAL TP2 MULT.
-REV 21.6.1 (2026-09-30) — TYPO FIX (mr_stoch_sell_max → mr_stoch_sell_min).
-REV 21.6 (2026-09-30) — PER-STRATEGY RR FLOOR.
-REV 21.5 (2026-09-30) — FLOAT TOLERANCE + RANGE_SCALPER WIDENING.
-REV 21.4 (2026-09-30) — RR FLOOR RECONCILED + MULTI-STRAT GATE + BTC EARLY REJECT.
-REV 21.3 (2026-09-30) — RR FLOOR HARMONIZED WITH PRE-GATE.
-REV 21.2 (2026-09-29) — FLOAT TOLERANCE + REJECTION REASON SURFACING.
-REV 21.1 (2026-09-29) — SIMPLIFICATION + TUNING PASS.
-Batch 3.9 (2026-09-29) — RR BUFFER + ST ALIGNMENT FOR REVERSALS.
-Batch 3.8 (2026-09-29) — RANGE_BAD DIAGNOSTIC VALUE.
-Batch 3.7 (2026-09-29) — STRUCTURAL UNLOCK FIXES.
-Batch 3.6 (2026-09-28) — NY_PM BLOCK HONOURS KZ_BYPASS.
-Batch 3.5 (2026-09-28) — STRATEGY QUALITY IMPROVEMENTS.
-Batch 3.2 (2026-09-28) — DEAD-IMPORT CLEANUP.
-Batch 3.1 (2026-09-28) — RS_SL_ATR FIELD.
-Batch 3.0 (2026-09-28) — CONSOLIDATED REFACTOR.
 """
 from __future__ import annotations
 
@@ -41,6 +32,7 @@ from core.config import CONFIG
 from core.coins_config import (
     get_caps, get_profile, is_enabled,
     get_coin_filters, get_coin_st_params, get_coin_td_fade,
+    get_coin_vol_class, get_vol_class_mult,     # REV 22.2
 )
 from market.indicators import htf_aligns as _htf_aligns_shared
 
@@ -492,9 +484,30 @@ def _mk(spec: FamilySpec, side, conf, entry, sl, tp1, tp2,
         pass
 
     caps = _get_caps_safe(spec, symbol)
+
+    # ── REV 22.2 — Vol class cap adjustment ──
+    # Volatility class (LOW/MED/HIGH) scales caps so stable majors
+    # (BTC, ETH) and wild alts (HYPE, MORPHO) get appropriately
+    # sized SL/TP windows.
+    #
+    #   LOW  × 0.80 → BTC SL cap 4.5% × 0.8 = 3.6%
+    #   MED  × 1.00 → APT SL cap 6.0% × 1.0 = 6.0%
+    #   HIGH × 1.40 → HYPE SL cap 4.5% × 1.4 = 6.3%
     max_sl_pct  = caps["sl"]
     max_tp1_pct = caps["tp1"]
     max_tp2_pct = caps["tp2"]
+    try:
+        vcls = get_coin_vol_class(symbol) or "MED"
+        vmult = get_vol_class_mult(vcls)
+        max_sl_pct  *= vmult
+        max_tp1_pct *= vmult
+        max_tp2_pct *= vmult
+        if _DEBUG_STRAT:
+            print(f"[_mk] {symbol} vol_class={vcls} mult={vmult:.2f} "
+                  f"→ caps sl={max_sl_pct:.4f} tp1={max_tp1_pct:.4f} tp2={max_tp2_pct:.4f}")
+    except Exception as _vce:
+        if _DEBUG_STRAT:
+            print(f"[_mk] {symbol} vol_class mult failed: {_vce}")
 
     if entry <= 0:
         if _DEBUG_STRAT:
@@ -581,10 +594,6 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
     filters = get_coin_filters(symbol)
     st_params = get_coin_st_params(symbol)
 
-    # ── REV 22.1 — Centralized config (single source of truth) ──
-    # Extract regime EARLY so _cfg is available for late-guard AND
-    # SL/TP calculations. Falls back gracefully if config_center
-    # isn't importable.
     regime = ind_1h.get("regime", "UNKNOWN") if ind_1h else "UNKNOWN"
     _cfg = _get_central_config(symbol, "SUPERTREND_RIDE", regime)
 
@@ -608,7 +617,6 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
     block_ny_am   = filters.get("block_ny_am",  spec.block_ny_am_for_st)
     block_ny_pm   = filters.get("block_ny_pm",  False)
 
-    # ── REV 22.1 — late guard from config_center ──
     late_adx = float(_cfg.get("late_guard_adx",
                               filters.get("late_guard_adx",
                                           spec.late_entry_guard_adx)))
@@ -628,7 +636,6 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
     st_flips = ind_1h.get("st_flips", 0)
     adx      = ind_1h.get("adx", 0)
     rsi      = ind_1h.get("rsi", 50)
-    # NOTE: `regime` already extracted at top of function
 
     if st_trend == "N/A":
         tracker.rej("SUPERTREND_RIDE", "st_na"); return None
@@ -652,10 +659,6 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
     if price <= 0 or atr <= 0:
         tracker.rej("SUPERTREND_RIDE", "bad_data"); return None
 
-    # ── REV 22.1 — SL/TP multipliers from config_center ──
-    # config_center already merges: GLOBAL → REGIME → STRATEGY_REGIME
-    # → FAMILY → COIN. `sl_atr` / `tp1_atr` / `tp2_atr` come from
-    # coin st_params; `sl_mult` / `tp_mult` come from REGIME.
     _coin_sl  = st_params.get("sl_atr",  2.5)
     _coin_tp1 = st_params.get("tp1_atr", 2.5)
     _coin_tp2 = st_params.get("tp2_atr", 5.0)
@@ -712,7 +715,6 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
             if abs(tp2 - price) < _min_tp1 * 1.5:
                 tp2 = price + _min_tp1 * 1.5
 
-        # ── REV 22.0 — LATE GUARD (BUY) ──
         if adx > late_adx and rsi > late_rsi:
             tracker.rej("SUPERTREND_RIDE", f"late_{adx:.0f}_{rsi:.0f}")
             return None
@@ -770,7 +772,6 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
             if abs(price - tp2) < _min_tp1 * 1.5:
                 tp2 = price - _min_tp1 * 1.5
 
-        # ── REV 22.0 — LATE GUARD (SELL) ──
         if adx > late_adx and rsi < (100.0 - late_rsi):
             tracker.rej("SUPERTREND_RIDE", f"late_{adx:.0f}_{rsi:.0f}")
             return None
@@ -1178,9 +1179,6 @@ def generate_signal_live(spec: FamilySpec, tracker: DiagnosticsTracker,
 
         return "NEUTRAL", 0.0, rej_summary, empty_lvl, "NONE"
 
-    # ═══════════════════════════════════════════════════════════
-    #  REV 22.0 — EXTENDED-MOVE GUARD (CHANGE 3)
-    # ═══════════════════════════════════════════════════════════
     _ext_ok, _ext_reason = _extended_entry_guard(
         ind_1h, ind_4h, result["side"], symbol
     )

@@ -1,67 +1,17 @@
 """
-coins/trend/hype.py — HYPEUSDT per-coin config.
+hype.py — HYPEUSDT coin configuration (IDENTITY ONLY).
 
-REV 20.1 (2026-09-28) — RSI BANDS WIDENED (HIGH tier):
-  ✅ BUY  min/max 38/68 → 32/73
-  ✅ SELL min/max 32/62 → 27/67
-  Aligns with trend family-wide REV 20.2 widening. See btc.py
-  header for the full rationale.
-
-REV 19.19 (2026-09-27) — ENABLED=DISABLED (liquidity guard):
-  ✅ Kept ENABLED=False — Binance spot vol only $9.4M; below
-     the $15M floor used across the trend family. Revisit when
-     sustained Binance volume > $20M.
-  ✅ Docstring note clarified (was implicit placeholder only).
-
-REV 19.18 (2026-09-27) — NEW COIN.
-REV 19.0 (2026-09-22) — auto-generated.
+Tuning (ST_PARAMS, CAPS, FILTERS) comes from:
+  core/family_baselines.py → BASELINES["trend_coins"]
 """
+from __future__ import annotations
 
 SYMBOL     = "HYPEUSDT"
 BASE       = "HYPE"
 FAMILY     = "trend_coins"
 PROFILE    = "TREND"
-ENABLED    = False
 VOL_CLASS  = "HIGH"
-
-CAPS = {
-    "sl":  0.0542,
-    "tp1": 0.0870,       # 1.6x SL (SOL canonical)
-    "tp2": 0.1735,       # 3.2x SL (SOL canonical)
-}
-
-ST_PARAMS = {
-    "sl_atr":  2.5,
-    "tp1_atr": 4.0,
-    "tp2_atr": 8.0,
-}
-
-FILTERS = {
-    "rsi_buy_min":  32.0,   # was 38.0 (REV 20.1)
-    "rsi_buy_max":  73.0,   # was 68.0
-    "rsi_sell_min": 27.0,   # was 32.0
-    "rsi_sell_max": 67.0,   # was 62.0
-    "min_flips":    4,
-    "max_flips":    10,
-    "min_dist_atr": 0.3,
-    "max_dist_atr": 1.4,
-    "min_adx_st":   22.0,
-    "late_guard_adx":  35.0,
-    "late_guard_dist": 1.0,
-    "late_guard_rsi":  58.0,
-    "top_chase_rsi":   68.0,
-    "top_chase_flips": 4,
-    "block_ny_am":  False,
-    "block_ny_pm":  False,
-    "mr_rsi_buy_max":    35.0,
-    "mr_rsi_sell_min":   65.0,
-    "mr_stoch_buy_max":  32.0,
-    "mr_stoch_sell_min": 68.0,
-    "cf_rsi_buy_max":    35.0,
-    "cf_rsi_sell_min":   65.0,
-    "rs_rsi_buy_max":    40.0,
-    "rs_rsi_sell_min":   60.0,
-}
+ENABLED    = False
 
 TD_FADE = {
     "rsi_sell":     65.0,

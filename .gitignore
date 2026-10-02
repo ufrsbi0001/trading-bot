@@ -70,3 +70,6 @@ fix_corruption.py
 # ─── Keep these (override patterns above) ───────
 !data/.gitkeep
 !data/Logs/.gitkeep
+
+# Audit report (temp)
+audit_coin_tuning.json

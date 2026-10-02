@@ -1,64 +1,17 @@
 """
-coins/trend/gram.py — GRAMUSDT per-coin config.
+gram.py — GRAMUSDT coin configuration (IDENTITY ONLY).
 
-REV 20.1 (2026-09-28) — RSI BANDS WIDENED (LOW tier):
-  ✅ BUY  min/max 42/62 → 38/67
-  ✅ SELL min/max 40/58 → 35/63
-  Same delta as btc.py — see btc.py header for rationale.
-
-REV 19.19 (2026-09-27) — ENABLED reverted True → False (liquidity guard).
-REV 19.17 (2026-09-27) — LOW-TIER TP1 RATIO FIX.
-REV 19.16 (2026-09-26) — SYMBOL FIX.
-REV 19.15 (2026-09-26) — COMMENT ACCURACY PASS.
-REV 19.14 (2026-09-25) — LOW TIER ALIGNMENT.
-REV 19.8 (2026-09-24) — TREND FAMILY.
+Tuning (ST_PARAMS, CAPS, FILTERS) comes from:
+  core/family_baselines.py → BASELINES["trend_coins"]
 """
+from __future__ import annotations
 
 SYMBOL     = "GRAMUSDT"
 BASE       = "GRAM"
 FAMILY     = "trend_coins"
 PROFILE    = "TREND"
-ENABLED    = False
 VOL_CLASS  = "LOW"
-
-CAPS = {
-    "sl":  0.0380,
-    "tp1": 0.0570,       # ~1.5x SL (0.0380 * 1.5 = 0.0570)
-    "tp2": 0.0950,       # ~2.5x SL (0.0380 * 2.5 = 0.0950)
-}
-
-ST_PARAMS = {
-    "sl_atr":  2.5,
-    "tp1_atr": 3.75,     # was 3.5 (1.4x) — now 1.5x SL, matches CAPS
-    "tp2_atr": 6.25,
-}
-
-FILTERS = {
-    "rsi_buy_min":  38.0,   # was 42.0 (REV 20.1)
-    "rsi_buy_max":  67.0,   # was 62.0
-    "rsi_sell_min": 35.0,   # was 40.0
-    "rsi_sell_max": 63.0,   # was 58.0
-    "min_flips":    2,
-    "max_flips":    10,
-    "min_dist_atr": 0.2,
-    "max_dist_atr": 1.4,
-    "min_adx_st":   25.0,
-    "late_guard_adx":  35.0,
-    "late_guard_dist": 1.0,
-    "late_guard_rsi":  58.0,
-    "top_chase_rsi":   68.0,
-    "top_chase_flips": 4,
-    "block_ny_am":  False,
-    "block_ny_pm":  False,
-    "mr_rsi_buy_max":    32.0,
-    "mr_rsi_sell_min":   68.0,
-    "mr_stoch_buy_max":  28.0,
-    "mr_stoch_sell_min": 72.0,
-    "cf_rsi_buy_max":    32.0,
-    "cf_rsi_sell_min":   68.0,
-    "rs_rsi_buy_max":    35.0,
-    "rs_rsi_sell_min":   65.0,
-}
+ENABLED    = False
 
 TD_FADE = {
     "rsi_sell":     65.0,

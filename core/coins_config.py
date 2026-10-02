@@ -1,31 +1,54 @@
 """
 coins_config.py — Wrapper around coins/ directory.
 
-REV 21.7 (2026-09-30) — FALLBACK RR FIX:
-  ✅ `get_coin_st_params()` fallback now returns tp1_atr = 1.5 × sl_atr
-     (was equal to sl_atr → RR 1.0 → every unknown coin silently
-     rejected by the _mk() RR floor). New fallback gives RR 1.5.
+REV 22.0 (2026-10-02) — FAMILY-LEVEL BASELINES:
+  ✅ MAJOR REFACTOR: Config now comes from core/family_baselines.py.
+     Coin files are IDENTITY-ONLY (SYMBOL, FAMILY, VOL_CLASS, ENABLED).
+     
+     Changed:
+       • get_caps()            → reads family baseline CAPS
+       • get_coin_filters()    → reads family baseline FILTERS
+       • get_coin_st_params()  → reads family baseline ST_PARAMS
+     
+     Unchanged:
+       • Identity fields still come from coins/*.py
+       • get_family, get_profile, get_coin_vol_class — unchanged
+       • get_coin_td_fade — still per-coin (strategy-specific)
+     
+     Benefits:
+       • Single source of truth for tuning (family_baselines.py)
+       • 60 coin files → 8-line identity-only
+       • Tuning iterations: 60 edits → 1 edit
+       • Statistical power (family-level samples)
 
-REV 19.16 (2026-09-29) — DEAD DYNAMIC ROUTING REMOVED:
-  ✅ Removed `get_family_dynamic()` and its `_REGIME_TO_FAMILY` table.
-     This was added in REV 19.15 but immediately reverted by
-     family_router REV 19.17 — the family modules' `is_family_coin()`
-     guard rejects any symbol not in that family's FAMILY_COINS
-     registry, so dynamic routing caused every re-routed coin to be
-     rejected before any strategy could run (signal count dropped to
-     1-2 across 44 coins). Since REV 19.17, family_router._resolve()
-     uses static get_family() exclusively — get_family_dynamic() has
-     had ZERO consumers since. Removing it eliminates ~35 lines of
-     dead, confusing code.
-
+REV 21.7 (2026-09-30) — FALLBACK RR FIX.
+REV 19.16 (2026-09-29) — DEAD DYNAMIC ROUTING REMOVED.
 REV 19.14 (2026-09-26) — GET_CAPS() FALLBACK RATIO FIX.
 REV 19.13 (2026-09-26) — NORMALIZE WIRING + PUBLIC SURFACE.
-REV 19.12 (2026-09-25) — DYNAMIC DIAGNOSTIC + LOAD-ERROR SURFACING.
-REV 19.0 (2026-09-22) — FILE-PER-COIN ARCHITECTURE.
+REV 19.0  (2026-09-22) — FILE-PER-COIN ARCHITECTURE.
 """
 from __future__ import annotations
 
 from coins import get_coin, all_coins, load_errors as _coin_load_errors
+
+# ── REV 22.0 — Family baselines (single source of truth) ──
+try:
+    from core.family_baselines import (
+        get_baseline as _get_family_baseline,
+        get_vol_class_mult as _get_vol_class_mult,
+        VOL_CLASS_CAP_MULT as _VOL_CLASS_CAP_MULT,
+    )
+except ImportError:
+    def _get_family_baseline(family):  # pragma: no cover — fallback
+        return {
+            "ST_PARAMS": {"sl_atr": 2.5, "tp1_atr": 3.75, "tp2_atr": 6.25},
+            "CAPS":      {"sl": 0.045, "tp1": 0.0675, "tp2": 0.1125},
+            "FILTERS":   {},
+        }
+    def _get_vol_class_mult(vcls):  # pragma: no cover
+        return 1.0
+    _VOL_CLASS_CAP_MULT = {"LOW": 1.0, "MED": 1.0, "HIGH": 1.0}
+
 
 __all__ = [
     # ── Symbol-taking accessors ──
@@ -40,6 +63,8 @@ __all__ = [
     "load_errors", "known_families",
     # ── Re-exports (used by family_router.py) ──
     "get_coin", "all_coins",
+    # ── REV 22.0 — Direct baseline access ──
+    "get_vol_class_mult",
 ]
 
 
@@ -55,9 +80,6 @@ def _normalize(symbol: str) -> str:
       "btcusdt"   → "BTCUSDT"
       "BTCUSDT"   → "BTCUSDT"
       ""          → ""    (get_coin returns None → defaults)
-
-    Note: non-USDT quotes (e.g. "BTCUSDC") are not handled by design —
-    the coin registry is USDT-only.
     """
     if not symbol:
         return ""
@@ -102,29 +124,76 @@ def is_known(symbol: str) -> bool:
         return False
 
 
+# ═══════════════════════════════════════════════════════════
+#  FAMILY BASELINE ACCESSORS (REV 22.0)
+# ═══════════════════════════════════════════════════════════
 def get_caps(symbol: str) -> dict:
     """
-    Return per-coin caps dict: {"sl": pct, "tp1": pct, "tp2": pct}.
+    Return family baseline caps dict: {"sl": pct, "tp1": pct, "tp2": pct}.
 
-    Fallback fires only on a double miss:
-      • coin not in registry / exception, AND
-      • family module also supplied no caps.
+    REV 22.0 — No longer per-coin. Reads from core/family_baselines.py.
 
-    Fallback ratios use the MED canonical TP1/SL (1.5x) and TP2/SL
-    (2.5x) — see REV 19.14.
+    Note: caps are the MAX allowed distances. Actual SL/TP are
+    computed by strategy functions (using ATR × st_params), then
+    clamped to these caps.
     """
     try:
-        c = get_coin(_normalize(symbol))
-        if c:
-            return dict(c["caps"])
+        family = get_family(symbol)
+        baseline = _get_family_baseline(family)
+        return dict(baseline["CAPS"])
     except Exception:
-        pass
-    # Last-resort safety net — MED canonical ratios (1.5x / 2.5x).
-    return {"sl": 0.045, "tp1": 0.0675, "tp2": 0.1125}
+        return {"sl": 0.045, "tp1": 0.0675, "tp2": 0.1125}
+
+
+def get_coin_filters(symbol: str) -> dict:
+    """
+    Return family baseline FILTERS dict.
+
+    REV 22.0 — No longer per-coin. Reads from core/family_baselines.py.
+
+    This includes: late_guard_*, top_chase_*, max_flips, min_flips,
+    min_adx_st, min_dist_atr, max_dist_atr, pullback_dist_atr,
+    rsi_buy_min/max, rsi_sell_min/max.
+    """
+    try:
+        family = get_family(symbol)
+        baseline = _get_family_baseline(family)
+        return dict(baseline["FILTERS"])
+    except Exception:
+        return {}
+
+
+def get_coin_st_params(symbol: str) -> dict:
+    """
+    Return family baseline ST_PARAMS dict.
+
+    REV 22.0 — No longer per-coin. Reads from core/family_baselines.py.
+
+    Returns {sl_atr, tp1_atr, tp2_atr} — the ATR multipliers for
+    SL and TP distances. Actual distances computed as ATR × multiplier.
+    """
+    try:
+        family = get_family(symbol)
+        baseline = _get_family_baseline(family)
+        return dict(baseline["ST_PARAMS"])
+    except Exception:
+        return {"sl_atr": 2.5, "tp1_atr": 3.75, "tp2_atr": 6.25}
+
+
+def get_vol_class_mult(vol_class: str) -> float:
+    """
+    Return cap multiplier for a vol class.
+
+    REV 22.0 — Used by signals/base.py::_mk() to adjust caps:
+      LOW  → 0.80 (majors need tighter caps)
+      MED  → 1.00 (baseline)
+      HIGH → 1.40 (wild alts need wider caps)
+    """
+    return _get_vol_class_mult(vol_class)
 
 
 # ═══════════════════════════════════════════════════════════
-#  REGISTRY-LEVEL ACCESSORS (no symbol arg → no normalize)
+#  REGISTRY-LEVEL ACCESSORS
 # ═══════════════════════════════════════════════════════════
 def get_family_coins(family: str) -> set[str]:
     """Return {symbol, ...} of ENABLED coins belonging to `family`."""
@@ -146,36 +215,8 @@ def enabled_coins() -> tuple[str, ...]:
 
 
 # ═══════════════════════════════════════════════════════════
-#  PER-COIN EXTRAS (used by family modules)
+#  PER-COIN EXTRAS (unused fields after REV 22.0 refactor)
 # ═══════════════════════════════════════════════════════════
-def get_coin_filters(symbol: str) -> dict:
-    """Return per-coin FILTERS dict, or {} if unknown."""
-    try:
-        c = get_coin(_normalize(symbol))
-        return dict(c["filters"]) if c else {}
-    except Exception:
-        return {}
-
-
-def get_coin_st_params(symbol: str) -> dict:
-    """
-    Return per-coin ST_PARAMS, or family-agnostic default.
-
-    REV 21.7 — fallback now produces RR 1.5 (was 1.0).
-    Old values (2.5 / 2.5) gave tp1_atr == sl_atr → RR 1.0 →
-    every unknown coin silently rejected. New values give
-    tp1_atr = 1.5 * sl_atr → RR 1.5.
-    """
-    try:
-        c = get_coin(_normalize(symbol))
-        if c:
-            return dict(c["st_params"])
-    except Exception:
-        pass
-    # REV 21.7 — RR 1.5 fallback.
-    return {"sl_atr": 2.5, "tp1_atr": 3.75, "tp2_atr": 6.25}
-
-
 def get_coin_vol_class(symbol: str) -> str:
     """Return volatility class label, or 'MED' if unknown."""
     try:
@@ -186,7 +227,12 @@ def get_coin_vol_class(symbol: str) -> str:
 
 
 def get_coin_td_fade(symbol: str) -> dict:
-    """Return per-coin TD_FADE params, or {} if unknown."""
+    """
+    Return per-coin TD_FADE params, or {} if unknown.
+
+    NOTE: TD_FADE is strategy-specific (falling-knife BUY logic),
+    so it stays per-coin. All OTHER tuning comes from family baselines.
+    """
     try:
         c = get_coin(_normalize(symbol))
         return dict(c["td_fade"]) if c else {}
@@ -208,7 +254,7 @@ def load_errors() -> dict[str, str]:
 
 def known_families() -> list[str]:
     """Return sorted list of distinct family NAMES present in the
-    loaded coin registry (e.g. ['momentum_coins', 'range_coins', ...])."""
+    loaded coin registry."""
     try:
         return sorted({c["family"] for c in all_coins().values()})
     except Exception:
@@ -216,11 +262,11 @@ def known_families() -> list[str]:
 
 
 # ═══════════════════════════════════════════════════════════
-#  DIAGNOSTIC — fully dynamic
+#  DIAGNOSTIC — REV 22.0
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print("=" * 70)
-    print("  COINS_CONFIG DIAGNOSTIC — REV 19.16 (file-per-coin)")
+    print("  COINS_CONFIG DIAGNOSTIC — REV 22.0 (family baselines)")
     print("=" * 70)
 
     errs = load_errors()
@@ -250,8 +296,34 @@ if __name__ == "__main__":
             coins = get_family_coins(fam)
             print(f"  {fam:<20} ({len(coins):>2}) → {sorted(coins)}")
 
-    # ── Sanity check: normalization ──
-    print("\nNormalization sanity check:")
+    # ── REV 22.0 — Baseline preview ──
+    print("\n" + "=" * 70)
+    print("  FAMILY BASELINE PREVIEW (REV 22.0)")
+    print("=" * 70)
+    for fam in fams:
+        baseline = _get_family_baseline(fam)
+        print(f"\n  {fam}:")
+        print(f"    ST_PARAMS: {baseline['ST_PARAMS']}")
+        print(f"    CAPS:      {baseline['CAPS']}")
+        print(f"    FILTERS:   {len(baseline['FILTERS'])} keys")
+
+    # ── Sample: Verify baseline is served ──
+    print("\n" + "=" * 70)
+    print("  SAMPLE LOOKUP (should serve from family baseline)")
+    print("=" * 70)
+    for sym in ("APTUSDT", "BTCUSDT", "HYPEUSDT"):
+        if sym in all_c:
+            print(f"\n  {sym}:")
+            print(f"    family:     {get_family(sym)}")
+            print(f"    vol_class:  {get_coin_vol_class(sym)}")
+            print(f"    ST_PARAMS:  {get_coin_st_params(sym)}")
+            print(f"    CAPS:       {get_caps(sym)}")
+            print(f"    FILTERS:    {len(get_coin_filters(sym))} keys")
+
+    # ── Normalization sanity check ──
+    print("\n" + "=" * 70)
+    print("  NORMALIZATION SANITY CHECK")
+    print("=" * 70)
     if all_c:
         sample = sorted(all_c)[0]
         bare = sample[:-4] if sample.endswith("USDT") else sample

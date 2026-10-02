@@ -1,46 +1,17 @@
 """
-coins/trend/ethfi.py — ETHFIUSDT per-coin config.
+ethfi.py — ETHFIUSDT coin configuration (IDENTITY ONLY).
 
-2026-09-29 — INITIAL: Ether.fi. Trend family, MED tier.
-  Liquid staking token. ETH-correlated trends.
+Tuning (ST_PARAMS, CAPS, FILTERS) comes from:
+  core/family_baselines.py → BASELINES["trend_coins"]
 """
+from __future__ import annotations
 
 SYMBOL     = "ETHFIUSDT"
 BASE       = "ETHFI"
 FAMILY     = "trend_coins"
 PROFILE    = "TREND"
-ENABLED    = True
 VOL_CLASS  = "MED"
-
-CAPS = {
-    "sl":  0.050,
-    "tp1": 0.075,
-    "tp2": 0.125,
-}
-
-ST_PARAMS = {
-    "sl_atr":  2.4,
-    "tp1_atr": 3.6,   # AUTO-FIX RR 1.250 → 1.5
-    "tp2_atr": 6.0,
-}
-
-FILTERS = {
-    "rsi_buy_min":  38.0,
-    "rsi_buy_max":  70.0,
-    "rsi_sell_min": 30.0,
-    "rsi_sell_max": 65.0,
-    "min_flips":    3,
-    "max_flips":    10,
-    "min_dist_atr": 0.2,
-    "max_dist_atr": 1.4,
-    "min_adx_st":   22.0,
-    "mr_rsi_buy_max":    32.0,
-    "mr_rsi_sell_min":   68.0,
-    "mr_stoch_buy_max":  25.0,
-    "mr_stoch_sell_min": 75.0,
-    "rs_rsi_buy_max":    35.0,
-    "rs_rsi_sell_min":   65.0,
-}
+ENABLED    = True
 
 TD_FADE = {
     "rsi_sell":     65.0,
