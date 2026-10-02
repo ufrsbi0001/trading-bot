@@ -10,29 +10,31 @@ Evaluates each candidate trade across 6 independent dimensions:
   5. Position correlation (max concurrent same-side)
   6. Volatility regime filter
 
-Approval requires MIN_APPROVALS (currently 5/6) filter passes.
-All decisions are logged with reasoning for audit.
+Approval requires MIN_APPROVALS filter passes.
 
-REV 1.3.0 (2026-09-30) — DOCSTRING / COMMENT TRUTH-UP:
-  ✅ Updated the module docstring, DecisionScore.total_filters comment,
-     evaluate_trade() docstring, and the inline MIN_APPROVALS comment
-     to reflect the CURRENT value (5/6). Previously these said "(default
-     3/6)" or "(3)" — leftovers from the REV 1.2.0 tightening pass that
-     bumped MIN_APPROVALS from 3 to 5 but never updated the docs.
-     Pure documentation fix — NO behaviour change.
+REV 4.1 (2026-10-02) — PHASE 1 CLEANUP:
+  ✅ COUNTER_TREND_STRATEGIES ab core/config_center.py se import hoti
+     hai (pehle is file mein hardcoded duplicate thi). Naya strategy
+     add karne ke liye sirf config_center edit karein — yahan kuch
+     nahi chhedna padega.
 
-REV 1.2.1 (2026-09-29) — SAME-SIDE CAP FROM CONFIG:
-  ✅ MAX_SAME_SIDE_POSITIONS is now read from CONFIG.max_same_side_positions
-     (config.py REV 1.5.0) instead of being hardcoded to 2. Tune via
-     .env `MAX_SAME_SIDE_POSITIONS=3` — no code change needed.
+REV 4.0 (2026-10-02) — CENTRALIZED CONFIG (config_center.DECISION):
+  ✅ Saari hardcoded values ab core/config_center.py ke DECISION dict
+     se aati hain. Yeh file sirf LOGIC rakhti hai, values nahi.
+  ✅ Tuning ke liye:
+       • core/config_center.py → DECISION dict edit karein, YA
+       • .env mein CC_DEC_<key>=value set karein
+     e.g., CC_DEC_MIN_APPROVALS=4, CC_DEC_BTC_BIAS_MODE=high_risk_only
+  ✅ _btc_bias_blocks() ab 3 modes support karta hai:
+       • "disabled"       → gate band
+       • "high_risk_only" → sirf high-risk meme coins block
+       • "full"           → har TREND_UP mein SHORT block (purana behavior)
+  ✅ _btc_bias_blocks() ab `symbol` parameter leta hai (high-risk filter ke liye).
+  ✅ Callers (is file + base.py) `symbol` pass karte hain.
 
-REV 1.2.0 (2026-09-29) — SIMPLIFICATION PASS:
-  ✅ Removed `_filter_funding()` — dead filter.
-  ✅ MIN_APPROVALS 5/7 → 3/6. [then later re-tightened to 5/6]
-  ✅ DecisionScore.total_filters 7 → 6.
-  ✅ WR_MULT_MIN 0.70 → 0.85; WR_MULT_MAX 1.15 → 1.10.
-  ✅ WR_MULT_MIN_TRADES 10 → 15.
-
+REV 1.3.0 (2026-09-30) — DOCSTRING / COMMENT TRUTH-UP.
+REV 1.2.1 (2026-09-29) — SAME-SIDE CAP FROM CONFIG.
+REV 1.2.0 (2026-09-29) — SIMPLIFICATION PASS.
 REV 1.1.0 (2026-09-29) — FUNDING FILTER + WR CAP FIX. [superseded]
 REV 1.0.6 (2026-09-29) — SOLE MTF FILTER + DOC CLARITY.
 REV 1.0.5 (2026-09-29) — GLOBAL BTC BIAS HARD GATE.
@@ -52,56 +54,72 @@ from typing import Optional
 from core.client import logger
 from core.config import CONFIG       # needed for MTF flag + same-side cap
 
+# ── REV 4.0 — Centralized decision config ──
+# ── REV 4.1 — COUNTER_TREND_STRATEGIES bhi yahan se import ──
+try:
+    from core.config_center import get_decision_cfg as _get_decision_cfg
+    from core.config_center import COUNTER_TREND_STRATEGIES
+    _DEC = _get_decision_cfg()
+except Exception as _e:
+    # Graceful fallback — agar config_center load na ho to defaults
+    print(f"[decision_engine] config_center unavailable ({_e}) — using defaults")
+    _DEC = {
+        "min_approvals": 5, "total_filters": 6,
+        "btc_bias_enabled": True, "btc_bias_mode": "full",
+        "btc_bias_high_risk_coins": frozenset(),
+        "btc_regime_ttl_sec": 600,
+        "adx_counter_trend_hard_max": 45.0,
+        "adx_counter_trend_soft_max": 35.0,
+        "atr_ratio_extreme": 2.5,
+        "loss_streak_trigger": 4, "loss_streak_cooldown_min": 60,
+        "wr_mult_min": 0.85, "wr_mult_max": 1.10, "wr_mult_min_trades": 15,
+    }
+    COUNTER_TREND_STRATEGIES = frozenset({
+        "TREND_DOWN_FADE",
+        "MEAN_REVERSION",
+        "RANGE_SCALPER",
+        "CHOP_FADE",
+    })
+
 
 # ═════════════════════════════════════════════════════════════
-#  TUNABLES
+#  TUNABLES — REV 4.0: ab config_center se aate hain
+#  Tuning ke liye: core/config_center.py ka DECISION dict
+#  ya .env mein CC_DEC_* env vars set karein.
 # ═════════════════════════════════════════════════════════════
-# REV 1.3.0 — value is 5 (raised from 3 in an earlier tightening pass).
-# The comment MUST reflect the live value; future drift would be
-# misleading (like it was between REV 1.2.0 and REV 1.3.0).
-MIN_APPROVALS              = 5      # 5/6 filters must pass
+MIN_APPROVALS              = _DEC["min_approvals"]
+TOTAL_FILTERS              = _DEC["total_filters"]
 
-ADX_COUNTER_TREND_HARD_MAX = 45.0
-ADX_COUNTER_TREND_SOFT_MAX = 35.0
-ATR_RATIO_EXTREME          = 2.5
+ADX_COUNTER_TREND_HARD_MAX = _DEC["adx_counter_trend_hard_max"]
+ADX_COUNTER_TREND_SOFT_MAX = _DEC["adx_counter_trend_soft_max"]
+ATR_RATIO_EXTREME          = _DEC["atr_ratio_extreme"]
 
-# ── Effective position-count math (REV 1.2.1) ──
-#   CONFIG.max_open_positions       = 6  (total slot cap in orders/)
-#   CONFIG.max_same_side_positions  = 3  (from .env; config REV 1.5.0)
-# Effective ceiling = 3 same-side LONG + 3 same-side SHORT = 6.
-# The 6-slot cap is an ORDERS-layer limit. The same-side cap is a
-# DECISION-layer limit — it can only reduce the effective count.
-# Both must be satisfied.
-#
-# Read from CONFIG so it can be tuned via .env:
-#   MAX_SAME_SIDE_POSITIONS=3  → 3+3=6 effective slots
+# Same-side cap — still from CONFIG (.env MAX_SAME_SIDE_POSITIONS)
 MAX_SAME_SIDE_POSITIONS = CONFIG.max_same_side_positions
 
-LOSS_STREAK_TRIGGER        = 4
-LOSS_STREAK_COOLDOWN_MIN   = 60
+LOSS_STREAK_TRIGGER        = _DEC["loss_streak_trigger"]
+LOSS_STREAK_COOLDOWN_MIN   = _DEC["loss_streak_cooldown_min"]
 
-# BTC global bias gate
-BLOCK_COUNTERTREND_TO_BTC  = True   # If False, BTC gate is a no-op
-BTC_REGIME_TTL_SEC         = 600    # Stale BTC regime older → UNKNOWN
+# ── BTC global bias gate ──
+BLOCK_COUNTERTREND_TO_BTC  = _DEC["btc_bias_enabled"]
+BTC_BIAS_MODE              = _DEC["btc_bias_mode"]            # "full" | "high_risk_only" | "disabled"
+BTC_BIAS_HIGH_RISK_COINS   = _DEC["btc_bias_high_risk_coins"] # frozenset
+BTC_REGIME_TTL_SEC         = _DEC["btc_regime_ttl_sec"]
 
-# REV 1.2.0 — win-rate multiplier bounds (narrower than before)
-WR_MULT_MIN                = 0.85   # was 0.70
-WR_MULT_MAX                = 1.10   # was 1.15
-WR_MULT_MIN_TRADES         = 15     # was 10
+# ── Win-rate multiplier bounds ──
+WR_MULT_MIN                = _DEC["wr_mult_min"]
+WR_MULT_MAX                = _DEC["wr_mult_max"]
+WR_MULT_MIN_TRADES         = _DEC["wr_mult_min_trades"]
 
-COUNTER_TREND_STRATEGIES = {
-    "TREND_DOWN_FADE",
-    "MEAN_REVERSION",
-    "RANGE_SCALPER",
-    "CHOP_FADE",
-}
+# NOTE (REV 4.1): COUNTER_TREND_STRATEGIES is now imported from
+# core.config_center above. Single source of truth — edit there only.
 
 
 @dataclass
 class DecisionScore:
     approved: bool = False
     approvals: int = 0
-    total_filters: int = 6      # REV 1.2.0: 7 → 6 (funding filter removed)
+    total_filters: int = TOTAL_FILTERS
     top_reason: str = ""
     reasons: list = field(default_factory=list)
     detail: dict = field(default_factory=dict)
@@ -377,14 +395,37 @@ def _filter_volatility(ind_1h: dict):
 
 # ═════════════════════════════════════════════════════════════
 #  BTC BIAS GATE (helper)
+#  REV 4.0 — 3 modes support (full | high_risk_only | disabled)
 # ═════════════════════════════════════════════════════════════
-def _btc_bias_blocks(side: str) -> Optional[str]:
+def _btc_bias_blocks(side: str, symbol: str = "") -> Optional[str]:
     """
-    Returns a rejection reason string if the side conflicts with the
-    current BTC regime; otherwise None.
+    REV 4.0 — BTC bias gate with 3 modes.
+
+    Modes (config_center.DECISION.btc_bias_mode):
+      • "disabled"       → gate OFF, no block
+      • "high_risk_only" → sirf high-risk meme coins block
+      • "full"           → har TREND_UP mein SHORT block,
+                            TREND_DOWN mein LONG block
+
+    Returns rejection reason string, or None if allowed.
     """
     if not BLOCK_COUNTERTREND_TO_BTC:
         return None
+
+    if BTC_BIAS_MODE == "disabled":
+        return None
+
+    # Normalize symbol for high-risk check
+    _sym = (symbol or "").upper()
+    if _sym and not _sym.endswith("USDT"):
+        _sym += "USDT"
+
+    # High-risk-only mode: allow all other coins freely
+    if BTC_BIAS_MODE == "high_risk_only":
+        if not _sym or _sym not in BTC_BIAS_HIGH_RISK_COINS:
+            return None
+
+    # Full mode or high-risk coin → check regime
     regime = get_btc_regime()
     if regime == "TREND_UP" and side == "SELL":
         return "BTC_TREND_UP_blocks_SHORT"
@@ -403,13 +444,15 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
     """
     Two HARD GATES before the vote:
 
-      GATE 1: BTC global bias. If BTC is TREND_UP, all SELLs are
-              rejected. If TREND_DOWN, all BUYs are rejected.
+      GATE 1: BTC global bias. Depends on btc_bias_mode:
+              • "full"           → TREND_UP blocks all SELLs
+              • "high_risk_only" → sirf high-risk meme coins block
+              • "disabled"       → gate OFF
 
       GATE 2: Same-side correlation limit (CONFIG.max_same_side_positions).
 
     If both gates pass, the 6-filter vote runs.
-    Approve iff approvals >= MIN_APPROVALS (currently 5/6).
+    Approve iff approvals >= MIN_APPROVALS.
     """
     result = DecisionScore()
     active = active_trades_list or []
@@ -417,17 +460,17 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
     # ═══════════════════════════════════════════════════════════
     #  HARD GATE #1 — BTC global bias
     # ═══════════════════════════════════════════════════════════
-    btc_reason = _btc_bias_blocks(side)
+    btc_reason = _btc_bias_blocks(side, symbol)
     if btc_reason:
         result.approved = False
         result.approvals = 0
-        result.total_filters = 6
+        result.total_filters = TOTAL_FILTERS
         result.top_reason = f"HARD_REJECT: {btc_reason}"
         result.reasons = [f"btc_bias:{btc_reason}"]
         result.detail["btc_bias"] = {"pass": False, "reason": btc_reason}
         logger.warning(
             f"[decision] 🚫 HARD REJECT {symbol} {side} [{strategy}] — "
-            f"BTC regime={get_btc_regime()} → {btc_reason} | "
+            f"BTC regime={get_btc_regime()} mode={BTC_BIAS_MODE} → {btc_reason} | "
             f"conf={conf:.0f}% rr={rr:.2f}"
         )
         return result
@@ -439,7 +482,7 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
     if same_side_count >= MAX_SAME_SIDE_POSITIONS:
         result.approved = False
         result.approvals = 0
-        result.total_filters = 6
+        result.total_filters = TOTAL_FILTERS
         result.top_reason = (
             f"HARD_REJECT: {same_side_count} same-side already open "
             f"(max {MAX_SAME_SIDE_POSITIONS})"
@@ -476,7 +519,6 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
                *_filter_correlation(side, active))
     result.add("volatility",
                *_filter_volatility(ind_1h))
-    # REV 1.2.0 — funding filter removed (dead)
 
     result.approved = result.approvals >= MIN_APPROVALS
     result.top_reason = (
@@ -518,4 +560,7 @@ def get_stats() -> dict:
         "by_strategy": by_strat,
         "paused_strategies": pauses,
         "btc_regime": get_btc_regime(),
+        "btc_bias_mode": BTC_BIAS_MODE,
+        "min_approvals": MIN_APPROVALS,
+        "total_filters": TOTAL_FILTERS,
     }

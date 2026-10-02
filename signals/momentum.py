@@ -1,29 +1,34 @@
 """
 momentum_coins.py — MOMENTUM family signal engine.
 
-REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
-  ✅ Removed dead late_entry_guard_* / top_chase_* from FamilySpec.
-     config_center.py provides these values via _cfg.
+REV 23.2 (2026-10-02) — PHASE 3 CLEANUP:
+  ✅ Legacy sizing helpers removed from imports and __all__.
+  ✅ FALLBACK_CAPS now sourced from config_center.FAMILY[*]["CAPS"].
+     Was: {"sl": 0.060, "tp1": 0.060, "tp2": 0.150}
+     Now: {"sl": 0.060, "tp1": 0.090, "tp2": 0.150} (config_center)
+  ✅ st_rsi_sell_floor / rsi_buy_overbought / rsi_sell_oversold now
+     live in config_center.FAMILY[*]["FILTERS"].
 
+REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP.
 REV 21.2 (2026-09-30) — FAMILY-SPECIFIC TUNING.
 """
 from __future__ import annotations
 
 from core.config import CONFIG
 from core.coins_config import get_family_coins
+from core.config_center import FAMILY as _CC_FAMILY
 
 from signals.base import (
     FamilySpec, DiagnosticsTracker, build_all_strategies,
     route_signal as _route_signal_base,
     generate_signal_live as _generate_signal_live_base,
     is_family_coin as _is_family_coin_base,
-    calc_risk_usd, get_risk_per_trade,
-    calc_position_size, calc_notional, calc_margin,
 )
 
 
 FAMILY_NAME  = "MOMENTUM"
-FAMILY_COINS = get_family_coins("momentum_coins")
+FAMILY_KEY   = "momentum_coins"
+FAMILY_COINS = get_family_coins(FAMILY_KEY)
 
 __all__ = [
     "FAMILY_NAME", "FAMILY_COINS",
@@ -31,8 +36,6 @@ __all__ = [
     "is_family_coin",
     "route_signal", "generate_signal_live",
     "reset_diagnostics", "get_diagnostics", "format_diagnostics",
-    "calc_risk_usd", "get_risk_per_trade",
-    "calc_position_size", "calc_notional", "calc_margin",
 ]
 
 
@@ -54,12 +57,13 @@ MIN_ADX = {
     "TREND_DOWN_FADE":  20.0,
 }
 
-FALLBACK_CAPS = {"sl": 0.060, "tp1": 0.060, "tp2": 0.150}
+# ── REV 23.2 — FALLBACK_CAPS sourced from config_center ──
+FALLBACK_CAPS = dict(_CC_FAMILY[FAMILY_KEY]["CAPS"])
 
 
 _SPEC = FamilySpec(
     name=FAMILY_NAME,
-    family_key="momentum_coins",
+    family_key=FAMILY_KEY,
     regime_strategies=REGIME_STRATEGIES,
     disabled_strategies=DISABLED_STRATEGIES,
     min_adx=MIN_ADX,
@@ -75,8 +79,6 @@ _SPEC = FamilySpec(
     counter_trend_adx_cutoff=35.0,
     rsi_buy_overbought=86.0,
     rsi_sell_oversold=20.0,
-    # NOTE: late_entry_guard_* / top_chase_* removed — config_center provides.
-    # ── REV 21.2: family-specific tuning ──
     st_min_dist_atr=0.4,
     st_max_chase_atr=2.5,
     st_flips_min=4,

@@ -1,6 +1,29 @@
 """
 families/base.py — Shared signal-engine core for all 4 families.
 
+REV 23.3 (2026-10-02) — COSMETIC CLEANUP:
+  ✅ Removed unused module constant `DEFAULT_TREND_FOLLOW_RSI_FLOOR`
+     (was only used as FamilySpec dataclass default). Inlined as
+     literal `15.0` in the dataclass. Zero behaviour change.
+
+REV 23.2 (2026-10-02) — PHASE 3 CLEANUP:
+  ✅ Removed legacy sizing helpers (calc_risk_usd, get_risk_per_trade,
+     calc_position_size, calc_notional, calc_margin). They returned
+     hardcoded 0.0 and were never actually used — only re-exported by
+     family modules.
+  ✅ strategy_supertrend_ride now reads rsi_buy_overbought /
+     rsi_sell_oversold from `filters` (config_center.FAMILY[*].FILTERS)
+     with FamilySpec values as fallback. Consistent with the rest of
+     the filter pipeline.
+
+REV 23.1 (2026-10-02) — PHASE 2 CLEANUP:
+  ✅ Removed duplicate BTC bias check from _mk() — decision_engine.py
+     already runs _btc_bias_blocks() as HARD GATE #1 in evaluate_trade().
+     Single source of truth → no more double log entries.
+  ✅ min_confidence now read from config_center.GLOBAL["min_confidence"]
+     (single source), with spec.min_confidence as fallback.
+     .env MIN_CONFIDENCE still works (synced in config.py).
+
 REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
   ✅ Removed `_MIN_RR_BY_STRATEGY` hardcoded dict — now uses
      config_center.get_min_rr().
@@ -34,10 +57,12 @@ from core.coins_config import (
 from market.indicators import htf_aligns as _htf_aligns_shared
 
 # ─── REV 22.1 — Centralized config (single source of truth) ───
+# ─── REV 23.1 — GLOBAL added (for min_confidence) ───
 from core.config_center import (
     get_config as _get_central_config,
     get_min_rr as _get_min_rr,
     COUNTER_TREND_STRATEGIES as _COUNTER_TREND_STRATS,
+    GLOBAL as _CC_GLOBAL,
 )
 
 # ─── Optional regime-multiplier helper (graceful fallback) ──
@@ -55,7 +80,10 @@ _DEBUG_STRAT = os.getenv("DEBUG_STRATEGY", "false").strip().lower() == "true"
 # ═══════════════════════════════════════════════════════════
 #  TUNABLES
 # ═══════════════════════════════════════════════════════════
-DEFAULT_TREND_FOLLOW_RSI_FLOOR = 15.0
+# NOTE (REV 23.3): DEFAULT_TREND_FOLLOW_RSI_FLOOR removed — inlined
+# as `15.0` in FamilySpec dataclass default. All 4 family modules
+# pass explicit st_rsi_sell_floor so the default is unused in
+# practice; inlining keeps the dataclass self-contained.
 
 HTF_ESCAPE_MIN_ADX   = 20.0
 HTF_ESCAPE_MIN_FLIPS = 4
@@ -144,35 +172,6 @@ def _extended_entry_guard(ind_1h, ind_4h, side, symbol=""):
 
 
 # ═══════════════════════════════════════════════════════════
-#  POSITION-SIZING HELPERS (legacy — kept for re-export)
-#  Actual position sizing happens in orders/entry.py using CONFIG.
-# ═══════════════════════════════════════════════════════════
-def calc_risk_usd(equity: float | None = None) -> float:
-    """LEGACY — kept for family module re-exports. Unused in practice."""
-    return 0.0
-
-
-def get_risk_per_trade() -> float:
-    """LEGACY — kept for family module re-exports. Unused in practice."""
-    return 0.0
-
-
-def calc_position_size(entry, sl, equity=None):
-    """LEGACY — kept for family module re-exports. Unused in practice."""
-    return 0.0
-
-
-def calc_notional(entry, sl, equity=None):
-    """LEGACY — kept for family module re-exports. Unused in practice."""
-    return 0.0
-
-
-def calc_margin(entry, sl, equity=None, leverage=None):
-    """LEGACY — kept for family module re-exports. Unused in practice."""
-    return 0.0
-
-
-# ═══════════════════════════════════════════════════════════
 #  DIAGNOSTICS TRACKER
 # ═══════════════════════════════════════════════════════════
 class DiagnosticsTracker:
@@ -256,7 +255,8 @@ class FamilySpec:
     st_rsi_sell_min: float = 30.0
     st_rsi_sell_max: float = 62.0
 
-    st_rsi_sell_floor: float = DEFAULT_TREND_FOLLOW_RSI_FLOOR
+    # REV 23.3 — inlined former DEFAULT_TREND_FOLLOW_RSI_FLOOR constant.
+    st_rsi_sell_floor: float = 15.0
 
     pullback_dist_atr: float = 0.8
 
@@ -455,18 +455,15 @@ def _mk(spec: FamilySpec, side, conf, entry, sl, tp1, tp2,
         reasons, symbol="", ind_1h=None, strategy_name=""):
     """Signal builder with caps + RR floor.
 
-    REV 23.0 — Uses config_center.get_min_rr() for RR floor.
+    REV 23.1 — 
+      • Removed duplicate BTC bias check (decision_engine handles it).
+      • min_confidence now from config_center.GLOBAL (fallback: spec).
+      • RR floor from config_center.get_min_rr().
     """
-    # Early BTC bias reject
-    try:
-        from signals.decision_engine import _btc_bias_blocks
-        _btc_reason = _btc_bias_blocks(side)
-        if _btc_reason:
-            if _DEBUG_STRAT:
-                print(f"[_mk] {symbol} REJECT: btc_bias {_btc_reason}")
-            return None
-    except Exception:
-        pass
+    # NOTE (REV 23.1): The BTC bias gate was REMOVED from here.
+    # decision_engine.evaluate_trade() runs the gate as HARD GATE #1
+    # — single source of truth. Removing it here eliminates the
+    # duplicate log line and the risk of drift between two checks.
 
     caps = _get_caps_safe(spec, symbol)
 
@@ -547,10 +544,12 @@ def _mk(spec: FamilySpec, side, conf, entry, sl, tp1, tp2,
                   f"(entry={entry} sl={sl} tp1={tp1} risk={risk})")
         return None
 
-    if conf < spec.min_confidence:
+    # ── REV 23.1 — min_confidence from config_center (fallback: spec) ──
+    _min_conf = float(_CC_GLOBAL.get("min_confidence", spec.min_confidence))
+    if conf < _min_conf:
         if _DEBUG_STRAT:
             print(f"[_mk] {symbol} REJECT: conf {conf:.1f} < "
-                  f"{spec.min_confidence} (rr={rr:.2f})")
+                  f"{_min_conf} (rr={rr:.2f})")
         return None
 
     sig = ("STRONG_BUY" if conf >= 72 else "BUY") if side == "BUY" \
@@ -581,6 +580,11 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
     rsi_sell_max  = filters.get("rsi_sell_max",  spec.st_rsi_sell_max)
     trend_follow_floor = filters.get("st_rsi_sell_floor",
                                      spec.st_rsi_sell_floor)
+    # ── REV 23.2 — pull from filters (config_center primary) ──
+    rsi_buy_overbought = filters.get("rsi_buy_overbought",
+                                     spec.rsi_buy_overbought)
+    rsi_sell_oversold  = filters.get("rsi_sell_oversold",
+                                     spec.rsi_sell_oversold)
 
     min_flips     = filters.get("min_flips",     spec.st_flips_min)
     max_flips     = filters.get("max_flips",     spec.st_flips_max)
@@ -659,7 +663,7 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
             tracker.rej("SUPERTREND_RIDE", f"rsi_buy_low_{rsi:.0f}"); return None
         if rsi > rsi_buy_max:
             tracker.rej("SUPERTREND_RIDE", f"rsi_buy_high_{rsi:.0f}"); return None
-        if rsi > spec.rsi_buy_overbought:
+        if rsi > rsi_buy_overbought:
             tracker.rej("SUPERTREND_RIDE", "rsi_overbought"); return None
         if rsi > top_rsi and st_flips > top_flips:
             tracker.rej("SUPERTREND_RIDE", "top_chase_buy"); return None
@@ -718,7 +722,7 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
             tracker.rej("SUPERTREND_RIDE", f"rsi_sell_low_{rsi:.0f}"); return None
         if rsi > rsi_sell_max:
             tracker.rej("SUPERTREND_RIDE", f"rsi_sell_high_{rsi:.0f}"); return None
-        if rsi < spec.rsi_sell_oversold:
+        if rsi < rsi_sell_oversold:
             tracker.rej("SUPERTREND_RIDE", "rsi_oversold"); return None
 
         if ema20 > 0:

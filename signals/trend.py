@@ -1,6 +1,16 @@
 """
 trend_coins.py — TREND family signal engine.
 
+REV 23.2 (2026-10-02) — PHASE 3 CLEANUP:
+  ✅ Legacy sizing helpers (calc_risk_usd, get_risk_per_trade,
+     calc_position_size, calc_notional, calc_margin) removed from
+     imports and __all__. They were dead code — returned hardcoded
+     0.0 and were never actually called.
+  ✅ FALLBACK_CAPS now sourced from config_center.FAMILY[*]["CAPS"]
+     — single source of truth.
+     Was: {"sl": 0.050, "tp1": 0.050, "tp2": 0.125}
+     Now: {"sl": 0.045, "tp1": 0.0675, "tp2": 0.125} (config_center)
+
 REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
   ✅ Removed dead late_entry_guard_* / top_chase_* from FamilySpec.
      config_center.py provides these values via _cfg.
@@ -11,19 +21,19 @@ from __future__ import annotations
 
 from core.config import CONFIG
 from core.coins_config import get_family_coins
+from core.config_center import FAMILY as _CC_FAMILY
 
 from signals.base import (
     FamilySpec, DiagnosticsTracker, build_all_strategies,
     route_signal as _route_signal_base,
     generate_signal_live as _generate_signal_live_base,
     is_family_coin as _is_family_coin_base,
-    calc_risk_usd, get_risk_per_trade,
-    calc_position_size, calc_notional, calc_margin,
 )
 
 
 FAMILY_NAME  = "TREND"
-FAMILY_COINS = get_family_coins("trend_coins")
+FAMILY_KEY   = "trend_coins"
+FAMILY_COINS = get_family_coins(FAMILY_KEY)
 
 __all__ = [
     "FAMILY_NAME", "FAMILY_COINS",
@@ -31,8 +41,6 @@ __all__ = [
     "is_family_coin",
     "route_signal", "generate_signal_live",
     "reset_diagnostics", "get_diagnostics", "format_diagnostics",
-    "calc_risk_usd", "get_risk_per_trade",
-    "calc_position_size", "calc_notional", "calc_margin",
 ]
 
 
@@ -54,12 +62,13 @@ MIN_ADX = {
     "TREND_DOWN_FADE":  20.0,
 }
 
-FALLBACK_CAPS = {"sl": 0.050, "tp1": 0.050, "tp2": 0.125}
+# ── REV 23.2 — FALLBACK_CAPS sourced from config_center ──
+FALLBACK_CAPS = dict(_CC_FAMILY[FAMILY_KEY]["CAPS"])
 
 
 _SPEC = FamilySpec(
     name=FAMILY_NAME,
-    family_key="trend_coins",
+    family_key=FAMILY_KEY,
     regime_strategies=REGIME_STRATEGIES,
     disabled_strategies=DISABLED_STRATEGIES,
     min_adx=MIN_ADX,
