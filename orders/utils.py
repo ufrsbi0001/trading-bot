@@ -1,9 +1,13 @@
 """
 orders/utils.py — Shared constants and low-level helpers.
 
-REV 1.5.0 (2026-09-28) — SPLIT FROM orders.py:
-  Extracted from the monolithic orders.py so that entry/manage/repair/exit
-  modules can share constants and helpers without duplication.
+REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
+  ✅ Removed `_STRATEGY_HOLD_MIN` — now from config_center.
+  ✅ Removed `_PER_CLASS_CFG` — moved to config_center as
+     `VOL_CLASS_R_THRESHOLDS`.
+  ✅ `_r_thresholds_per_class()` reads from config_center.
+
+REV 1.5.0 (2026-09-28) — SPLIT FROM orders.py.
 """
 from __future__ import annotations
 
@@ -19,6 +23,12 @@ from core.client import (
 from core.state import PKT, get_active_trade
 from core.coins_config import get_coin_vol_class
 
+# ── REV 23.0 — Unified config source ──
+from core.config_center import (
+    get_config as _get_central_config,
+    VOL_CLASS_R_THRESHOLDS as _VOL_CLASS_R_THRESHOLDS,
+)
+
 
 # ═════════════════════════════════════════════════════════════
 #  Constants (from CONFIG)
@@ -31,16 +41,6 @@ PARTIAL_CLOSE_USDT   = CONFIG.partial_close_usdt
 DRY_RUN              = CONFIG.dry_run
 MAX_HOLD_MINUTES     = CONFIG.max_hold_minutes
 
-
-# ═════════════════════════════════════════════════════════════
-#  Per-strategy hold caps
-# ═════════════════════════════════════════════════════════════
-_STRATEGY_HOLD_MIN: dict[str, float] = {
-    "SUPERTREND_RIDE":  120.0,   # was 240
-    "TREND_DOWN_FADE":  120.0,   # was 240
-    "MEAN_REVERSION":   60.0,   # was 240
-    "RANGE_SCALPER":    60.0,   # was 240
-}
 
 # ═════════════════════════════════════════════════════════════
 #  Shared mutable state (module-local)
@@ -89,29 +89,8 @@ def _get_risk_unit(active: dict | None) -> float | None:
 
 # ═════════════════════════════════════════════════════════════
 #  Per-vol-class thresholds
+#  REV 23.0 — Now served by config_center.VOL_CLASS_R_THRESHOLDS.
 # ═════════════════════════════════════════════════════════════
-_PER_CLASS_CFG = {
-    "HIGH": {
-        "be_r": 0.80, "be_stop_r": 0.20,
-        "lock1_r": 1.20, "lock1_stop_r": 0.55,
-        "lock2_r": 1.80, "lock2_stop_r": 0.95,
-        "max_hold_bars": 26,
-    },
-    "MED": {
-        "be_r": 0.75, "be_stop_r": 0.15,
-        "lock1_r": 1.10, "lock1_stop_r": 0.55,
-        "lock2_r": 1.70, "lock2_stop_r": 0.90,
-        "max_hold_bars": 28,
-    },
-    "LOW": {
-        "be_r": 0.70, "be_stop_r": 0.15,
-        "lock1_r": 1.00, "lock1_stop_r": 0.50,
-        "lock2_r": 1.60, "lock2_stop_r": 0.85,
-        "max_hold_bars": 30,
-    },
-}
-
-
 def _vol_class(symbol: str) -> str:
     try:
         return get_coin_vol_class(symbol)
@@ -121,8 +100,12 @@ def _vol_class(symbol: str) -> str:
 
 
 def _r_thresholds_per_class(symbol: str, cfg: dict) -> dict:
+    """
+    REV 23.0 — Reads from config_center.VOL_CLASS_R_THRESHOLDS.
+    Falls back to MED if vol_class not found.
+    """
     vcls = _vol_class(symbol)
-    base = _PER_CLASS_CFG.get(vcls, _PER_CLASS_CFG["MED"])
+    base = _VOL_CLASS_R_THRESHOLDS.get(vcls, _VOL_CLASS_R_THRESHOLDS["MED"])
     return {
         "be_r":          base["be_r"],
         "lock1_r":       base["lock1_r"],
@@ -189,7 +172,7 @@ def _pick_real_sl(pair, entry, is_long):
 # ═════════════════════════════════════════════════════════════
 def _derive_sl_level(is_long, actual_sl, entry, risk_unit=None, thresholds=None):
     if thresholds is None:
-        thresholds = _PER_CLASS_CFG["MED"]
+        thresholds = _VOL_CLASS_R_THRESHOLDS["MED"]
     be_r  = thresholds["be_stop_r"]
     lk1_r = thresholds["lock1_stop_r"]
     lk2_r = thresholds["lock2_stop_r"]
@@ -204,8 +187,7 @@ def _derive_sl_level(is_long, actual_sl, entry, risk_unit=None, thresholds=None)
             if actual_sl >= lk1_stop - tol:  return 2
             if actual_sl >= be_stop  - tol:  return 1
             return 0
-        logger.warning(f"_derive_sl_level: no risk_unit for entry={entry} — "
-                       f"using legacy multiplicative path")
+        logger.warning(f"_derive_sl_level: no risk_unit for entry={entry}")
         if actual_sl >= entry * 1.005:   return 3
         elif actual_sl >= entry * 1.002: return 2
         elif actual_sl >= entry * 0.998: return 1
@@ -220,8 +202,7 @@ def _derive_sl_level(is_long, actual_sl, entry, risk_unit=None, thresholds=None)
             if actual_sl <= lk1_stop + tol:  return 2
             if actual_sl <= be_stop  + tol:  return 1
             return 0
-        logger.warning(f"_derive_sl_level: no risk_unit for entry={entry} — "
-                       f"using legacy multiplicative path")
+        logger.warning(f"_derive_sl_level: no risk_unit for entry={entry}")
         if actual_sl <= entry * 0.995:   return 3
         elif actual_sl <= entry * 0.998: return 2
         elif actual_sl <= entry * 1.002: return 1
@@ -262,8 +243,8 @@ def get_trade_status(symbol, pos: dict = None):
 
         if sl_price and sl_price > 0:
             if risk_unit and risk_unit > 0:
-                th = _PER_CLASS_CFG.get(_vol_class(symbol),
-                                        _PER_CLASS_CFG["MED"])
+                th = _VOL_CLASS_R_THRESHOLDS.get(_vol_class(symbol),
+                                                 _VOL_CLASS_R_THRESHOLDS["MED"])
                 be_r  = th["be_stop_r"]
                 lk1_r = th["lock1_stop_r"]
                 lk2_r = th["lock2_stop_r"]

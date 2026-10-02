@@ -1,32 +1,11 @@
 """
 momentum_coins.py — MOMENTUM family signal engine.
 
-REV 21.2 (2026-09-30) — FAMILY-SPECIFIC TUNING:
-  ✅ Momentum coins (APT, JUP, RENDER, RUNE, VIRTUAL, ZRO, etc.) are
-     breakout movers — they extend FAR (2-3 ATR) and confirm early
-     with few flips. Uniform tightening was blocking valid breakouts.
-     st_rsi_sell_floor 30.0 → 25.0 (momentum coins dip hard on pullbacks).
-     st_min_dist_atr 0.5 → 0.4 (catch early breakouts close to ST line).
-     st_max_chase_atr 1.5 → 2.5 (breakouts extend far — need room).
-     st_flips_min 5 → 4 (early momentum needs fewer confirmations).
-     st_flips_max kept at 10.
+REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
+  ✅ Removed dead late_entry_guard_* / top_chase_* from FamilySpec.
+     config_center.py provides these values via _cfg.
 
-REV 21.1 (2026-09-30) — OVER-FIT REBALANCE.
-REV 21.0 (2026-09-29) — DATA-DRIVEN TUNING PASS.
-REV 20.6 (2026-09-29) — LIVE FIRE UNLOCK (TUNING).
-REV 20.5 (2026-09-29) — RANGE-SCALPER BOUNDS WIDENED.
-REV 20.4 (2026-09-29) — BOUNCE-ZONE SHORT FIX.
-REV 20.3 (2026-09-29) — BATCH 3.7 UNLOCK FIXES.
-REV 20.2 (2026-09-28) — RSI BANDS + PULLBACK ENTRY.
-REV 20.0 (2026-09-28) — BATCH 3 REFACTOR.
-REV 19.19 (2026-09-28) — SHARED HTF ALIGNMENT.
-REV 19.18 (2026-09-28) — DEBUG PRINT GATED BEHIND ENV FLAG.
-REV 19.17 (2026-09-26) — DEAD CODE CLEANUP + COMMENT TRUTH-UP.
-REV 19.16 (2026-09-26) — TP2 DIRECTION FIX + DEAD-CODE + NONE GUARD.
-REV 19.15 (2026-09-26) — SIGNAL FREQUENCY UNLOCK.
-REV 19.14 (2026-09-25) — DEFENSIVE HARDENING.
-REV 19.13 (2026-09-25) — KZ_BYPASS FROM CONFIG.
-REV 19.9 (2026-09-24) — Initial release with built-in fixes.
+REV 21.2 (2026-09-30) — FAMILY-SPECIFIC TUNING.
 """
 from __future__ import annotations
 
@@ -96,11 +75,7 @@ _SPEC = FamilySpec(
     counter_trend_adx_cutoff=35.0,
     rsi_buy_overbought=86.0,
     rsi_sell_oversold=20.0,
-    top_chase_rsi=76.0,
-    top_chase_flips=8,
-    late_entry_guard_adx=55.0,
-    late_entry_guard_dist=1.8,
-    late_entry_guard_rsi=72.0,
+    # NOTE: late_entry_guard_* / top_chase_* removed — config_center provides.
     # ── REV 21.2: family-specific tuning ──
     st_min_dist_atr=0.4,
     st_max_chase_atr=2.5,

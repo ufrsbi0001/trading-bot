@@ -1,25 +1,22 @@
 """
 indicators.py — V2.9.9 (2026-09-24) for BEST_SCALP_V2.
 
-REV 1.4.14 (2026-10-01) — 3-LAYER 5m TREND FILTER:
-  ✅ `check_short_term_trend()` rewritten as a 3-layer gate:
-       L1 STATE   — p > e9 > e21 (basic alignment)
-       L2 EVENT   — EMA20 freshly reclaimed in last 3 bars
-                    (after being below in the 3 bars before that)
-       L3 VOLUME  — last bar volume >= 20-bar average
-     Any layer fails → reject. On any API/computation error →
-     fail-open (True) with warning so transient issues don't
-     block ALL trend trades.
-  ✅ `_TREND_TTL` 60 → 30 (fresher signal).
-  ✅ Reason codes now: L1_no_uptrend / L2_no_fresh_reclaim /
-     L3_vol_weak_0.62x / etc.
+REV 3.2 (2026-10-02) — UNIFIED CONFIG (Option B):
+  ✅ `_BASE_CFG` / `_REGIME_CFG` literals DELETED. Now sourced from
+     core.config_center (single source of truth).
+     • `_BASE_CFG` = config_center.get_config(include_family=False),
+       flat GLOBAL + REGIME[UNKNOWN] — same shape as old dict.
+     • `_REGIME_CFG` = config_center.get_regime_cfg(regime) — same
+       keys (sl_mult / tp_mult / rsi_period) + new ones (hold_minutes,
+       late_guard_adx) that callers ignore.
+  ✅ `get_trading_config()` / `get_regime_multipliers()` /
+     `_regime_config()` kept as thin public wrappers (API preserved).
+  ✅ config_center.REGIME values aligned to match old indicators
+     values (VOLATILE 1.4/1.3, QUIET 0.9, CHOP 1.1/1.0, UNKNOWN 1.0)
+     and rsi_period added — zero behaviour change.
 
-REV 1.4.13 (2026-10-01) — PHASE 1 ORDERBOOK ENABLE:
-  ✅ `get_order_book_imbalance()` is now CALLED inside
-     `calculate_pro_indicators()` and its output is exposed in
-     the returned dict as `ob_imbalance`, `ob_bias`, `ob_bid_vol`,
-     `ob_ask_vol`.
-
+REV 1.4.14 (2026-10-01) — 3-LAYER 5m TREND FILTER.
+REV 1.4.13 (2026-10-01) — PHASE 1 ORDERBOOK ENABLE.
 REV 1.4.12 (2026-09-29) — 5M TREND CACHE TTL EXTENSION.
 REV 1.4.11 (2026-09-29) — DEAD HELPER REMOVAL.
 REV 1.4.10 (2026-09-29) — DEAD CODE CLEANUP.
@@ -86,6 +83,12 @@ try:
 except Exception:
     CONFIG = None  # type: ignore
 
+# ── REV 3.2 — config_center delegation ──
+from core.config_center import (
+    get_config as _cc_get_config,
+    get_regime_cfg as _cc_get_regime_cfg,
+)
+
 UTC = timezone.utc
 
 
@@ -135,46 +138,28 @@ def _http_get_json(url: str, params: dict | None = None,
 
 
 # ─────────────────────────────────────────────────────────────
-# REGIME-ADAPTIVE CONFIG
+# REGIME-ADAPTIVE CONFIG — REV 3.2
+#   Delegated to core.config_center (single source of truth).
+#   `_BASE_CFG` retained as a module-level flat dict for
+#   backwards-compat (used by get_futures_sentiment for the
+#   funding_extreme threshold).
 # ─────────────────────────────────────────────────────────────
-_BASE_CFG: dict[str, float | int] = {
-    "sl_atr":        1.8,
-    "tp1_atr":       2.5,
-    "tp2_atr":       5.0,
-    "tp1_qty":       0.75,
-    "min_rr":        1.5,
-    "cooldown_hours": 12,
-    "min_dist_pct":  0.0025,
-    "max_dist_pct":  0.050,
-    "atr_ratio_min": 0.30,
-    "atr_ratio_max": 2.00,
-    "be_r_min":        0.75,
-    "be_stop_r":       0.15,
-    "lock1_r_min":     1.10,
-    "lock1_stop_r":    0.55,
-    "lock2_r_min":     1.70,
-    "lock2_stop_r":    0.90,
-    "partial_stop_r":  0.30,
-    "be_factor":     0.6,
-    "lock1_pct":     0.9,
-    "lock2_pct":     2.2,
-    "min_adx":       22,
-    "cvd_z_min":     0.4,
-    "funding_extreme": 0.0008,
-}
-
-_REGIME_CFG: dict[str, dict[str, float]] = {
-    "TREND_UP":   {"sl_mult": 1.0,  "tp_mult": 1.0,  "rsi_period": 14},
-    "TREND_DOWN": {"sl_mult": 1.0,  "tp_mult": 1.0,  "rsi_period": 14},
-    "VOLATILE":   {"sl_mult": 1.4,  "tp_mult": 1.3,  "rsi_period": 14},
-    "QUIET":      {"sl_mult": 0.7,  "tp_mult": 0.9,  "rsi_period": 14},
-    "CHOP":       {"sl_mult": 1.1,  "tp_mult": 1.0,  "rsi_period": 21},
-    "UNKNOWN":    {"sl_mult": 1.0,  "tp_mult": 1.0,  "rsi_period": 14},
-}
+_BASE_CFG: dict = _cc_get_config(include_family=False)
+_BASE_CFG.pop("_meta", None)  # strip metadata key
 
 
 def get_trading_config() -> dict:
-    return dict(_BASE_CFG)
+    """Flat GLOBAL + REGIME[UNKNOWN] — legacy _BASE_CFG shape.
+
+    REV 3.2 — was `return dict(_BASE_CFG)`; now reads from
+    config_center each call so .env overrides / runtime
+    config updates propagate. Callers use .get() so extra
+    keys (sl_mult / tp_mult / rsi_period / hold_minutes) are
+    silently ignored where not expected.
+    """
+    out = _cc_get_config(include_family=False)
+    out.pop("_meta", None)
+    return out
 
 
 def get_regime_multipliers(regime: str) -> dict:
@@ -184,7 +169,13 @@ def get_regime_multipliers(regime: str) -> dict:
 
 
 def _regime_config(regime: str) -> dict:
-    return _REGIME_CFG.get(regime, _REGIME_CFG["UNKNOWN"])
+    """Return REGIME[regime] — served by config_center.
+
+    REV 3.2 — was local _REGIME_CFG lookup; now delegated.
+    Same keys (sl_mult / tp_mult / rsi_period) plus new ones
+    (hold_minutes / late_guard_adx) that callers don't read.
+    """
+    return _cc_get_regime_cfg(regime)
 
 
 # ─────────────────────────────────────────────────────────────

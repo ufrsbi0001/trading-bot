@@ -1,18 +1,18 @@
 """
 orders — Facade package.
 
-REV 1.5.0 (2026-09-28) — SPLIT FROM orders.py:
-  Split into entry.py / manage.py / repair.py / exit.py / utils.py.
-  All public symbols re-exported here so `import orders as _o` in
-  future.py continues to work unchanged.
+REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
+  ✅ Removed `_PER_CLASS_CFG` and `_STRATEGY_HOLD_MIN` re-exports
+     (moved to config_center.VOL_CLASS_R_THRESHOLDS).
+
+REV 1.5.0 (2026-09-28) — SPLIT FROM orders.py.
 """
 from .utils import (
-    _PER_CLASS_CFG, _get_risk_unit, _pick_real_sl,
+    _get_risk_unit, _pick_real_sl,
     _derive_sl_level, _vol_class, _r_thresholds_per_class,
     get_trade_status,
     LEVERAGE, RISK_PERCENT, MAX_OPEN_POSITIONS, MAX_TOTAL_MARGIN_PCT,
     PARTIAL_CLOSE_USDT, DRY_RUN, MAX_HOLD_MINUTES,
-    _STRATEGY_HOLD_MIN,
 )
 
 from .exit import (
@@ -46,9 +46,8 @@ __all__ = [
     "get_total_pnl",
     # Utils
     "get_trade_status",
-    "_PER_CLASS_CFG", "_get_risk_unit", "_pick_real_sl",
+    "_get_risk_unit", "_pick_real_sl",
     "_derive_sl_level", "_vol_class", "_r_thresholds_per_class",
     "LEVERAGE", "RISK_PERCENT", "MAX_OPEN_POSITIONS", "MAX_TOTAL_MARGIN_PCT",
     "PARTIAL_CLOSE_USDT", "DRY_RUN", "MAX_HOLD_MINUTES",
-    "_STRATEGY_HOLD_MIN",
 ]

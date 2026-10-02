@@ -1,6 +1,11 @@
 """
 orders/manage.py — Trade management loop.
 
+REV 1.7.1 (2026-10-02) — UNIFIED CONFIG CLEANUP:
+  ✅ Time-exit fallback now uses `config_center.get_config().hold_minutes`
+     instead of removed `_STRATEGY_HOLD_MIN`.
+  ✅ Import of `_STRATEGY_HOLD_MIN` removed from `.utils`.
+
 REV 1.7.0 (2026-10-02) — CONFIG CENTER INTEGRATION (Phase 1):
   ✅ Time-exit now prefers `hold_time_minutes` (frozen at entry time
      by entry.py REV 1.7.0) over the live strategy-based cap. This
@@ -42,10 +47,12 @@ from core.state import (
 )
 from market.indicators import calculate_pro_indicators, get_trading_config
 
+# ── REV 1.7.1 — Unified config source for hold_minutes fallback ──
+from core.config_center import get_config as _get_central_config
+
 from .utils import (
     MAX_HOLD_MINUTES, PARTIAL_CLOSE_USDT,
-    _STRATEGY_HOLD_MIN, _cl,
-    _get_risk_unit, _r_thresholds_per_class,
+    _cl, _get_risk_unit, _r_thresholds_per_class,
 )
 from .repair import (
     cancel_all_sl_stops, cancel_specific_sl, reconcile_active_trade,
@@ -241,6 +248,7 @@ def manage_single_trade(symbol):
 
     # ═══════════════════════════════════════════════════════════
     #  TIME EXIT — REV 1.7.0: prefer stored regime-aware hold time
+    #             REV 1.7.1: fallback via config_center
     # ═══════════════════════════════════════════════════════════
     try:
         entry_time_str = active.get('entry_time', '')
@@ -270,12 +278,12 @@ def manage_single_trade(symbol):
                     effective_cap = None
 
             if effective_cap is None:
-                # Fallback chain for legacy trades (pre-REV 1.7.0)
-                strat_cap = _STRATEGY_HOLD_MIN.get(strat_name)
-                if strat_cap is not None:
-                    effective_cap = min(float(MAX_HOLD_MINUTES), strat_cap)
-                    _source = f"strategy={strat_name}"
-                else:
+                # ── REV 1.7.1 — fallback: config_center hold_minutes (regime-aware) ──
+                try:
+                    _cfg_hold = _get_central_config(symbol, strat_name, "UNKNOWN")
+                    effective_cap = float(_cfg_hold.get("hold_minutes", MAX_HOLD_MINUTES))
+                    _source = f"config_center={effective_cap:.0f}m"
+                except Exception:
                     effective_cap = min(float(MAX_HOLD_MINUTES), bars_cap_min)
                     _source = "bars_cap"
 

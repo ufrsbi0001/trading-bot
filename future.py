@@ -1,37 +1,15 @@
 """
 future.py — Trading engine orchestrator + main scan loop.
 
-REV 1.4.24 (2026-09-30) — DYNAMIC STARTUP BANNER VALUES:
-  ✅ "Running in TUNED mode" line now reads MIN_APPROVALS from
-     decision_engine dynamically instead of hardcoded "3/6". Also
-     updates st_rsi_sell_floor label to "per-family" since REV 21.2
-     made it family-specific (25/28/30) — no single global value.
-  ✅ "Decision engine: active" line now shows the actual
-     MIN_APPROVALS value from decision_engine.
-  ✅ _spread_label() now includes the global cap (max_spread_pct)
-     for parity with the config.py banner. Previously only per-family
-     values were shown, hiding the global fallback from logs.
-  All three changes are COSMETIC — no behaviour change. They just
-  prevent misleading log lines when MIN_APPROVALS / spread caps are
-  tuned via .env or code.
+REV 1.4.25 (2026-10-02) — UNIFIED CONFIG CLEANUP:
+  ✅ `_format_be_lock_config()` no longer reads `_PER_CLASS_CFG` from
+     the `orders` package (which was removed in orders/utils.py
+     REV 23.0). Now imports `VOL_CLASS_R_THRESHOLDS` directly from
+     `core.config_center` — same dict structure (be_r / lock1_r /
+     lock2_r), so zero behaviour change in the startup banner.
 
-REV 1.4.23 (2026-09-30) — FIX Bug #1: PRE-CHECKS BEFORE DECISION ENGINE:
-  ✅ Cooldown / Rotation / IN POSITION / Same Candle pre-checks now
-     run BEFORE evaluate_trade(). Previously the decision engine was
-     called first (logging "APPROVED"), then these checks blocked the
-     trade afterwards — producing misleading log spam and wasting the
-     6-filter vote.
-     Live evidence (2026-09-30 12:21+): VIRTUAL SHORT opened at 12:21:01,
-     but every subsequent scan still logged:
-       "[decision] ✅ VIRTUAL SELL [SUPERTREND_RIDE] 5/6 conf=80% ... APPROVED"
-     8+ times over 4 minutes, while the actual trade was never placed
-     because the position was already open.
-     After fix: pre-checks short-circuit BEFORE evaluate_trade(), so
-     the decision engine is never called for already-open symbols.
-     Added a post-decision safety re-check as belt-and-suspenders for
-     the case where the decision engine somehow allows a trade on an
-     already-tracked symbol (e.g. race with active_trades_list update).
-
+REV 1.4.24 (2026-09-30) — DYNAMIC STARTUP BANNER VALUES.
+REV 1.4.23 (2026-09-30) — FIX Bug #1: PRE-CHECKS BEFORE DECISION ENGINE.
 REV 1.4.22 (2026-09-30) — HOIST STRATEGY EXTRACT.
 REV 1.4.21 (2026-09-30) — CONDITIONAL 5M FILTER + RENAME.
 REV 1.4.20 (2026-09-29) — SAME-SIDE RACE FIX.
@@ -69,6 +47,9 @@ from datetime import datetime
 
 from core.config import CONFIG
 from core.coins_config import get_family
+
+# ── REV 1.4.25 — Unified config source for BE/LOCK banner ──
+from core.config_center import VOL_CLASS_R_THRESHOLDS as _VOL_CLASS_R_THRESHOLDS
 
 import core.client as _c
 import core.state as _s
@@ -255,8 +236,13 @@ def _reconcile_on_startup():
 
 
 def _format_be_lock_config(cfg: dict) -> tuple[str, bool]:
+    """
+    REV 1.4.25 — now reads VOL_CLASS_R_THRESHOLDS directly from
+    config_center instead of getattr(_o, "_PER_CLASS_CFG", None).
+    Same structure — LOW/MED/HIGH with be_r / lock1_r / lock2_r.
+    """
     try:
-        per_class = getattr(_o, "_PER_CLASS_CFG", None)
+        per_class = _VOL_CLASS_R_THRESHOLDS
         if isinstance(per_class, dict) and per_class:
             parts: list[str] = []
             for cls in ("LOW", "MED", "HIGH"):

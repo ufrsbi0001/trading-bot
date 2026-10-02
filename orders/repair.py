@@ -1,6 +1,11 @@
 """
 orders/repair.py — Reconciliation and order repair.
 
+REV 1.6.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
+  ✅ `_PER_CLASS_CFG` removed (was duplicated from utils). Now reads
+     directly from `core.config_center.VOL_CLASS_R_THRESHOLDS`.
+     Same structure — zero behaviour change.
+
 REV 1.5.3 (2026-09-30) — CRITICAL FIX Bug #4 (algoId vs orderId):
   ✅ cancel_all_sl_stops() now checks BOTH algoId AND orderId
      against except_ids.
@@ -63,8 +68,13 @@ from core.state import (
 )
 from market.indicators import get_trading_config
 
+# ── REV 1.6.0 — Unified config source ──
+from core.config_center import (
+    VOL_CLASS_R_THRESHOLDS as _VOL_CLASS_R_THRESHOLDS,
+)
+
 from .utils import (
-    _PER_CLASS_CFG, _cl, _get_risk_unit, _pick_real_sl,
+    _cl, _get_risk_unit, _pick_real_sl,
     _derive_sl_level, _vol_class, _RECONCILE_SKIP_FRESH_SEC,
 )
 
@@ -482,7 +492,9 @@ def reconcile_active_trade(symbol):
             logger.debug(f"[reconcile] {symbol} TP repair (naked branch): {e}")
         return
 
-    th = _PER_CLASS_CFG.get(_vol_class(symbol), _PER_CLASS_CFG["MED"])
+    # ── REV 1.6.0 — read directly from config_center ──
+    th = _VOL_CLASS_R_THRESHOLDS.get(_vol_class(symbol),
+                                     _VOL_CLASS_R_THRESHOLDS["MED"])
     actual_level = _derive_sl_level(is_long, actual_sl, entry,
                                     risk_unit=risk_unit, thresholds=th)
 

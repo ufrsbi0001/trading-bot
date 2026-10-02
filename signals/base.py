@@ -1,27 +1,24 @@
 """
-signals/base.py — Shared signal-engine core for all 4 families.
+families/base.py — Shared signal-engine core for all 4 families.
 
-REV 22.2 (2026-10-02) — VOL CLASS CAP ADJUSTMENT:
-  ✅ `_mk()` now applies vol_class multiplier to caps:
-       LOW  × 0.80 (majors — tighter caps)
-       MED  × 1.00 (baseline)
-       HIGH × 1.40 (wild alts — wider caps)
-     BTC (LOW) gets 4.5% × 0.8 = 3.6% SL cap.
-     HYPE (HIGH) gets 4.5% × 1.4 = 6.3% SL cap.
-     Reads from core/family_baselines.py via coins_config.
+REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
+  ✅ Removed `_MIN_RR_BY_STRATEGY` hardcoded dict — now uses
+     config_center.get_min_rr().
+  ✅ Removed dead `MAX_HOLD_MINUTES=1800` (CONFIG.max_hold_minutes
+     used by orders/utils.py).
+  ✅ Removed FamilySpec `late_entry_guard_*` and `top_chase_*` fields
+     — dead since config_center always provides these values.
+  ✅ Extended-move guard thresholds now read from config_center:
+     max_move_20bar_pct, rsi_1h_extreme_buy, rsi_1h_extreme_sell,
+     rsi_4h_extreme_buy, rsi_4h_extreme_sell, near_120high_tol,
+     near_120low_tol.
+  ✅ Exhausted filter constants read from config_center:
+     exhausted_rsi_buy, exhausted_rsi_sell, exhausted_dist_mult.
+  ✅ All thresholds live in ONE place: core/config_center.py.
 
-REV 22.1 (2026-10-02) — CONFIG CENTER INTEGRATION (Phase 1):
-  ✅ Added `config_center` import.
-  ✅ strategy_supertrend_ride() now reads sl_atr / tp1_atr / tp2_atr
-     and late_guard_* from config_center.get_config() — single source
-     of truth. Falls back to st_params / spec defaults if missing.
-  ✅ Regime multipliers (sl_mult / tp_mult) now come from
-     config_center.REGIME (VOLATILE 0.70, CHOP 0.45).
-
-REV 22.0 (2026-10-01) — PHASE 1 (3 CHANGES):
-  ✅ CHANGE 3 — Extended-move guard added.
-  ✅ CHANGE 4 — Late-entry guard enforced.
-  ✅ CHANGE 5 — Orderbook confidence modifier (±3).
+REV 22.2 (2026-10-02) — VOL CLASS CAP ADJUSTMENT.
+REV 22.1 (2026-10-02) — CONFIG CENTER INTEGRATION.
+REV 22.0 (2026-10-01) — PHASE 1 (3 CHANGES).
 """
 from __future__ import annotations
 
@@ -32,12 +29,16 @@ from core.config import CONFIG
 from core.coins_config import (
     get_caps, get_profile, is_enabled,
     get_coin_filters, get_coin_st_params, get_coin_td_fade,
-    get_coin_vol_class, get_vol_class_mult,     # REV 22.2
+    get_coin_vol_class, get_vol_class_mult,
 )
 from market.indicators import htf_aligns as _htf_aligns_shared
 
 # ─── REV 22.1 — Centralized config (single source of truth) ───
-from core.config_center import get_config as _get_central_config
+from core.config_center import (
+    get_config as _get_central_config,
+    get_min_rr as _get_min_rr,
+    COUNTER_TREND_STRATEGIES as _COUNTER_TREND_STRATS,
+)
 
 # ─── Optional regime-multiplier helper (graceful fallback) ──
 try:
@@ -59,58 +60,50 @@ DEFAULT_TREND_FOLLOW_RSI_FLOOR = 15.0
 HTF_ESCAPE_MIN_ADX   = 20.0
 HTF_ESCAPE_MIN_FLIPS = 4
 
-# ═══════════════════════════════════════════════════════════
-#  REV 21.7 — REVERSAL TARGET MULTIPLES
-# ═══════════════════════════════════════════════════════════
+# REV 21.7 — Reversal target multiples (used by MEAN_REVERSION, RANGE_SCALPER)
 REVERSAL_TP1_MULT = 1.8
 REVERSAL_TP2_MULT = 2.7
 
-# REV 21.1 — exhausted filter: block only at EXTREME overextension
-EXHAUSTED_RSI_EXTREME_BUY  = 78.0
-EXHAUSTED_RSI_EXTREME_SELL = 22.0
-EXHAUSTED_DIST_MULT        = 1.5
-
-# REV 21.4 — RR floor inside _mk().
-_MK_RR_FLOOR = 1.5
-
-# REV 21.5 — float tolerance for boundary RR comparisons.
+# REV 21.5 — Float tolerance for boundary RR comparisons.
 _RR_FLOAT_EPS = 1e-6
 
-# REV 21.6 — per-strategy RR floor.
-_MIN_RR_BY_STRATEGY = {
-    "SUPERTREND_RIDE":  1.5,
-    "TREND_DOWN_FADE":  1.5,
-    "MEAN_REVERSION":   1.8,
-    "RANGE_SCALPER":    1.8,
-}
-
 
 # ═══════════════════════════════════════════════════════════
-#  REV 22.0 — EXTENDED-MOVE GUARD (loose thresholds)
+#  EXTENDED-MOVE GUARD — REV 23.0
+#  All thresholds read from config_center at runtime.
 # ═══════════════════════════════════════════════════════════
-MAX_MOVE_20BAR_PCT   = 0.18     # 18% move over last 20 × 1h bars
-RSI_1H_EXTREME_BUY   = 78.0
-RSI_1H_EXTREME_SELL  = 22.0
-RSI_4H_EXTREME_BUY   = 76.0
-RSI_4H_EXTREME_SELL  = 24.0
-NEAR_120HIGH_TOL     = 0.992    # within 0.8% of 120-bar high → reject BUY
-NEAR_120LOW_TOL      = 1.008    # within 0.8% of 120-bar low  → reject SELL
-
-
 def _extended_entry_guard(ind_1h, ind_4h, side, symbol=""):
     """
     Reject if price is already extended at signal time.
 
-    Checks (in order):
-      1. 20-bar momentum > 18%
-      2. Price within 0.8% of 120-bar high (BUY) or low (SELL)
-      3. 1h RSI > 78 (BUY) or < 22 (SELL)
-      4. 4h RSI > 76 (BUY) or < 24 (SELL)
+    REV 23.0 — Thresholds come from core/config_center.py GLOBAL:
+      - max_move_20bar_pct   (default 0.10)
+      - near_120high_tol     (default 0.997)
+      - near_120low_tol      (default 1.003)
+      - rsi_1h_extreme_buy   (default 72.0)
+      - rsi_1h_extreme_sell  (default 28.0)
+      - rsi_4h_extreme_buy   (default 72.0)
+      - rsi_4h_extreme_sell  (default 28.0)
 
     Returns (ok, reason). ok=False → caller must reject.
     """
     if not ind_1h:
         return True, ""
+
+    try:
+        cfg = _get_central_config(symbol, "", "UNKNOWN")
+    except Exception:
+        cfg = {}
+
+    # Pull thresholds from config_center (with safe fallbacks)
+    _max_move = float(cfg.get("max_move_20bar_pct", 0.10))
+    _rsi_1h_buy = float(cfg.get("rsi_1h_extreme_buy", 72.0))
+    _rsi_1h_sell = float(cfg.get("rsi_1h_extreme_sell", 28.0))
+    _rsi_4h_buy = float(cfg.get("rsi_4h_extreme_buy", 72.0))
+    _rsi_4h_sell = float(cfg.get("rsi_4h_extreme_sell", 28.0))
+    _tol_hi = float(cfg.get("near_120high_tol", 0.997))
+    _tol_lo = float(cfg.get("near_120low_tol", 1.003))
+
     try:
         price = float(ind_1h.get("price", 0) or 0)
         if price <= 0:
@@ -118,75 +111,65 @@ def _extended_entry_guard(ind_1h, ind_4h, side, symbol=""):
 
         # 1. 20-bar momentum
         mom = float(ind_1h.get("momentum_pct", 0.0) or 0.0)
-        if side == "BUY" and mom > MAX_MOVE_20BAR_PCT:
+        if side == "BUY" and mom > _max_move:
             return False, f"move20_{mom*100:.1f}%"
-        if side == "SELL" and mom < -MAX_MOVE_20BAR_PCT:
+        if side == "SELL" and mom < -_max_move:
             return False, f"move20_{mom*100:.1f}%"
 
         # 2. 120-bar high/low proximity
         dc_hi = float(ind_1h.get("dc_high_slow", 0) or 0)
         dc_lo = float(ind_1h.get("dc_low_slow",  0) or 0)
-        if side == "BUY" and dc_hi > 0 and price >= dc_hi * NEAR_120HIGH_TOL:
+        if side == "BUY" and dc_hi > 0 and price >= dc_hi * _tol_hi:
             return False, "at_120bar_high"
-        if side == "SELL" and dc_lo > 0 and price <= dc_lo * NEAR_120LOW_TOL:
+        if side == "SELL" and dc_lo > 0 and price <= dc_lo * _tol_lo:
             return False, "at_120bar_low"
 
         # 3. 1h RSI extreme
         rsi_1h = float(ind_1h.get("rsi", 50.0) or 50.0)
-        if side == "BUY" and rsi_1h > RSI_1H_EXTREME_BUY:
+        if side == "BUY" and rsi_1h > _rsi_1h_buy:
             return False, f"rsi1h_{rsi_1h:.0f}"
-        if side == "SELL" and rsi_1h < RSI_1H_EXTREME_SELL:
+        if side == "SELL" and rsi_1h < _rsi_1h_sell:
             return False, f"rsi1h_{rsi_1h:.0f}"
 
         # 4. 4h RSI extreme
         if ind_4h:
             rsi_4h = float(ind_4h.get("rsi", 50.0) or 50.0)
-            if side == "BUY" and rsi_4h > RSI_4H_EXTREME_BUY:
+            if side == "BUY" and rsi_4h > _rsi_4h_buy:
                 return False, f"rsi4h_{rsi_4h:.0f}"
-            if side == "SELL" and rsi_4h < RSI_4H_EXTREME_SELL:
+            if side == "SELL" and rsi_4h < _rsi_4h_sell:
                 return False, f"rsi4h_{rsi_4h:.0f}"
     except Exception:
         pass
     return True, ""
 
 
-# ─── Shared fallback constants ────────────────────────────
-EQUITY_USD             = 5000.0
-RISK_PERCENT           = 0.5
-LEVERAGE               = 5
-MAX_OPEN_POSITIONS     = 5
-MAX_TOTAL_MARGIN_PCT   = 0.60
-MAX_DAILY_DRAWDOWN_PCT = 4.0
-MAX_ACCOUNT_DRAWDOWN   = 10.0
-MAX_HOLD_MINUTES       = 1800
-
-
 # ═══════════════════════════════════════════════════════════
-#  POSITION-SIZING HELPERS
+#  POSITION-SIZING HELPERS (legacy — kept for re-export)
+#  Actual position sizing happens in orders/entry.py using CONFIG.
 # ═══════════════════════════════════════════════════════════
 def calc_risk_usd(equity: float | None = None) -> float:
-    eq = equity if equity is not None else EQUITY_USD
-    return eq * (RISK_PERCENT / 100.0)
+    """LEGACY — kept for family module re-exports. Unused in practice."""
+    return 0.0
 
 
 def get_risk_per_trade() -> float:
-    return calc_risk_usd()
+    """LEGACY — kept for family module re-exports. Unused in practice."""
+    return 0.0
 
 
 def calc_position_size(entry, sl, equity=None):
-    eq = equity if equity is not None else EQUITY_USD
-    risk_usd = eq * (RISK_PERCENT / 100.0)
-    d = abs(entry - sl)
-    return risk_usd / d if d > 0 else 0.0
+    """LEGACY — kept for family module re-exports. Unused in practice."""
+    return 0.0
 
 
 def calc_notional(entry, sl, equity=None):
-    return calc_position_size(entry, sl, equity) * entry
+    """LEGACY — kept for family module re-exports. Unused in practice."""
+    return 0.0
 
 
 def calc_margin(entry, sl, equity=None, leverage=None):
-    lev = leverage if leverage is not None else LEVERAGE
-    return calc_notional(entry, sl, equity) / lev if lev > 0 else 0.0
+    """LEGACY — kept for family module re-exports. Unused in practice."""
+    return 0.0
 
 
 # ═══════════════════════════════════════════════════════════
@@ -230,6 +213,8 @@ class DiagnosticsTracker:
 
 # ═══════════════════════════════════════════════════════════
 #  FAMILY SPEC
+#  REV 23.0 — Removed dead late_entry_guard_* / top_chase_* fields.
+#  config_center always provides these values via _cfg.
 # ═══════════════════════════════════════════════════════════
 @dataclass
 class FamilySpec:
@@ -258,12 +243,9 @@ class FamilySpec:
     rsi_buy_overbought: float = 86.0
     rsi_sell_oversold: float = 20.0
 
-    top_chase_rsi: float = 76.0
-    top_chase_flips: int = 8
-
-    late_entry_guard_adx: float = 45.0
-    late_entry_guard_dist: float = 1.8
-    late_entry_guard_rsi: float = 62.0
+    # NOTE: late_entry_guard_* / top_chase_* were REMOVED in REV 23.0.
+    #       They are always provided by config_center.get_config().
+    #       FamilySpec no longer duplicates them.
 
     st_min_dist_atr: float = 0.25
     st_max_chase_atr: float = 1.4
@@ -406,7 +388,7 @@ def _apply_modern_modifiers(conf: float, side: str,
                 conf = max(0.0, conf - 5.0)
                 extra.append(f"crowdedS{fz:.1f}")
 
-        # ── REV 22.0 — Orderbook imbalance modifier (±3, soft) ──
+        # Orderbook imbalance modifier (±3, soft)
         try:
             ob_bias = str(ind_1h.get("ob_bias", "BALANCED"))
             ob_imb  = float(ind_1h.get("ob_imbalance", 0.0) or 0.0)
@@ -458,7 +440,7 @@ def _htf_aligns(ind_4h, side, ind_1h=None):
 
 
 # ═══════════════════════════════════════════════════════════
-#  SIGNAL BUILDER (with caps)
+#  SIGNAL BUILDER (with caps + RR floor)
 # ═══════════════════════════════════════════════════════════
 def _get_caps_safe(spec: FamilySpec, symbol: str) -> dict:
     if not symbol:
@@ -471,8 +453,11 @@ def _get_caps_safe(spec: FamilySpec, symbol: str) -> dict:
 
 def _mk(spec: FamilySpec, side, conf, entry, sl, tp1, tp2,
         reasons, symbol="", ind_1h=None, strategy_name=""):
-    """Signal builder with caps + RR floor."""
-    # ── REV 21.4 — early BTC bias reject ──
+    """Signal builder with caps + RR floor.
+
+    REV 23.0 — Uses config_center.get_min_rr() for RR floor.
+    """
+    # Early BTC bias reject
     try:
         from signals.decision_engine import _btc_bias_blocks
         _btc_reason = _btc_bias_blocks(side)
@@ -485,14 +470,7 @@ def _mk(spec: FamilySpec, side, conf, entry, sl, tp1, tp2,
 
     caps = _get_caps_safe(spec, symbol)
 
-    # ── REV 22.2 — Vol class cap adjustment ──
-    # Volatility class (LOW/MED/HIGH) scales caps so stable majors
-    # (BTC, ETH) and wild alts (HYPE, MORPHO) get appropriately
-    # sized SL/TP windows.
-    #
-    #   LOW  × 0.80 → BTC SL cap 4.5% × 0.8 = 3.6%
-    #   MED  × 1.00 → APT SL cap 6.0% × 1.0 = 6.0%
-    #   HIGH × 1.40 → HYPE SL cap 4.5% × 1.4 = 6.3%
+    # ── Vol class cap adjustment (REV 22.2) ──
     max_sl_pct  = caps["sl"]
     max_tp1_pct = caps["tp1"]
     max_tp2_pct = caps["tp2"]
@@ -560,7 +538,8 @@ def _mk(spec: FamilySpec, side, conf, entry, sl, tp1, tp2,
 
     rr = abs(tp1 - entry) / risk
 
-    _effective_floor = _MIN_RR_BY_STRATEGY.get(strategy_name, _MK_RR_FLOOR)
+    # ── REV 23.0 — RR floor from config_center ──
+    _effective_floor = _get_min_rr(strategy_name)
     if rr < _effective_floor - _RR_FLOAT_EPS:
         if _DEBUG_STRAT:
             print(f"[_mk] {symbol} REJECT: rr {rr:.3f} < {_effective_floor} "
@@ -611,18 +590,15 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
     min_adx_st    = filters.get("min_adx_st",
                                 max(spec.min_adx["SUPERTREND_RIDE"],
                                     spec.min_adx_env))
-    guard_dist    = filters.get("late_guard_dist", spec.late_entry_guard_dist)
-    top_rsi       = filters.get("top_chase_rsi",   spec.top_chase_rsi)
-    top_flips     = filters.get("top_chase_flips", spec.top_chase_flips)
+    guard_dist    = filters.get("late_guard_dist", 1.0)
+    top_rsi       = filters.get("top_chase_rsi",   68.0)
+    top_flips     = filters.get("top_chase_flips", 4)
     block_ny_am   = filters.get("block_ny_am",  spec.block_ny_am_for_st)
     block_ny_pm   = filters.get("block_ny_pm",  False)
 
-    late_adx = float(_cfg.get("late_guard_adx",
-                              filters.get("late_guard_adx",
-                                          spec.late_entry_guard_adx)))
-    late_rsi = float(_cfg.get("late_guard_rsi",
-                              filters.get("late_guard_rsi",
-                                          spec.late_entry_guard_rsi)))
+    # Late guard from config_center (single source)
+    late_adx = float(_cfg.get("late_guard_adx", 35.0))
+    late_rsi = float(_cfg.get("late_guard_rsi", 58.0))
 
     if _is_ny_pm(ind_1h) and block_ny_pm:
         tracker.rej("SUPERTREND_RIDE", "NY_PM"); return None
@@ -667,6 +643,11 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
     tp1_atr = float(_cfg.get("tp1_atr", _coin_tp1)) * float(_cfg.get("tp_mult", 1.0))
     tp2_atr = float(_cfg.get("tp2_atr", _coin_tp2)) * float(_cfg.get("tp_mult", 1.0))
 
+    # Exhausted thresholds from config_center
+    _exh_rsi_buy  = float(_cfg.get("exhausted_rsi_buy", 78.0))
+    _exh_rsi_sell = float(_cfg.get("exhausted_rsi_sell", 22.0))
+    _exh_dist_mult = float(_cfg.get("exhausted_dist_mult", 1.5))
+
     # ── BUY ──
     if st_trend == "UP" and price > st_val:
         if regime in ("CHOP", "QUIET"):
@@ -693,7 +674,7 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
         dist = price - st_val
         dist_atr = dist / atr
 
-        if rsi >= EXHAUSTED_RSI_EXTREME_BUY and dist_atr >= guard_dist * EXHAUSTED_DIST_MULT:
+        if rsi >= _exh_rsi_buy and dist_atr >= guard_dist * _exh_dist_mult:
             tracker.rej("SUPERTREND_RIDE",
                         f"exhausted_{adx:.0f}_{rsi:.0f}"); return None
 
@@ -750,7 +731,7 @@ def strategy_supertrend_ride(spec, tracker, ind_1h, ind_4h,
         dist = st_val - price
         dist_atr = dist / atr
 
-        if rsi <= EXHAUSTED_RSI_EXTREME_SELL and dist_atr >= guard_dist * EXHAUSTED_DIST_MULT:
+        if rsi <= _exh_rsi_sell and dist_atr >= guard_dist * _exh_dist_mult:
             tracker.rej("SUPERTREND_RIDE",
                         f"exhausted_sell_{adx:.0f}_{rsi:.0f}"); return None
 

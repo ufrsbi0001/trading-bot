@@ -1,25 +1,25 @@
 """
 coins_config.py — Wrapper around coins/ directory.
 
-REV 22.0 (2026-10-02) — FAMILY-LEVEL BASELINES:
-  ✅ MAJOR REFACTOR: Config now comes from core/family_baselines.py.
-     Coin files are IDENTITY-ONLY (SYMBOL, FAMILY, VOL_CLASS, ENABLED).
-     
+REV 23.0 (2026-10-02) — UNIFIED CONFIG SOURCE:
+  ✅ Migrated from core/family_baselines.py → core/config_center.py.
+     All family baselines (ST_PARAMS, CAPS, FILTERS) and vol class
+     multipliers now come from config_center.py — the single source
+     of truth for the entire system.
+
      Changed:
-       • get_caps()            → reads family baseline CAPS
-       • get_coin_filters()    → reads family baseline FILTERS
-       • get_coin_st_params()  → reads family baseline ST_PARAMS
+       • Top import block: family_baselines → config_center
      
      Unchanged:
-       • Identity fields still come from coins/*.py
-       • get_family, get_profile, get_coin_vol_class — unchanged
-       • get_coin_td_fade — still per-coin (strategy-specific)
-     
-     Benefits:
-       • Single source of truth for tuning (family_baselines.py)
-       • 60 coin files → 8-line identity-only
-       • Tuning iterations: 60 edits → 1 edit
-       • Statistical power (family-level samples)
+       • get_caps()            → reads baseline CAPS
+       • get_coin_filters()    → reads baseline FILTERS
+       • get_coin_st_params()  → reads baseline ST_PARAMS
+       • get_vol_class_mult()  → reads VOL_CLASS_CAP_MULT
+       • All other accessors
+
+REV 22.0 (2026-10-02) — FAMILY-LEVEL BASELINES:
+  ✅ Config now comes from core/family_baselines.py.
+     Coin files are IDENTITY-ONLY.
 
 REV 21.7 (2026-09-30) — FALLBACK RR FIX.
 REV 19.16 (2026-09-29) — DEAD DYNAMIC ROUTING REMOVED.
@@ -31,9 +31,9 @@ from __future__ import annotations
 
 from coins import get_coin, all_coins, load_errors as _coin_load_errors
 
-# ── REV 22.0 — Family baselines (single source of truth) ──
+# ── REV 23.0 — Unified config source (single source of truth) ──
 try:
-    from core.family_baselines import (
+    from core.config_center import (
         get_baseline as _get_family_baseline,
         get_vol_class_mult as _get_vol_class_mult,
         VOL_CLASS_CAP_MULT as _VOL_CLASS_CAP_MULT,
@@ -125,13 +125,13 @@ def is_known(symbol: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════
-#  FAMILY BASELINE ACCESSORS (REV 22.0)
+#  FAMILY BASELINE ACCESSORS (REV 23.0 — from config_center)
 # ═══════════════════════════════════════════════════════════
 def get_caps(symbol: str) -> dict:
     """
     Return family baseline caps dict: {"sl": pct, "tp1": pct, "tp2": pct}.
 
-    REV 22.0 — No longer per-coin. Reads from core/family_baselines.py.
+    REV 23.0 — Reads from core/config_center.py.
 
     Note: caps are the MAX allowed distances. Actual SL/TP are
     computed by strategy functions (using ATR × st_params), then
@@ -149,7 +149,7 @@ def get_coin_filters(symbol: str) -> dict:
     """
     Return family baseline FILTERS dict.
 
-    REV 22.0 — No longer per-coin. Reads from core/family_baselines.py.
+    REV 23.0 — Reads from core/config_center.py.
 
     This includes: late_guard_*, top_chase_*, max_flips, min_flips,
     min_adx_st, min_dist_atr, max_dist_atr, pullback_dist_atr,
@@ -167,7 +167,7 @@ def get_coin_st_params(symbol: str) -> dict:
     """
     Return family baseline ST_PARAMS dict.
 
-    REV 22.0 — No longer per-coin. Reads from core/family_baselines.py.
+    REV 23.0 — Reads from core/config_center.py.
 
     Returns {sl_atr, tp1_atr, tp2_atr} — the ATR multipliers for
     SL and TP distances. Actual distances computed as ATR × multiplier.
@@ -184,7 +184,9 @@ def get_vol_class_mult(vol_class: str) -> float:
     """
     Return cap multiplier for a vol class.
 
-    REV 22.0 — Used by signals/base.py::_mk() to adjust caps:
+    REV 23.0 — Reads from core/config_center.py.
+
+    Used by signals/base.py::_mk() to adjust caps:
       LOW  → 0.80 (majors need tighter caps)
       MED  → 1.00 (baseline)
       HIGH → 1.40 (wild alts need wider caps)
@@ -215,7 +217,7 @@ def enabled_coins() -> tuple[str, ...]:
 
 
 # ═══════════════════════════════════════════════════════════
-#  PER-COIN EXTRAS (unused fields after REV 22.0 refactor)
+#  PER-COIN EXTRAS
 # ═══════════════════════════════════════════════════════════
 def get_coin_vol_class(symbol: str) -> str:
     """Return volatility class label, or 'MED' if unknown."""
@@ -231,7 +233,7 @@ def get_coin_td_fade(symbol: str) -> dict:
     Return per-coin TD_FADE params, or {} if unknown.
 
     NOTE: TD_FADE is strategy-specific (falling-knife BUY logic),
-    so it stays per-coin. All OTHER tuning comes from family baselines.
+    so it stays per-coin. All OTHER tuning comes from config_center.
     """
     try:
         c = get_coin(_normalize(symbol))
@@ -262,11 +264,11 @@ def known_families() -> list[str]:
 
 
 # ═══════════════════════════════════════════════════════════
-#  DIAGNOSTIC — REV 22.0
+#  DIAGNOSTIC — REV 23.0
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print("=" * 70)
-    print("  COINS_CONFIG DIAGNOSTIC — REV 22.0 (family baselines)")
+    print("  COINS_CONFIG DIAGNOSTIC — REV 23.0 (unified config)")
     print("=" * 70)
 
     errs = load_errors()
@@ -296,9 +298,9 @@ if __name__ == "__main__":
             coins = get_family_coins(fam)
             print(f"  {fam:<20} ({len(coins):>2}) → {sorted(coins)}")
 
-    # ── REV 22.0 — Baseline preview ──
+    # ── REV 23.0 — Baseline preview ──
     print("\n" + "=" * 70)
-    print("  FAMILY BASELINE PREVIEW (REV 22.0)")
+    print("  FAMILY BASELINE PREVIEW (REV 23.0 — from config_center)")
     print("=" * 70)
     for fam in fams:
         baseline = _get_family_baseline(fam)
@@ -309,7 +311,7 @@ if __name__ == "__main__":
 
     # ── Sample: Verify baseline is served ──
     print("\n" + "=" * 70)
-    print("  SAMPLE LOOKUP (should serve from family baseline)")
+    print("  SAMPLE LOOKUP (should serve from config_center)")
     print("=" * 70)
     for sym in ("APTUSDT", "BTCUSDT", "HYPEUSDT"):
         if sym in all_c:
