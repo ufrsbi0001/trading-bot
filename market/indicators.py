@@ -1,14 +1,18 @@
 """
 indicators.py — V2.9.9 (2026-09-24) for BEST_SCALP_V2.
 
+REV 3.3 (2026-10-02) — FULLY DELEGATED TO config_center:
+  ✅ `_BASE_CFG` module-level dict REMOVED (was dead code after
+     funding threshold migrated). All config reads now go through
+     config_center:
+       • get_trading_config() = config_center.get_config(include_family=False)
+       • _regime_config(r)    = config_center.get_regime_cfg(r)
+       • funding threshold    = config_center.GLOBAL["funding_extreme"]
+  ✅ Zero local dicts — runtime/env overrides propagate immediately.
+
 REV 3.2 (2026-10-02) — UNIFIED CONFIG (Option B):
   ✅ `_BASE_CFG` / `_REGIME_CFG` literals DELETED. Now sourced from
      core.config_center (single source of truth).
-     • `_BASE_CFG` = config_center.get_config(include_family=False),
-       flat GLOBAL + REGIME[UNKNOWN] — same shape as old dict.
-     • `_REGIME_CFG` = config_center.get_regime_cfg(regime) — same
-       keys (sl_mult / tp_mult / rsi_period) + new ones (hold_minutes,
-       late_guard_adx) that callers ignore.
   ✅ `get_trading_config()` / `get_regime_multipliers()` /
      `_regime_config()` kept as thin public wrappers (API preserved).
   ✅ config_center.REGIME values aligned to match old indicators
@@ -83,10 +87,11 @@ try:
 except Exception:
     CONFIG = None  # type: ignore
 
-# ── REV 3.2 — config_center delegation ──
+# ── REV 3.3 — config_center delegation (single source of truth) ──
 from core.config_center import (
     get_config as _cc_get_config,
     get_regime_cfg as _cc_get_regime_cfg,
+    GLOBAL as _CC_GLOBAL,
 )
 
 UTC = timezone.utc
@@ -138,23 +143,17 @@ def _http_get_json(url: str, params: dict | None = None,
 
 
 # ─────────────────────────────────────────────────────────────
-# REGIME-ADAPTIVE CONFIG — REV 3.2
-#   Delegated to core.config_center (single source of truth).
-#   `_BASE_CFG` retained as a module-level flat dict for
-#   backwards-compat (used by get_futures_sentiment for the
-#   funding_extreme threshold).
+# REGIME-ADAPTIVE CONFIG — REV 3.3
+#   Fully delegated to core.config_center (single source of truth).
+#   No local dicts — every read goes through the public helpers
+#   or _CC_GLOBAL so runtime/env overrides propagate immediately.
 # ─────────────────────────────────────────────────────────────
-_BASE_CFG: dict = _cc_get_config(include_family=False)
-_BASE_CFG.pop("_meta", None)  # strip metadata key
-
-
 def get_trading_config() -> dict:
     """Flat GLOBAL + REGIME[UNKNOWN] — legacy _BASE_CFG shape.
 
-    REV 3.2 — was `return dict(_BASE_CFG)`; now reads from
-    config_center each call so .env overrides / runtime
-    config updates propagate. Callers use .get() so extra
-    keys (sl_mult / tp_mult / rsi_period / hold_minutes) are
+    REV 3.3 — was `dict(_BASE_CFG)`; now reads config_center each call
+    so .env overrides / runtime updates propagate. Callers use .get()
+    so extra keys (sl_mult / tp_mult / rsi_period / hold_minutes) are
     silently ignored where not expected.
     """
     out = _cc_get_config(include_family=False)
@@ -171,7 +170,7 @@ def get_regime_multipliers(regime: str) -> dict:
 def _regime_config(regime: str) -> dict:
     """Return REGIME[regime] — served by config_center.
 
-    REV 3.2 — was local _REGIME_CFG lookup; now delegated.
+    REV 3.3 — was local _REGIME_CFG lookup; now delegated.
     Same keys (sl_mult / tp_mult / rsi_period) plus new ones
     (hold_minutes / late_guard_adx) that callers don't read.
     """
@@ -308,9 +307,10 @@ def get_futures_sentiment(symbol: str) -> dict:
         elif out["oi_change_pct"] < -1.0:
             out["oi_trend"] = "FALLING"
 
-        if out["funding"] > _BASE_CFG["funding_extreme"]:
+        # REV 3.3 — funding threshold from config_center (live source)
+        if out["funding"] > _CC_GLOBAL["funding_extreme"]:
             out["sentiment"] = "LONG_CROWDED"
-        elif out["funding"] < -_BASE_CFG["funding_extreme"]:
+        elif out["funding"] < -_CC_GLOBAL["funding_extreme"]:
             out["sentiment"] = "SHORT_CROWDED"
 
     with _fut_lock:
