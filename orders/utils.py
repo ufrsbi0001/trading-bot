@@ -15,6 +15,7 @@ import threading
 import time
 
 from core.config import CONFIG
+from core import config_center as CC
 
 from core.client import (
     get_client, refresh_timestamp, _run_with_timeout,
@@ -33,13 +34,13 @@ from core.config_center import (
 # ═════════════════════════════════════════════════════════════
 #  Constants (from CONFIG)
 # ═════════════════════════════════════════════════════════════
-LEVERAGE             = CONFIG.leverage
-RISK_PERCENT         = CONFIG.risk_percent
-MAX_OPEN_POSITIONS   = CONFIG.max_open_positions
-MAX_TOTAL_MARGIN_PCT = CONFIG.max_total_margin_pct
-PARTIAL_CLOSE_USDT   = CONFIG.partial_close_usdt
+LEVERAGE             = CC.get('leverage')
+RISK_PERCENT         = CC.get('risk_percent')
+MAX_OPEN_POSITIONS   = CC.get('max_open_positions')
+MAX_TOTAL_MARGIN_PCT = CC.get('max_total_margin_pct')
+PARTIAL_CLOSE_USDT   = CC.get('partial_close_usdt')
 DRY_RUN              = CONFIG.dry_run
-MAX_HOLD_MINUTES     = CONFIG.max_hold_minutes
+MAX_HOLD_MINUTES     = CC.get('hold_minutes')
 
 
 # ═════════════════════════════════════════════════════════════

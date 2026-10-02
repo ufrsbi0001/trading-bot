@@ -1,6 +1,16 @@
 """
 indicators.py — V2.9.9 (2026-09-24) for BEST_SCALP_V2.
 
+REV 3.5 (2026-10-02) — DEAD IMPORT + LIVE FUNDING_Z READ:
+  ✅ Removed dead `from core.config import CONFIG` try/except block.
+     After REV 3.3 delegation, this module reads all trading config
+     from config_center — CONFIG was only referenced for a single
+     `use_funding_z` flag read, now migrated to live config_center.
+  ✅ Removed dead `GLOBAL as _CC_GLOBAL` import — never referenced.
+  ✅ `use_funding_z` flag now read LIVE via `_cc_get("use_funding_z")`
+     each call. Runtime/env overrides propagate immediately.
+     Zero behaviour change for default values.
+
 REV 3.4 (2026-10-02) — DEAD FUNCTION CLEANUP:
   ✅ Removed legacy functions (no live consumers, verified via grep):
        • get_futures_sentiment()       — legacy, no callers
@@ -90,16 +100,14 @@ except Exception:
     if not logger.handlers:
         logger.addHandler(logging.StreamHandler())
 
-try:
-    from core.config import CONFIG  # type: ignore
-except Exception:
-    CONFIG = None  # type: ignore
-
-# ── REV 3.3 — config_center delegation (single source of truth) ──
+# ── REV 3.5 — config_center delegation (single source of truth) ──
+#   Removed dead CONFIG import (was only used for use_funding_z).
+#   Removed dead _CC_GLOBAL import (never referenced).
+#   Added `get as _cc_get` for scalar live reads.
 from core.config_center import (
     get_config as _cc_get_config,
     get_regime_cfg as _cc_get_regime_cfg,
-    GLOBAL as _CC_GLOBAL,
+    get as _cc_get,
 )
 
 UTC = timezone.utc
@@ -147,7 +155,7 @@ def _http_get_json(url: str, params: dict | None = None,
 # REGIME-ADAPTIVE CONFIG — REV 3.3
 #   Fully delegated to core.config_center (single source of truth).
 #   No local dicts — every read goes through the public helpers
-#   or _CC_GLOBAL so runtime/env overrides propagate immediately.
+#   or _cc_get so runtime/env overrides propagate immediately.
 # ─────────────────────────────────────────────────────────────
 def get_trading_config() -> dict:
     """Flat GLOBAL + REGIME[UNKNOWN] — legacy _BASE_CFG shape.
@@ -949,8 +957,15 @@ def calculate_pro_indicators(df: pd.DataFrame, tf: str,
     ob_imbalance = {"bid_vol": 0.0, "ask_vol": 0.0, "imbalance": 0.0, "bias": "BALANCED"}
     funding_z = {"funding_now": 0.0, "funding_mean": 0.0, "funding_z": 0.0}
 
-    if symbol and CONFIG is not None and getattr(CONFIG, "use_funding_z", False):
-        funding_z = get_funding_rate_z(symbol)
+    # ── REV 3.5 — use_funding_z read LIVE from config_center ──
+    # (was: getattr(CONFIG, "use_funding_z", False) via core/config.py proxy)
+    if symbol:
+        try:
+            _funding_z_enabled = bool(_cc_get("use_funding_z", False))
+        except Exception:
+            _funding_z_enabled = False
+        if _funding_z_enabled:
+            funding_z = get_funding_rate_z(symbol)
 
     # ── REV 1.4.13 — ORDERBOOK IMBALANCE (enable, 30s cache) ──
     if symbol:

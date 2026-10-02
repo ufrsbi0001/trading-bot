@@ -1,6 +1,16 @@
 """
 families/base.py — Shared signal-engine core for all 4 families.
 
+REV 23.4 (2026-10-02) — LIVE CONFIG READS + DEAD IMPORT CLEANUP:
+  ✅ Removed dead `from core.config import CONFIG` import — never
+     referenced anywhere in this module (verified via grep).
+  ✅ Removed `GLOBAL as _CC_GLOBAL` import — the single usage in
+     _mk() has been migrated to a LIVE `CC.get("min_confidence", ...)`
+     call so runtime/env overrides propagate immediately.
+  ✅ _mk(): min_confidence read now LIVE (was: snapshot of
+     _CC_GLOBAL dict at import time).
+  ✅ Zero behaviour change for default values.
+
 REV 23.3 (2026-10-02) — COSMETIC CLEANUP:
   ✅ Removed unused module constant `DEFAULT_TREND_FOLLOW_RSI_FLOOR`
      (was only used as FamilySpec dataclass default). Inlined as
@@ -27,7 +37,7 @@ REV 23.1 (2026-10-02) — PHASE 2 CLEANUP:
 REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
   ✅ Removed `_MIN_RR_BY_STRATEGY` hardcoded dict — now uses
      config_center.get_min_rr().
-  ✅ Removed dead `MAX_HOLD_MINUTES=1800` (CONFIG.max_hold_minutes
+  ✅ Removed dead `MAX_HOLD_MINUTES=1800` (CC.get('hold_minutes')
      used by orders/utils.py).
   ✅ Removed FamilySpec `late_entry_guard_*` and `top_chase_*` fields
      — dead since config_center always provides these values.
@@ -48,7 +58,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from core.config import CONFIG
+from core import config_center as CC
 from core.coins_config import (
     get_caps, get_profile, is_enabled,
     get_coin_filters, get_coin_st_params, get_coin_td_fade,
@@ -57,12 +67,11 @@ from core.coins_config import (
 from market.indicators import htf_aligns as _htf_aligns_shared
 
 # ─── REV 22.1 — Centralized config (single source of truth) ───
-# ─── REV 23.1 — GLOBAL added (for min_confidence) ───
+# ─── REV 23.4 — GLOBAL import removed; use CC.get() for live reads ───
 from core.config_center import (
     get_config as _get_central_config,
     get_min_rr as _get_min_rr,
     COUNTER_TREND_STRATEGIES as _COUNTER_TREND_STRATS,
-    GLOBAL as _CC_GLOBAL,
 )
 
 # ─── Optional regime-multiplier helper (graceful fallback) ──
@@ -352,7 +361,7 @@ def _apply_modern_modifiers(conf: float, side: str,
     if ind_1h is None:
         return conf
     try:
-        if CONFIG.use_taker_volume:
+        if CC.get('use_taker_volume'):
             z = float(ind_1h.get("taker_ratio_z", 0.0) or 0.0)
             if side == "BUY" and z > 1.5:
                 conf = min(95.0, conf + 4.0)
@@ -361,7 +370,7 @@ def _apply_modern_modifiers(conf: float, side: str,
                 conf = min(95.0, conf + 4.0)
                 extra.append(f"taker{z:.1f}")
 
-        if CONFIG.use_volume_profile:
+        if CC.get('use_volume_profile'):
             pd_pct = float(ind_1h.get("poc_dist_pct", 0.0) or 0.0)
             if side == "BUY" and -1.5 < pd_pct < 0.5:
                 conf = min(95.0, conf + 2.0)
@@ -370,7 +379,7 @@ def _apply_modern_modifiers(conf: float, side: str,
                 conf = min(95.0, conf + 2.0)
                 extra.append("atPOC")
 
-        if CONFIG.use_anchored_vwap:
+        if CC.get('use_anchored_vwap'):
             ad = float(ind_1h.get("avwap_dist_pct", 0.0) or 0.0)
             if side == "BUY" and 0.0 < ad < 3.0:
                 conf = min(95.0, conf + 2.0)
@@ -379,7 +388,7 @@ def _apply_modern_modifiers(conf: float, side: str,
                 conf = min(95.0, conf + 2.0)
                 extra.append("<aVWAP")
 
-        if CONFIG.use_funding_z:
+        if CC.get('use_funding_z'):
             fz = float(ind_1h.get("funding_z", 0.0) or 0.0)
             if side == "BUY" and fz > 2.0:
                 conf = max(0.0, conf - 5.0)
@@ -417,10 +426,10 @@ def _apply_modern_modifiers(conf: float, side: str,
 #  HTF ALIGNMENT WRAPPER
 # ═══════════════════════════════════════════════════════════
 def _htf_aligns(ind_4h, side, ind_1h=None):
-    if _htf_aligns_shared(ind_4h, side, relaxed=CONFIG.htf_align_relaxed):
+    if _htf_aligns_shared(ind_4h, side, relaxed=CC.get('htf_align_relaxed')):
         return True
 
-    if not CONFIG.htf_align_relaxed or ind_1h is None:
+    if not CC.get('htf_align_relaxed') or ind_1h is None:
         return False
 
     try:
@@ -459,6 +468,8 @@ def _mk(spec: FamilySpec, side, conf, entry, sl, tp1, tp2,
       • Removed duplicate BTC bias check (decision_engine handles it).
       • min_confidence now from config_center.GLOBAL (fallback: spec).
       • RR floor from config_center.get_min_rr().
+    REV 23.4 —
+      • min_confidence read LIVE (was: snapshot via _CC_GLOBAL).
     """
     # NOTE (REV 23.1): The BTC bias gate was REMOVED from here.
     # decision_engine.evaluate_trade() runs the gate as HARD GATE #1
@@ -544,8 +555,8 @@ def _mk(spec: FamilySpec, side, conf, entry, sl, tp1, tp2,
                   f"(entry={entry} sl={sl} tp1={tp1} risk={risk})")
         return None
 
-    # ── REV 23.1 — min_confidence from config_center (fallback: spec) ──
-    _min_conf = float(_CC_GLOBAL.get("min_confidence", spec.min_confidence))
+    # ── REV 23.4 — min_confidence LIVE read (fallback: spec) ──
+    _min_conf = float(CC.get("min_confidence", spec.min_confidence) or spec.min_confidence)
     if conf < _min_conf:
         if _DEBUG_STRAT:
             print(f"[_mk] {symbol} REJECT: conf {conf:.1f} < "

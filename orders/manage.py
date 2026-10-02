@@ -1,39 +1,29 @@
 """
 orders/manage.py — Trade management loop.
 
+REV 1.9.0 (2026-10-02) — RUNTIME TOGGLE AWARENESS:
+  ✅ Removed module-level cached imports `MAX_HOLD_MINUTES` and
+     `PARTIAL_CLOSE_USDT` from .utils. Both are now read LIVE from
+     config_center on every call via _cc_get(). UI runtime updates
+     (config_center.update_runtime(hold_minutes=..., ...)) take effect
+     immediately — no bot restart required.
+  ✅ Trailing SL tunables (TRAIL_DISTANCE_R, TRAIL_HYSTERESIS_R,
+     TRAIL_MIN_LEVEL) promoted from hardcoded module constants to
+     config_center.GLOBAL reads. Tune via .env (CC_TRAIL_*) or
+     runtime update_runtime(trail_distance_r=...). Re-added the 3
+     keys to config_center (REV 5.2) — previously flagged 'dead'
+     because they were hardcoded locals, never read from GLOBAL.
+  ✅ is_time_exit_enabled() already live (REV 1.8.0) — unchanged.
+  ✅ Zero behaviour change for default values.
+
 REV 1.8.0 (2026-10-02) — TIME_EXIT TOGGLE GATE:
-  ✅ TIME_EXIT block ab `is_time_exit_enabled()` se gated hai.
-     • False (default) → poora time-exit block skip
-     • True            → purana regime-aware hold-time logic chalta hai
-  ✅ Toggle karne ke 3 tarike:
-       1. Dashboard UI:  POST /api/time_exit {"enabled": true}
-       2. Runtime:       cc.update_runtime(time_exit_enabled=True)
-       3. .env:          CC_TIME_EXIT_ENABLED=true
-  ✅ Jab OFF ho, sirf SL / TP / RR_COLLAPSE exits kaam karte hain.
-  ✅ SL/TP/trailing/partial logic me koi change nahi.
+  ✅ TIME_EXIT block gated by is_time_exit_enabled().
+  ✅ SL/TP/trailing/partial logic unchanged.
 
-REV 1.7.1 (2026-10-02) — UNIFIED CONFIG CLEANUP:
-  ✅ Time-exit fallback now uses `config_center.get_config().hold_minutes`
-     instead of removed `_STRATEGY_HOLD_MIN`.
-  ✅ Import of `_STRATEGY_HOLD_MIN` removed from `.utils`.
-
-REV 1.7.0 (2026-10-02) — CONFIG CENTER INTEGRATION (Phase 1):
-  ✅ Time-exit now prefers `hold_time_minutes` (frozen at entry time
-     by entry.py REV 1.7.0) over the live strategy-based cap. This
-     prevents regime flips mid-trade from retroactively shortening
-     the hold budget. Falls back gracefully for legacy trades.
-
-REV 1.6.3 (2026-09-28) — DEAD IMPORT CLEANUP:
-  ✅ Removed two unused imports (zero behaviour change):
-       • `from decimal import Decimal`   (never referenced)
-       • `from core.config import CONFIG`     (never referenced — every
-         config value comes via .utils: MAX_HOLD_MINUTES,
-         PARTIAL_CLOSE_USDT, _STRATEGY_HOLD_MIN).
-
-REV 1.6.2 (2026-09-28) — NAKED-SL WINDOW FIX:
-  ✅ _detect_tp1_fill_and_move_be() and update_sl() now place the
-     NEW stop-loss BEFORE cancelling the OLD one.
-
+REV 1.7.1 (2026-10-02) — UNIFIED CONFIG CLEANUP.
+REV 1.7.0 (2026-10-02) — CONFIG CENTER INTEGRATION (Phase 1).
+REV 1.6.3 (2026-09-28) — DEAD IMPORT CLEANUP.
+REV 1.6.2 (2026-09-28) — NAKED-SL WINDOW FIX.
 REV 1.6.1 (2026-09-28) — DIRECTIONAL NO-DOWNGRADE SL GUARD.
 REV 1.6.0 (2026-09-28) — CONTINUOUS TRAILING STOP-LOSS.
 REV 1.5.0 (2026-09-28) — SPLIT + P1 FIX.
@@ -60,13 +50,15 @@ from market.indicators import calculate_pro_indicators, get_trading_config
 
 # ── REV 1.7.1 — Unified config source for hold_minutes fallback ──
 # ── REV 1.8.0 — is_time_exit_enabled() for TIME_EXIT toggle gate ──
+# ── REV 1.9.0 — _cc_get() for live reads (hold_minutes, partial_close_usdt,
+#               trail_*). Replaces cached imports from .utils. ──
 from core.config_center import (
     get_config as _get_central_config,
     is_time_exit_enabled,
+    get as _cc_get,
 )
 
 from .utils import (
-    MAX_HOLD_MINUTES, PARTIAL_CLOSE_USDT,
     _cl, _get_risk_unit, _r_thresholds_per_class,
 )
 from .repair import (
@@ -76,11 +68,13 @@ from .exit import emergency_close_retry, handle_trade_close
 
 
 # ═════════════════════════════════════════════════════════════
-#  TRAILING SL TUNABLES  (REV 1.6.0)
+#  REV 1.9.0 — Trailing SL tunables now LIVE from config_center.
+#  No module-level constants. Read via _cc_get('trail_*') at use site.
+#  Defaults documented here for reference only:
+#     trail_distance_r   = 0.50
+#     trail_hysteresis_r = 0.10
+#     trail_min_level    = 1
 # ═════════════════════════════════════════════════════════════
-TRAIL_DISTANCE_R    = 0.50   # trail distance behind mark (in R units)
-TRAIL_HYSTERESIS_R  = 0.10   # min improvement required to update (R units)
-TRAIL_MIN_LEVEL     = 1      # start trailing only after SL reaches BE
 
 
 # ═════════════════════════════════════════════════════════════
@@ -266,14 +260,16 @@ def manage_single_trade(symbol):
     #    • time_exit_enabled = False (default) → poora block skip
     #    • time_exit_enabled = True            → regime-aware hold-time
     #  Toggle: dashboard UI / update_runtime() / CC_TIME_EXIT_ENABLED
-    #  Jab OFF ho, sirf SL / TP / RR_COLLAPSE exits kaam karte hain.
+    #
+    #  REV 1.9.0 — hold_minutes ab LIVE read ho rahi hai (module-level
+    #  cache hata diya). UI change turant reflect hoti hai.
     # ═══════════════════════════════════════════════════════════
     try:
         entry_time_str = active.get('entry_time', '')
         if entry_time_str:
             strat_name = active.get("strategy", "UNKNOWN")
 
-            # ── REV 1.8.0 — TIME_EXIT gate ──
+            # ── REV 1.8.0 — TIME_EXIT gate (live read every call) ──
             _time_exit_on = False
             try:
                 _time_exit_on = bool(is_time_exit_enabled())
@@ -291,6 +287,11 @@ def manage_single_trade(symbol):
                 r_th_early = _r_thresholds_per_class(symbol, get_trading_config())
                 bars_cap_min = float(r_th_early.get("max_hold_bars", 28)) * 60.0
 
+                # ── REV 1.9.0 — LIVE hold_minutes fallback ──
+                # Read fresh every call so UI/runtime changes take effect
+                # without a bot restart.
+                _live_hold = float(_cc_get('hold_minutes', 180) or 180)
+
                 # ── REV 1.7.0 — prefer stored regime-aware hold time ──
                 # `hold_time_minutes` was frozen at entry time (entry.py
                 # REV 1.7.0) so regime flips mid-trade don't retroactively
@@ -307,13 +308,13 @@ def manage_single_trade(symbol):
                         effective_cap = None
 
                 if effective_cap is None:
-                    # ── REV 1.7.1 — fallback: config_center hold_minutes (regime-aware) ──
+                    # ── REV 1.7.1 — fallback: config_center hold_minutes (live) ──
                     try:
                         _cfg_hold = _get_central_config(symbol, strat_name, "UNKNOWN")
-                        effective_cap = float(_cfg_hold.get("hold_minutes", MAX_HOLD_MINUTES))
+                        effective_cap = float(_cfg_hold.get("hold_minutes", _live_hold))
                         _source = f"config_center={effective_cap:.0f}m"
                     except Exception:
-                        effective_cap = min(float(MAX_HOLD_MINUTES), bars_cap_min)
+                        effective_cap = min(_live_hold, bars_cap_min)
                         _source = "bars_cap"
 
                 if held_min > effective_cap:
@@ -373,7 +374,10 @@ def manage_single_trade(symbol):
     else:
         mark_r = None
 
-    # Partial 70% (disabled by default)
+    # ═══════════════════════════════════════════════════════════
+    #  PARTIAL 70% (disabled by default)
+    #  REV 1.9.0 — partial_close_usdt ab LIVE read hoti hai
+    # ═══════════════════════════════════════════════════════════
     try:
         unrealized_usdt = float(raw_pos.get('unRealizedProfit', '0') or 0)
         if unrealized_usdt == 0:
@@ -382,11 +386,14 @@ def manage_single_trade(symbol):
 
         partial_done = active.get('partial_70_done', False)
 
-        if PARTIAL_CLOSE_USDT > 0 and not partial_done and unrealized_usdt >= PARTIAL_CLOSE_USDT:
+        # ── REV 1.9.0 — LIVE partial_close_usdt ──
+        _partial_usdt = float(_cc_get('partial_close_usdt', 0.0) or 0.0)
+
+        if _partial_usdt > 0 and not partial_done and unrealized_usdt >= _partial_usdt:
             skip_partial = False
             try:
-                trigger_price = (entry + (PARTIAL_CLOSE_USDT / abs(float(amt))) if is_long
-                                 else entry - (PARTIAL_CLOSE_USDT / abs(float(amt))))
+                trigger_price = (entry + (_partial_usdt / abs(float(amt))) if is_long
+                                 else entry - (_partial_usdt / abs(float(amt))))
                 slippage_pct = abs(mark - trigger_price) / entry * 100 if entry else 0
                 if slippage_pct > 0.4:
                     if (is_long and mark < trigger_price) or (not is_long and mark > trigger_price):
@@ -660,10 +667,15 @@ def manage_single_trade(symbol):
 
     # ═══════════════════════════════════════════════════════════
     #  CONTINUOUS TRAILING SL  (REV 1.6.0)
+    #  REV 1.9.0 — tunables ab LIVE from config_center
     # ═══════════════════════════════════════════════════════════
-    if r_mode and mark_r is not None and mark_r > 0 and last_sl_level >= TRAIL_MIN_LEVEL:
+    trail_min_level    = int(_cc_get('trail_min_level',    1))
+    trail_distance_r   = float(_cc_get('trail_distance_r',   0.50))
+    trail_hysteresis_r = float(_cc_get('trail_hysteresis_r', 0.10))
+
+    if r_mode and mark_r is not None and mark_r > 0 and last_sl_level >= trail_min_level:
         try:
-            trail_dist = risk_unit * TRAIL_DISTANCE_R
+            trail_dist = risk_unit * trail_distance_r
             min_trail = float(tick) * 10
             if trail_dist < min_trail:
                 trail_dist = min_trail
@@ -674,7 +686,7 @@ def manage_single_trade(symbol):
                 if trail_sl < be_floor:
                     trail_sl = be_floor
                 improvement_r = (trail_sl - current_sl_price) / risk_unit
-                if improvement_r >= TRAIL_HYSTERESIS_R:
+                if improvement_r >= trail_hysteresis_r:
                     update_sl(trail_sl, last_sl_level, force=True)
             else:
                 trail_sl = mark + trail_dist
@@ -682,7 +694,7 @@ def manage_single_trade(symbol):
                 if trail_sl > be_ceiling:
                     trail_sl = be_ceiling
                 improvement_r = (current_sl_price - trail_sl) / risk_unit
-                if improvement_r >= TRAIL_HYSTERESIS_R:
+                if improvement_r >= trail_hysteresis_r:
                     update_sl(trail_sl, last_sl_level, force=True)
         except Exception as e:
             logger.debug(f"[{symbol}] trailing SL failed: {e}")

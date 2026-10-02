@@ -1,43 +1,27 @@
 """
 orders/entry.py — Order placement.
 
-REV 1.7.3 (2026-10-02) — COSMETIC CLEANUP:
-  ✅ `_apply_vol_class_sizing` — `mult_map` promoted to module-level
-     `_VOL_CLASS_QTY_MULT` (clarity vs config_center's
-     VOL_CLASS_CAP_MULT which is a different concept).
+REV 1.8.0 (2026-10-02) — RUNTIME TOGGLE AWARENESS:
+  ✅ Removed cached imports LEVERAGE, RISK_PERCENT, MAX_OPEN_POSITIONS,
+     MAX_TOTAL_MARGIN_PCT from .utils. All now read LIVE via _cc_get()
+     so UI runtime changes take effect immediately.
+  ✅ _VOL_CLASS_QTY_MULT module dict → config_center.VOL_CLASS_QTY_MULT
+     (single source). Read live at sizing time.
+  ✅ Promoted 7 hardcoded scalars to config_center (REV 5.3):
+     margin_buffer_pct, counter_trend_size_mult,
+     min_notional_bump_mult, corrected_qty_close_ratio,
+     sl_tight_ratio, sl_wide_ratio, risk_oversize_warn_mult,
+     rr_collapse_tol.
+  ✅ Zero behaviour change for default values.
 
-REV 1.7.2 (2026-10-02) — PHASE 2 CLEANUP:
-  ✅ Signal drift cap now uses ACTUAL regime (was hardcoded "UNKNOWN").
-     Fetches regime from cached 1h indicator before resolving
-     signal_drift_pct from config_center. Prevents silent failures
-     if regime-dependent drift tuning is added later.
-
-REV 1.7.1 (2026-10-02) — PHASE 1 CLEANUP:
-  ✅ RR check now uses `config_center.get_min_rr(strategy)` (per-strategy
-     floors from MIN_RR dict) instead of `cfg['min_rr']` (GLOBAL scalar).
-     Fixes mismatch where strategy signal-gen used MIN_RR[strategy]=1.8
-     but entry.py read GLOBAL min_rr=1.5.
-     Fallback: get_min_rr() returns 1.5 if strategy not in MIN_RR.
-
-REV 1.7.0 (2026-10-02) — CONFIG CENTER INTEGRATION (Phase 1):
-  ✅ Added `config_center` import.
-  ✅ Signal drift cap now reads `signal_drift_pct` from config_center
-     (was hardcoded 0.8%).
-  ✅ Regime snapshot added at entry time — stores `regime_at_entry`
-     and `hold_time_minutes` in active_trades.json. manage.py will
-     use these frozen values instead of the LIVE regime (which can
-     flip mid-trade).
-
-REV 1.6.0 (2026-10-01) — SIGNAL DRIFT CAP:
-  ✅ Rejects entry if live price drifted > 0.8% from signal price.
-     Prevents stale signal entries (e.g., FET 1.8% adverse drift).
-  ✅ FIX: Removed redundant `bot_tracked_symbols.discard()` on
-     drift reject — the check runs BEFORE slot reservation, so no
-     cleanup is needed. Kept the check position (before slot add).
-
-REV 1.5.10 (2026-09-30) — RR COLLAPSE FLOAT TOLERANCE.
-REV 1.5.9 (2026-09-30) — SAFETY GUARDS (Bug #3 + Bug #5).
-REV 1.5.8 (2026-09-30) — MAX_QTY CAP (fix -4005 loop).
+REV 1.7.3 (2026-10-02) — COSMETIC CLEANUP.
+REV 1.7.2 (2026-10-02) — PHASE 2 CLEANUP.
+REV 1.7.1 (2026-10-02) — PHASE 1 CLEANUP.
+REV 1.7.0 (2026-10-02) — CONFIG CENTER INTEGRATION (Phase 1).
+REV 1.6.0 (2026-10-01) — SIGNAL DRIFT CAP.
+REV 1.5.10 — RR COLLAPSE FLOAT TOLERANCE.
+REV 1.5.9 — SAFETY GUARDS.
+REV 1.5.8 — MAX_QTY CAP.
 Contains: place_order_fixed.
 """
 from __future__ import annotations
@@ -59,16 +43,15 @@ from core.state import (
 )
 from market.indicators import get_trading_config
 from core.coins_config import get_caps
-from .utils import (
-    LEVERAGE, RISK_PERCENT, MAX_OPEN_POSITIONS, MAX_TOTAL_MARGIN_PCT,
-    DRY_RUN, _cl,
-)
+from .utils import DRY_RUN, _cl
 from .exit import emergency_close_retry, handle_trade_close
 
 # ── REV 1.7.0 — Centralized config (single source of truth) ──
+# ── REV 1.8.0 — _cc_get() for LIVE runtime-tunable reads ──
 from core.config_center import get_config as _get_central_config
-# ── REV 1.7.1 — Per-strategy RR floor (fixes MIN_RR vs GLOBAL mismatch) ──
 from core.config_center import get_min_rr as _get_min_rr_central
+from core.config_center import get as _cc_get
+from core.config_center import VOL_CLASS_QTY_MULT as _VOL_CLASS_QTY_MULT
 
 # ─── REV 1.5.3 — counter-trend size scaler (guarded import) ───
 try:
@@ -77,22 +60,11 @@ except Exception:
     _CT_STRATS = frozenset()
 
 
-# ── REV 1.7.3 — QTY scaling constants (module-level for clarity) ──
-# NOTE: this is QTY scaling (position size), distinct from
-# config_center.VOL_CLASS_CAP_MULT which scales SL/TP distance caps.
-_VOL_CLASS_QTY_MULT = {
-    "HIGH": Decimal("0.4"),
-    "MED":  Decimal("0.7"),
-    "LOW":  Decimal("1.0"),
-}
-
-
 def _apply_vol_class_sizing(symbol: str, qty_dec: Decimal, step: Decimal, min_qty: Decimal) -> Decimal:
     """REV 1.5.6 — Vol-class based position sizing.
 
-    REV 1.7.3 — uses module-level `_VOL_CLASS_QTY_MULT` (was inline
-    `mult_map`). Renamed for clarity vs config_center's
-    `VOL_CLASS_CAP_MULT` which scales SL/TP distance caps, not qty.
+    REV 1.8.0 — reads multipliers from config_center.VOL_CLASS_QTY_MULT
+    (single source). Live read so UI tuning reflects immediately.
     """
     try:
         from core.coins_config import get_coin_vol_class
@@ -100,7 +72,8 @@ def _apply_vol_class_sizing(symbol: str, qty_dec: Decimal, step: Decimal, min_qt
     except Exception:
         vcls = "MED"
 
-    mult = _VOL_CLASS_QTY_MULT.get(vcls, Decimal("0.7"))
+    _mult_f = _VOL_CLASS_QTY_MULT.get(vcls, 0.70)
+    mult = Decimal(str(_mult_f))
     try:
         scaled = qty_dec * mult
         scaled = (scaled // step) * step
@@ -115,10 +88,14 @@ def _apply_vol_class_sizing(symbol: str, qty_dec: Decimal, step: Decimal, min_qt
 
 
 def _apply_counter_trend_sizing(symbol: str, strategy: str, qty_dec: Decimal, step: Decimal, min_qty: Decimal) -> Decimal:
-    """REV 1.5.3 / 1.5.9 — scale down qty for counter-trend strategies."""
+    """REV 1.5.3 / 1.5.9 — scale down qty for counter-trend strategies.
+
+    REV 1.8.0 — multiplier now read LIVE from config_center
+    (`counter_trend_size_mult`, default 0.60).
+    """
     if not _CT_STRATS:
         return qty_dec
-    
+
     _strat = (strategy or "").strip()
     is_counter_trend = (
         _strat in _CT_STRATS
@@ -127,15 +104,17 @@ def _apply_counter_trend_sizing(symbol: str, strategy: str, qty_dec: Decimal, st
     )
     if not is_counter_trend:
         return qty_dec
-    
+
     try:
-        scaled = qty_dec * Decimal("0.6")
+        _mult_f = float(_cc_get("counter_trend_size_mult", 0.60) or 0.60)
+        mult = Decimal(str(_mult_f))
+        scaled = qty_dec * mult
         scaled = (scaled // step) * step
         if scaled < min_qty:
             scaled = min_qty
         if scaled < qty_dec:
             _label = _strat if _strat else "UNKNOWN"
-            logger.info(f"[{symbol}] counter-trend size 0.6x → {scaled} (was {qty_dec}) [{_label}]")
+            logger.info(f"[{symbol}] counter-trend size {mult}x → {scaled} (was {qty_dec}) [{_label}]")
         return scaled
     except Exception as e:
         logger.debug(f"[{symbol}] counter-trend scaling failed: {e}")
@@ -145,19 +124,16 @@ def _apply_counter_trend_sizing(symbol: str, strategy: str, qty_dec: Decimal, st
 def _snapshot_regime(symbol: str, strategy: str) -> tuple[str, int]:
     """
     REV 1.7.0 — Capture regime + hold time at entry time.
-
-    Returns (regime_string, hold_minutes). Safe defaults on any failure.
-    Called from place_order_fixed before writing active_trades.
     """
     _regime_now = 'UNKNOWN'
-    _hold_min = 180
+    _hold_min = int(_cc_get('hold_minutes', 180) or 180)
     try:
         from market.indicators import get_cached_indicator
         _ind_1h = get_cached_indicator(symbol + 'USDT', '1h')
         if _ind_1h:
             _regime_now = _ind_1h.get('regime', 'UNKNOWN')
             _cfg_at_entry = _get_central_config(symbol, strategy, _regime_now)
-            _hold_min = int(_cfg_at_entry.get('hold_minutes', 180))
+            _hold_min = int(_cfg_at_entry.get('hold_minutes', _hold_min))
             logger.info(
                 f"[{symbol}] REGIME SNAPSHOT: {_regime_now} "
                 f"→ hold={_hold_min}m, "
@@ -171,11 +147,7 @@ def _snapshot_regime(symbol: str, strategy: str) -> tuple[str, int]:
 
 
 def _get_regime_now(symbol: str) -> str:
-    """
-    REV 1.7.2 — Fetch current regime from cached 1h indicator.
-    Used by signal-drift check to resolve regime-dependent config.
-    Safe default: "UNKNOWN".
-    """
+    """REV 1.7.2 — Fetch current regime from cached 1h indicator."""
     try:
         from market.indicators import get_cached_indicator
         _ind = get_cached_indicator(symbol + 'USDT', '1h')
@@ -207,13 +179,16 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         return True
 
     # ═══════════════════════════════════════════════════════════
-    #  REV 1.7.0 — SIGNAL DRIFT CAP (now from config_center)
-    #  REV 1.7.2 — Regime is now ACTUAL (was hardcoded "UNKNOWN").
-    #  Reject entry if price drifted > signal_drift_pct from signal.
-    #  Default 0.5% (was hardcoded 0.8%).
-    #
-    #  NOTE: This check runs BEFORE bot_tracked_symbols.add(),
-    #        so no slot cleanup is needed on reject.
+    #  REV 1.8.0 — LIVE config reads (runtime-tunable)
+    # ═══════════════════════════════════════════════════════════
+    _leverage            = int(_cc_get("leverage", 5) or 5)
+    _risk_percent        = float(_cc_get("risk_percent", 0.5) or 0.5)
+    _max_open            = int(_cc_get("max_open_positions", 3) or 3)
+    _max_total_margin    = float(_cc_get("max_total_margin_pct", 0.60) or 0.60)
+    _margin_buffer_pct   = float(_cc_get("margin_buffer_pct", 0.80) or 0.80)
+
+    # ═══════════════════════════════════════════════════════════
+    #  REV 1.7.0 / 1.7.2 — SIGNAL DRIFT CAP (from config_center)
     # ═══════════════════════════════════════════════════════════
     _regime_drift = _get_regime_now(symbol)
     _cfg_drift = _get_central_config(symbol, strategy, _regime_drift)
@@ -244,21 +219,21 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             return False
 
     with BOT_TRACKED_LOCK:
-        if len(bot_tracked_symbols) >= MAX_OPEN_POSITIONS:
-            logger.warning(f" Max {MAX_OPEN_POSITIONS} reached, skip {symbol}")
+        if len(bot_tracked_symbols) >= _max_open:
+            logger.warning(f" Max {_max_open} reached, skip {symbol}")
             return False
         if symbol in bot_tracked_symbols:
             logger.warning(f" {symbol} already tracked")
             return False
         bot_tracked_symbols.add(symbol)
-        logger.info(f" Slot reserved for {symbol} ({len(bot_tracked_symbols)}/{MAX_OPEN_POSITIONS})")
+        logger.info(f" Slot reserved for {symbol} ({len(bot_tracked_symbols)}/{_max_open})")
 
     try:
         if VALID_SYMBOLS and pair not in VALID_SYMBOLS:
             logger.error(f"Symbol {pair} not in VALID_SYMBOLS")
             with BOT_TRACKED_LOCK: bot_tracked_symbols.discard(symbol)
             return False
-        
+
         try:
             pos_list = client.futures_position_information(symbol=pair)
             if pos_list and float(pos_list[0]['positionAmt']) != 0:
@@ -277,23 +252,23 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                     _ACCOUNT_CACHE['time'] = time.time()
             except Exception:
                 pass
-            
+
             available = float(account['availableBalance'])
             wallet_balance = float(account.get('totalWalletBalance', available))
-            required_margin = (float(quantity) * entry_price_est) / LEVERAGE
-            
-            if required_margin > available * 0.80:
+            required_margin = (float(quantity) * entry_price_est) / _leverage
+
+            if required_margin > available * _margin_buffer_pct:
                 logger.warning(f" Insufficient margin for {symbol}")
                 with BOT_TRACKED_LOCK: bot_tracked_symbols.discard(symbol)
                 return False
-            
+
             try:
                 used_margin_total = float(account.get('totalInitialMargin', wallet_balance - available))
             except (TypeError, ValueError):
                 used_margin_total = max(0.0, wallet_balance - available)
-            
+
             projected_total = used_margin_total + required_margin
-            max_total_allowed = wallet_balance * MAX_TOTAL_MARGIN_PCT
+            max_total_allowed = wallet_balance * _max_total_margin
             if wallet_balance > 0 and projected_total > max_total_allowed:
                 logger.warning(f" Aggregate exposure limit hit for {symbol}")
                 with BOT_TRACKED_LOCK: bot_tracked_symbols.discard(symbol)
@@ -308,9 +283,9 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         except Exception as e:
             if '-4046' not in str(e) and 'No need to change margin type' not in str(e):
                 logger.debug(f"Margin type warning: {e}")
-        
+
         try:
-            client.futures_change_leverage(symbol=pair, leverage=LEVERAGE)
+            client.futures_change_leverage(symbol=pair, leverage=_leverage)
         except Exception as e:
             logger.error(f"Leverage change FAILED for {pair}: {e}")
             with BOT_TRACKED_LOCK: bot_tracked_symbols.discard(symbol)
@@ -322,7 +297,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         min_notional = f['minNotional']
         max_qty = f.get('maxQty')
         cfg = get_trading_config()
-        
+
         final_sl_price = float(sl_price)
         min_dist = entry_price_est * cfg['min_dist_pct']
         if side == 'BUY':
@@ -332,7 +307,6 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             if final_sl_price <= entry_price_est + min_dist:
                 final_sl_price = entry_price_est + min_dist
 
-        # ── REV 1.5.5 — RESOLVE THE R-REFERENCE PRICE ──
         _ref_price = entry_price_est
         if signal_price is not None:
             try:
@@ -341,13 +315,13 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                     _ref_price = _sp
             except (TypeError, ValueError):
                 pass
-        
+
         intended_dist = abs(_ref_price - final_sl_price)
         intended_dist_pct = (intended_dist / _ref_price * 100) if _ref_price > 0 else 0
         logger.info(f" [SIZE] Intended SL dist {intended_dist:.4f} ({intended_dist_pct:.3f}%) [ref={_ref_price:.6f} est={entry_price_est:.6f}]")
 
         try:
-            risk_amount = float(wallet_balance) * (RISK_PERCENT / 100.0)
+            risk_amount = float(wallet_balance) * (_risk_percent / 100.0)
             actual_dist = abs(_ref_price - final_sl_price)
             if actual_dist > 0:
                 calc_qty = risk_amount / actual_dist
@@ -376,11 +350,12 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         qty_str = adjust_qty(qty_dec, step, min_qty)
         qty_dec = Decimal(qty_str)
         notional = float(qty_dec) * entry_price_est
-        
+
         if notional < min_notional:
             _pre_bump_qty = qty_dec
+            _bump_mult = float(_cc_get("min_notional_bump_mult", 1.02) or 1.02)
             logger.warning(f"Notional {notional:.2f} < min {min_notional}, increasing qty")
-            qty_dec = Decimal(str(min_notional / entry_price_est * 1.02))
+            qty_dec = Decimal(str(min_notional / entry_price_est * _bump_mult))
             qty_dec = (qty_dec // step) * step
             if qty_dec < min_qty:
                 qty_dec = min_qty
@@ -395,7 +370,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 logger.warning(f"[{symbol}] min_notional bump {_pre_bump_qty} → {qty_dec} ({_bump_ratio:.2f}×) would push risk to {_bumped_risk_pct:.3f}% — aborting entry")
                 with BOT_TRACKED_LOCK: bot_tracked_symbols.discard(symbol)
                 return False
-            
+
             qty_str = format(qty_dec, f'.{abs(step.as_tuple().exponent)}f')
             notional = float(qty_dec) * entry_price_est
             if notional < min_notional:
@@ -414,7 +389,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         if qty_tp2_dec < min_qty:
             qty_tp1_dec = qty_dec
             qty_tp2_dec = Decimal('0')
-        
+
         qty_tp1 = format(qty_tp1_dec, f'.{prec}f')
         qty_tp2 = format(qty_tp2_dec, f'.{prec}f') if qty_tp2_dec > 0 else '0'
         sl_price = final_sl_price
@@ -433,12 +408,12 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 logger.error(f"Market order error: {e}")
                 with BOT_TRACKED_LOCK: bot_tracked_symbols.discard(symbol)
                 return False
-        
+
         if market_resp is None or not market_resp.get('orderId'):
             logger.error(f"Market order failed for {pair}")
             with BOT_TRACKED_LOCK: bot_tracked_symbols.discard(symbol)
             return False
-        
+
         logger.info(f"✅ Market {side} {pair} {qty_str} orderId={market_resp.get('orderId')}")
         time.sleep(3)
 
@@ -450,7 +425,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 break
             except Exception:
                 time.sleep(1)
-        
+
         if pos is None:
             logger.error(f"❌ Position fetch FAILED for {pair} - keeping tracked")
             _regime_now, _hold_min = _snapshot_regime(symbol, strategy)
@@ -513,7 +488,6 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
 
         _shared_entry_time_str = datetime.now(PKT).strftime('%Y-%m-%d %I:%M:%S %p')
 
-        # ── REV 1.7.0 — Regime snapshot (frozen for trade lifetime) ──
         _regime_now, _hold_min = _snapshot_regime(symbol, strategy)
 
         try:
@@ -547,7 +521,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             logger.critical(f"[{symbol}] Fill crossed SL! entry {entry_price:.6f} SL {sl_price_f:.6f} dir_dist {directional_dist:.6f} - aborting")
             try: send_telegram(f"🚨 {symbol} CROSSED SL - closing\nEntry {entry_price:.4f} SL {sl_price_f:.4f}")
             except Exception: pass
-            
+
             closed_ok = False
             thread_launched = False
             try:
@@ -575,7 +549,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 logger.error(f"Crossed SL emergency close failed: {ce}")
                 threading.Thread(target=emergency_close_retry, args=(symbol, pair, close_side), daemon=True).start()
                 thread_launched = True
-            
+
             if thread_launched: return False
             try:
                 time.sleep(2.5)
@@ -584,7 +558,10 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 logger.warning(f"handle_trade_close CROSSED_SL failed: {htce}")
             return False
 
-        if actual_dist_post < min_dist_post * 0.7:
+        # ── REV 1.8.0 — LIVE ratios for SL sanity fixes ──
+        _sl_tight_ratio = float(_cc_get("sl_tight_ratio", 0.70) or 0.70)
+
+        if actual_dist_post < min_dist_post * _sl_tight_ratio:
             logger.warning(f"[{symbol}] SL too tight after fill (dist {actual_dist_post:.6f} < {min_dist_post:.6f}), widening")
             if side == 'BUY': sl_price = entry_price - min_dist_post
             else: sl_price = entry_price + min_dist_post
@@ -592,7 +569,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             actual_dist_post = min_dist_post
             directional_dist = min_dist_post
             try:
-                risk_amount = float(wallet_balance) * (RISK_PERCENT / 100.0)
+                risk_amount = float(wallet_balance) * (_risk_percent / 100.0)
                 corrected_qty_tight = Decimal(str(risk_amount / actual_dist_post)) if actual_dist_post > 0 else qty_dec
                 corrected_qty_tight = (corrected_qty_tight // f['stepSize']) * f['stepSize']
                 if corrected_qty_tight < f['minQty']: corrected_qty_tight = f['minQty']
@@ -627,13 +604,13 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             except Exception as fix_t:
                 logger.error(f"Tight branch fix failed: {fix_t}", exc_info=True)
 
-        elif intended_dist > 0 and actual_dist_post > intended_dist * 1.05:
+        elif intended_dist > 0 and actual_dist_post > intended_dist * float(_cc_get("sl_wide_ratio", 1.05) or 1.05):
             risk_multiplier = actual_dist_post / intended_dist
             logger.warning(f"[{symbol}] SL widened vs intended (actual {actual_dist_post:.6f} vs intended {intended_dist:.6f}) - real risk {risk_multiplier:.2f}x")
             try: send_telegram(f"⚠️ {symbol} slippage: SL wider than intended, risk {risk_multiplier:.2f}x\nEntry {entry_price:.4f} SL {sl_price_f:.4f}")
             except Exception: pass
             try:
-                risk_amount = float(wallet_balance) * (RISK_PERCENT / 100.0)
+                risk_amount = float(wallet_balance) * (_risk_percent / 100.0)
                 _caps = get_caps(symbol)
                 max_allowed_dist = entry_price * _caps["sl"]
                 if actual_dist_post > max_allowed_dist:
@@ -643,11 +620,12 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                     sl_price_f = float(sl_price)
                     actual_dist_post = max_allowed_dist
                     directional_dist = max_allowed_dist
-                
+
                 corrected_qty_dec = Decimal(str(risk_amount / actual_dist_post)) if actual_dist_post > 0 else qty_dec
                 corrected_qty_dec = (corrected_qty_dec // f['stepSize']) * f['stepSize']
                 if corrected_qty_dec < f['minQty']: corrected_qty_dec = f['minQty']
-                if corrected_qty_dec < (qty_dec * Decimal('0.5')):
+                _close_ratio = Decimal(str(_cc_get("corrected_qty_close_ratio", 0.50) or 0.50))
+                if corrected_qty_dec < (qty_dec * _close_ratio):
                     logger.critical(f"[{symbol}] Corrected qty {corrected_qty_dec} < 50% of {qty_dec} - closing position to prevent huge loss")
                     try:
                         with _requests_lock:
@@ -655,7 +633,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                     except Exception as ce: logger.error(f"Emergency close failed: {ce}")
                     with BOT_TRACKED_LOCK: bot_tracked_symbols.discard(symbol)
                     return False
-                
+
                 if corrected_qty_dec < qty_dec:
                     reduce_qty = qty_dec - corrected_qty_dec
                     reduce_str = adjust_qty(reduce_qty, f['stepSize'], f['minQty'])
@@ -712,16 +690,16 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             tp1_price = max(tp1_price, entry_price * (1 - _caps["tp1"]))
             tp2_price = max(tp2_price, entry_price * (1 - _caps["tp2"]))
 
-        # ── REV 1.5.10 — RR RE-CHECK AFTER CAPS (with float tolerance) ──
-        # ── REV 1.7.1 — Now uses per-strategy RR floor from config_center ──
+        # ── REV 1.5.10 — RR RE-CHECK AFTER CAPS ──
+        # ── REV 1.8.0 — Live tol from config_center ──
         _risk_final = abs(entry_price - float(sl_price))
         _reward_final = abs(float(tp1_price) - entry_price)
         _rr_final = (_reward_final / _risk_final) if _risk_final > 0 else 0.0
         _min_rr = _get_min_rr_central(strategy)
-        _RR_COLLAPSE_TOL = 0.02
-        
+        _RR_COLLAPSE_TOL = float(_cc_get("rr_collapse_tol", 0.02) or 0.02)
+
         logger.info(f"[{symbol}] RR check: signal_rr={rr:.2f} → placed_rr={_rr_final:.3f} (min {_min_rr:.2f}, tol {_RR_COLLAPSE_TOL}) [strategy={strategy}] | caps sl={_caps['sl']:.4f} tp1={_caps['tp1']:.4f} tp2={_caps['tp2']:.4f} | tp1 {_tp1_before_cap:.6f}→{float(tp1_price):.6f} tp2 {_tp2_before_cap:.6f}→{float(tp2_price):.6f}")
-        
+
         if _rr_final < _min_rr - _RR_COLLAPSE_TOL:
             logger.critical(f"[{symbol}] RR COLLAPSE: {rr:.2f} → {_rr_final:.3f} (min {_min_rr:.2f}, tol {_RR_COLLAPSE_TOL}) — closing position immediately")
             try: send_telegram(f"🚨 {symbol} RR collapsed {rr:.2f}→{_rr_final:.2f} (min {_min_rr:.2f}) — closing")
@@ -743,17 +721,18 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 except Exception: pass
             with BOT_TRACKED_LOCK: bot_tracked_symbols.discard(symbol)
             return False
-        
+
         if _rr_final < _min_rr:
             logger.warning(f"[{symbol}] RR boundary: {rr:.3f} → {_rr_final:.4f} (min {_min_rr:.3f}, within tol {_RR_COLLAPSE_TOL}) — keeping position (float drift, not a real collapse)")
 
         try:
             _final_risk_usd = float(qty_dec) * abs(entry_price - float(sl_price))
             _final_risk_pct = ((_final_risk_usd / wallet_balance * 100.0) if wallet_balance > 0 else 0.0)
-            _target_risk_pct = RISK_PERCENT
+            _target_risk_pct = _risk_percent
+            _oversize_mult = float(_cc_get("risk_oversize_warn_mult", 1.20) or 1.20)
             logger.info(f"[{symbol}] RISK CHECK: actual {_final_risk_pct:.3f}% (target {_target_risk_pct:.3f}%) | qty={qty_dec} dist={abs(entry_price - float(sl_price)):.6f} strategy={strategy}")
-            if _final_risk_pct > _target_risk_pct * 1.2:
-                logger.warning(f"[{symbol}] RISK OVER-SIZE: {_final_risk_pct:.3f}% > {_target_risk_pct * 1.2:.3f}% (compound-scaling issue? qty={qty_dec})")
+            if _final_risk_pct > _target_risk_pct * _oversize_mult:
+                logger.warning(f"[{symbol}] RISK OVER-SIZE: {_final_risk_pct:.3f}% > {_target_risk_pct * _oversize_mult:.3f}% (compound-scaling issue? qty={qty_dec})")
         except Exception as _rce:
             logger.debug(f"[{symbol}] risk-check log failed: {_rce}")
 
@@ -785,7 +764,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                     return False
                 logger.warning(f"SL attempt {attempt+1} failed: {e}")
                 time.sleep(1.5)
-        
+
         if not sl_placed:
             logger.error("SL placement FAILED - emergency close")
             threading.Thread(target=emergency_close_retry, args=(symbol, pair, close_side), daemon=True).start()

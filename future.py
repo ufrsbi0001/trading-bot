@@ -1,27 +1,26 @@
 """
 future.py — Trading engine orchestrator + main scan loop.
 
-REV 1.4.27 (2026-10-02) — DEAD RE-EXPORT CLEANUP:
-  ✅ Removed 3 dead re-exports (verified unused via grep):
-       • retry_on_rate_limit    (was from core.client)
-       • HARDCODED_FILTERS      (was from core.client)
-       • detect_candle_patterns (was from market.indicators)
-     Zero behaviour change — nothing imported them from future.py.
+REV 1.4.28 (2026-10-02) — LIVE CONFIG READS (post-migration):
+  ✅ Banner MIN_APPROVALS: was `from signals.decision_engine import
+     MIN_APPROVALS` — that module no longer caches constants (REV 4.2
+     reads LIVE). The import was silently failing → `?/6` shown in
+     banner. Now read via `CC.get_decision_cfg()` directly.
+  ✅ `_spread_label()`: was reading `CONFIG.max_spread_*` via the
+     core/config.py proxy. Now reads LIVE from `CC.get(...)`.
+  ✅ `use_spread_filter` gate (2 places): was `getattr(CONFIG,
+     "use_spread_filter", False)`. Now `CC.get("use_spread_filter",
+     False)` — matches the rest of the file.
+  ✅ Dead `import signals.decision_engine as decision_engine# noqa`
+     removed — was only used for the import-side-effect, no longer
+     needed since we read live via CC.
+  ✅ `CONFIG` import retained — still used for env-level fields
+     (bot_coins, dry_run, demo_mode, testnet, api_key, api_secret).
+     These belong in core/config.py and MUST NOT move to config_center.
 
-REV 1.4.26 (2026-10-02) — PHASE 3 CLEANUP:
-  ✅ `_format_be_lock_config()` simplified — dead Layers 2/3 removed
-     (unreachable since VOL_CLASS_R_THRESHOLDS always exists).
-     Function now takes no args and returns `str` only.
-  ✅ `_EXPECTED_R_KEYS` constant removed (was only used by Layer 2).
-  ✅ Caller updated — legacy warning block removed (was dead code).
-
-REV 1.4.25 (2026-10-02) — UNIFIED CONFIG CLEANUP:
-  ✅ `_format_be_lock_config()` no longer reads `_PER_CLASS_CFG` from
-     the `orders` package (which was removed in orders/utils.py
-     REV 23.0). Now imports `VOL_CLASS_R_THRESHOLDS` directly from
-     `core.config_center` — same dict structure (be_r / lock1_r /
-     lock2_r), so zero behaviour change in the startup banner.
-
+REV 1.4.27 (2026-10-02) — DEAD RE-EXPORT CLEANUP.
+REV 1.4.26 (2026-10-02) — PHASE 3 CLEANUP.
+REV 1.4.25 (2026-10-02) — UNIFIED CONFIG CLEANUP.
 REV 1.4.24 (2026-09-30) — DYNAMIC STARTUP BANNER VALUES.
 REV 1.4.23 (2026-09-30) — FIX Bug #1: PRE-CHECKS BEFORE DECISION ENGINE.
 REV 1.4.22 (2026-09-30) — HOIST STRATEGY EXTRACT.
@@ -59,7 +58,8 @@ from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
 
-from core.config import CONFIG
+from core.config import CONFIG           # env-only fields (api_key, bot_coins, ...)
+from core import config_center as CC     # trading params (live reads)
 from core.coins_config import get_family
 
 # ── REV 1.4.25 — Unified config source for BE/LOCK banner ──
@@ -163,15 +163,20 @@ cleanup_indicator_cache   = _i.cleanup_indicator_cache
 # NOTE (REV 1.4.27): `detect_candle_patterns` re-export removed —
 # no live consumer. `indicators.py` still exports it.
 
-RISK_PERCENT               = CONFIG.risk_percent
-MAX_OPEN_POSITIONS         = CONFIG.max_open_positions
-MAX_DAILY_DRAWDOWN_PERCENT = CONFIG.max_daily_drawdown_percent
-MIN_CONFIDENCE             = CONFIG.min_confidence
-MIN_ADX                    = CONFIG.min_adx
-REQUIRE_HTF_AGREEMENT      = CONFIG.require_htf_agreement
-USE_5M_TREND_FILTER        = CONFIG.use_5m_trend_filter
-FG_ENABLED                 = CONFIG.fg_enabled
-LEVERAGE                   = CONFIG.leverage
+# ── Module-level constant snapshots (for banner/log only) ──
+# NOTE: These are read ONCE at import time. For runtime-tunable values
+# that change via update_runtime(), read LIVE via CC.get(...) at use site.
+RISK_PERCENT               = CC.get('risk_percent')
+MAX_OPEN_POSITIONS         = CC.get('max_open_positions')
+MAX_DAILY_DRAWDOWN_PERCENT = CC.get('max_daily_drawdown_percent')
+MIN_CONFIDENCE             = CC.get('min_confidence')
+MIN_ADX                    = CC.get('min_adx')
+REQUIRE_HTF_AGREEMENT      = CC.get('require_htf_agreement')
+USE_5M_TREND_FILTER        = CC.get('use_5m_trend_filter')
+FG_ENABLED                 = CC.get('fg_enabled')
+LEVERAGE                   = CC.get('leverage')
+
+# ── Env-only flags (from core/config.py, NOT config_center) ──
 DRY_RUN                    = CONFIG.dry_run
 DEMO_MODE                  = CONFIG.demo_mode
 TESTNET                    = CONFIG.testnet
@@ -182,9 +187,6 @@ BLACKLISTED_COINS = _s.BLACKLISTED_COINS
 CSV_FILE          = _s.CSV_FILE
 CSV_EXIT_FILE     = _s.CSV_EXIT_FILE
 PAUSE_FILE        = _s.PAUSE_FILE
-
-# NOTE (REV 1.4.26): _EXPECTED_R_KEYS removed — was only used by the
-# now-deleted Layer 2 of _format_be_lock_config.
 
 _PARALLEL_FETCH_WORKERS = 8
 
@@ -209,17 +211,17 @@ def _get_min_adx_for_coin(symbol: str) -> float:
 
 
 def _get_spread_cap_for_family(family: str) -> float:
-    """Per-family spread cap."""
+    """Per-family spread cap — reads LIVE from config_center."""
     try:
         if family == "trend_coins":
-            return float(getattr(CONFIG, "max_spread_trend", CONFIG.max_spread_pct))
+            return float(CC.get('max_spread_trend', CC.get('max_spread_pct')))
         if family == "range_coins":
-            return float(getattr(CONFIG, "max_spread_range", CONFIG.max_spread_pct))
+            return float(CC.get('max_spread_range', CC.get('max_spread_pct')))
         if family in ("volatility_coins", "momentum_coins"):
-            return float(getattr(CONFIG, "max_spread_volatility", CONFIG.max_spread_pct))
+            return float(CC.get('max_spread_volatility', CC.get('max_spread_pct')))
     except Exception:
         pass
-    return float(CONFIG.max_spread_pct)
+    return float(CC.get('max_spread_pct'))
 
 
 def _reconcile_on_startup():
@@ -369,18 +371,18 @@ def _extract_strategy(reasons: list) -> str:
 
 def _spread_label() -> str:
     """
-    REV 1.4.24 — per-family spread filter state.
+    REV 1.4.28 — per-family spread filter state.
 
-    Now includes the global fallback cap (max_spread_pct) so the
-    banner matches config.py's `_spread_label()`. Previously only
-    per-family values were shown, hiding the global fallback.
+    Now reads LIVE from config_center (was: `getattr(CONFIG, ...)` via
+    core/config.py proxy — same values but consistent with the rest
+    of the file's live-read pattern).
     """
-    if not getattr(CONFIG, "use_spread_filter", False):
+    if not CC.get("use_spread_filter", True):
         return "OFF"
-    _g = getattr(CONFIG, "max_spread_pct", 0.15)
-    _t = getattr(CONFIG, "max_spread_trend", 0.08)
-    _r = getattr(CONFIG, "max_spread_range", 0.12)
-    _v = getattr(CONFIG, "max_spread_volatility", 0.25)
+    _g = CC.get("max_spread_pct", 0.15)
+    _t = CC.get("max_spread_trend", 0.08)
+    _r = CC.get("max_spread_range", 0.12)
+    _v = CC.get("max_spread_volatility", 0.25)
     return (f"ON (global {_g:.2f}% | trend {_t:.2f}% | "
             f"range {_r:.2f}% | vol {_v:.2f}%)")
 
@@ -467,7 +469,7 @@ def main_loop():
     logger.info(f"PRO TRADING v13.3.22 - {TRADING_MODE} | Risk {RISK_PERCENT}% | "
                 f"Max {MAX_OPEN_POSITIONS} | DD {MAX_DAILY_DRAWDOWN_PERCENT}% | "
                 f"Lev {LEVERAGE}x | MinADX {MIN_ADX}(fallback) | "
-                f"PartialClose ${CONFIG.partial_close_usdt}")
+                f"PartialClose ${CC.get('partial_close_usdt')}")
 
     try:
         _floor_parts: list[str] = []
@@ -488,11 +490,11 @@ def main_loop():
         logger.debug(f"per-family MinADX log failed: {_mfe}")
 
     logger.info(
-        f"Modern flags: taker={CONFIG.use_taker_volume} "
-        f"vp={CONFIG.use_volume_profile} "
-        f"avwap={CONFIG.use_anchored_vwap} "
-        f"fz={CONFIG.use_funding_z} "
-        f"mtf={CONFIG.use_mtf_confluence}"
+        f"Modern flags: taker={CC.get('use_taker_volume')} "
+        f"vp={CC.get('use_volume_profile')} "
+        f"avwap={CC.get('use_anchored_vwap')} "
+        f"fz={CC.get('use_funding_z')} "
+        f"mtf={CC.get('use_mtf_confluence')}"
     )
 
     logger.info(f" {_be_lock_str}")
@@ -515,14 +517,19 @@ def main_loop():
     except Exception as e:
         logger.warning(f"Family summary failed: {e}")
 
-    # ── REV 1.4.24 — read MIN_APPROVALS dynamically ──
+    # ── REV 1.4.28 — read MIN_APPROVALS LIVE from config_center ──
+    # (was: `from signals.decision_engine import MIN_APPROVALS` — that
+    #  module no longer caches constants; REV 4.2 reads LIVE. The old
+    #  import silently fell back to "?" in the banner.)
     try:
-        from signals.decision_engine import MIN_APPROVALS as _MA_BANNER
-    except Exception:
+        _MA_BANNER = int(CC.get_decision_cfg().get("min_approvals", 5))
+    except Exception as _ma_err:
+        logger.debug(f"MIN_APPROVALS banner read failed: {_ma_err}")
         _MA_BANNER = "?"
 
     try:
-        import signals.decision_engine as decision_engine# noqa: F401
+        # Sanity-check that the decision engine module loads cleanly.
+        import signals.decision_engine  # noqa: F401
         logger.info(f"Decision engine: ✅ active (6-filter vote, {_MA_BANNER}/6 required)")
         logger.info("BTC-bias gate:   ✅ ACTIVE (REV 1.0.5) — updated each scan cycle")
         logger.info("MTF gate:        ✅ decision_engine only (REV 1.4.13 — hard-gate removed)")
@@ -579,7 +586,8 @@ def main_loop():
                 live_prices = _c.get_live_prices()
 
                 book_tickers: dict = {}
-                if getattr(CONFIG, "use_spread_filter", False):
+                # REV 1.4.28 — live read (was getattr(CONFIG, ...))
+                if CC.get("use_spread_filter", True):
                     try:
                         book_tickers = _c.get_book_tickers() or {}
                     except Exception as _bte:
@@ -852,7 +860,8 @@ def main_loop():
                         skip_reason = "IN POSITION"
 
                     # ── SPREAD FILTER ──
-                    if trade_side and getattr(CONFIG, "use_spread_filter", False):
+                    # REV 1.4.28 — live read (was getattr(CONFIG, ...))
+                    if trade_side and CC.get("use_spread_filter", True):
                         _bt = book_tickers.get(coin)
                         if _bt:
                             _bid = _bt.get('bid', 0.0)

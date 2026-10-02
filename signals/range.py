@@ -15,6 +15,7 @@ REV 21.2 (2026-09-30) — FAMILY-SPECIFIC TUNING.
 from __future__ import annotations
 
 from core.config import CONFIG
+from core import config_center as CC
 from core.coins_config import get_family_coins
 from core.config_center import FAMILY as _CC_FAMILY
 
@@ -68,11 +69,11 @@ _SPEC = FamilySpec(
     disabled_strategies=DISABLED_STRATEGIES,
     min_adx=MIN_ADX,
     fallback_caps=FALLBACK_CAPS,
-    min_confidence=CONFIG.min_confidence,
+    min_confidence=CC.get('min_confidence'),
     min_adx_env=18.0,
     min_sl_pct=0.0050,
     min_adx_outside_kz=25.0,
-    kz_bypass=CONFIG.kz_bypass,
+    kz_bypass=CC.get('kz_bypass'),
     block_ny_am_for_st=False,
     block_ny_am_for_td_fade=False,
     block_quiet=False,

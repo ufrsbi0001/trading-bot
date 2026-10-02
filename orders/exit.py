@@ -1,13 +1,16 @@
 """
 orders/exit.py — Trade close and emergency close.
 
-REV 1.5.6 (2026-10-02) — DAILY-LOSS COUNT CLARITY:
-  ✅ Comment added to make it explicit that BOTH SL and
-     RR_COLLAPSE (and non-tiny TIME_EXIT losses) increment the
-     daily loss counter. Behaviour unchanged from REV 1.5.5 —
-     only documentation clarity. The actual rollover bug was in
-     core/state.py's DailyTracker (fixed in state REV 1.3.16).
+REV 1.6.0 (2026-10-02) — RUNTIME TOGGLE AWARENESS:
+  ✅ Removed cached imports COOLDOWN_AFTER_SL_MIN, COOLDOWN_AFTER_TP_MIN
+     from core.state. Both now read LIVE via _cc_get() so UI runtime
+     changes take effect on the very next close.
+  ✅ `_TINY_LOSS_R` promoted from hardcoded module constant to
+     config_center.GLOBAL["tiny_loss_r"]. Now tunable via CC_TINY_LOSS_R
+     env or update_runtime(tiny_loss_r=...). Default 0.30 (unchanged).
+  ✅ Zero behaviour change for default values.
 
+REV 1.5.6 (2026-10-02) — DAILY-LOSS COUNT CLARITY.
 REV 1.5.5 (2026-09-29) — DUPLICATE-CLOSE REASON TRACKING.
 REV 1.5.4 (2026-09-28) — DEAD IMPORT CLEANUP.
 REV 1.5.3 (2026-09-28) — DEAD CONSTANT REMOVAL.
@@ -33,8 +36,10 @@ from core.state import (
     fail_counts, FAIL_COUNTS_LOCK,
     daily_tracker,
     CSV_EXIT_FILE,
-    COOLDOWN_AFTER_SL_MIN, COOLDOWN_AFTER_TP_MIN,
 )
+
+# ── REV 1.6.0 — Live runtime-tunable reads ──
+from core.config_center import get as _cc_get
 
 from .utils import _cl, _JUST_CLOSED, _JUST_CLOSED_LOCK
 
@@ -42,14 +47,7 @@ from .utils import _cl, _JUST_CLOSED, _JUST_CLOSED_LOCK
 # ═════════════════════════════════════════════════════════════
 #  Reason classification
 # ═════════════════════════════════════════════════════════════
-# Reasons that mean "the user or an external event closed this,
-# and the caller is waiting on a response". These get a short
-# PnL-retry window and a distinct Telegram message.
 _MANUAL_UI_REASONS = frozenset({"MANUAL_UI"})
-
-# PATCH: a TIME_EXIT loss smaller than this fraction of planned risk
-# is not counted as a loss by the daily limit / loss-streak guard.
-_TINY_LOSS_R = 0.30
 
 
 # ═════════════════════════════════════════════════════════════
@@ -193,7 +191,6 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
     if pair is None:
         pair = symbol + 'USDT'
 
-    # ── REV 1.5.5: defensive reason normalization ──
     if not reason:
         reason = "closed"
 
@@ -256,7 +253,6 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
     if pnl == 0.0:
         reason = "MANUAL" if reason in ("closed", "detected amt=0") else reason
     else:
-        # PATCH A: TIME_EXIT is kept as its own reason (was mislabeled SL/TP)
         if reason in ("closed", "detected amt=0", "emergency_close"):
             reason = "SL" if pnl < 0 else "TP"
 
@@ -272,19 +268,12 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
     except Exception:
         _r_mult = None
 
-    # ── REV 1.5.6: explicit real-loss classification ──
-    # Any of the following counts as a "real loss" (feeds daily loss
-    # counter AND decision-engine loss-streak guard):
-    #   • SL hit        (pnl < 0, reason="SL")
-    #   • RR_COLLAPSE   (pnl < 0, reason="RR_COLLAPSE")
-    #   • MANUAL close with negative pnl
-    #   • TIME_EXIT with R <= -0.30 (real loss, not tiny noise)
-    # Tiny TIME_EXIT losses (|R| < 0.30) are ignored.
+    # ── REV 1.6.0: LIVE tiny_loss_r from config_center ──
+    _tiny_loss_r = float(_cc_get("tiny_loss_r", 0.30) or 0.30)
     _is_real_loss = pnl < 0 and (
-        reason != "TIME_EXIT" or _r_mult is None or _r_mult <= -_TINY_LOSS_R
+        reason != "TIME_EXIT" or _r_mult is None or _r_mult <= -_tiny_loss_r
     )
 
-    # ── Normalize output reason for CSV/logs ──
     output_reason = "MANUAL" if reason in _MANUAL_UI_REASONS else reason
     is_manual_close = reason in _MANUAL_UI_REASONS
 
@@ -310,16 +299,21 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
         logger.debug(f"[decision] record_trade_result failed: {_de}")
 
     _r_txt = "" if _r_mult is None else f" ({_r_mult:+.2f}R)"
+
+    # ── REV 1.6.0: LIVE cooldowns from config_center ──
+    _cooldown_sl = int(_cc_get("cooldown_after_sl_min", 20) or 20)
+    _cooldown_tp = int(_cc_get("cooldown_after_tp_min", 15) or 15)
+
     if pnl < 0:
         # ═══════════════════════════════════════════════════════
-        #  REV 1.5.6 — DAILY LOSS COUNTER
+        #  DAILY LOSS COUNTER
         #  Both SL and RR_COLLAPSE increment the counter here,
         #  because both pass the _is_real_loss check (reason is
         #  not TIME_EXIT). Rollover handling is in DailyTracker.
         # ═══════════════════════════════════════════════════════
         if _is_real_loss:
             daily_tracker.add_loss()
-        cooldown_min = COOLDOWN_AFTER_SL_MIN
+        cooldown_min = _cooldown_sl
         if is_manual_close:
             send_telegram(f"🔻 MANUAL CLOSE {symbol}\nPnL: ${pnl:.2f}")
         elif reason == "TIME_EXIT":
@@ -327,7 +321,7 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
         else:
             send_telegram(f" SL HIT {symbol}\nPnL: ${pnl:.2f}")
     elif pnl > 0:
-        cooldown_min = COOLDOWN_AFTER_TP_MIN
+        cooldown_min = _cooldown_tp
         if is_manual_close:
             send_telegram(f"💰 MANUAL CLOSE {symbol}\nPnL: ${pnl:.2f}")
         elif reason == "TIME_EXIT":
@@ -335,7 +329,7 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
         else:
             send_telegram(f" TP HIT {symbol}\nPnL: ${pnl:.2f}")
     else:
-        cooldown_min = COOLDOWN_AFTER_TP_MIN
+        cooldown_min = _cooldown_tp
         if is_manual_close:
             send_telegram(f"➖ MANUAL CLOSE {symbol} (BE)")
         else:

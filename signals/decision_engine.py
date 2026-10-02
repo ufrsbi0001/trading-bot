@@ -1,48 +1,23 @@
 """
 decision_engine.py — Multi-filter trade approval layer.
 
-Sits between family_router signal generation and orders.place_order_fixed.
-Evaluates each candidate trade across 6 independent dimensions:
-  1. Trend strength (ADX + counter-trend awareness)
-  2. Multi-timeframe consensus
-  3. Volume / order-flow confirmation
-  4. Recent performance memory (loss streak guard)
-  5. Position correlation (max concurrent same-side)
-  6. Volatility regime filter
-
-Approval requires MIN_APPROVALS filter passes.
+REV 4.2 (2026-10-02) — LIVE CONFIG READS:
+  ✅ Removed module-level caching of config values. All decision-engine
+     config now read LIVE from config_center on each call, so
+     `update_runtime()` takes effect immediately (no restart).
+  ✅ Removed dead `from core.config import CONFIG` import — the comment
+     claimed it was "needed for MTF flag + same-side cap", but both were
+     already migrated to `CC.get(...)`.
+  ✅ Removed dead `_DEC` module-level dict — replaced with `_dec_get()`
+     helper that reads fresh on every call.
+  ✅ Fallback path now uses `logger.warning` instead of `print()`.
+  ✅ `total_filters` moved to instance-level (was class default).
 
 REV 4.1 (2026-10-02) — PHASE 1 CLEANUP:
-  ✅ COUNTER_TREND_STRATEGIES ab core/config_center.py se import hoti
-     hai (pehle is file mein hardcoded duplicate thi). Naya strategy
-     add karne ke liye sirf config_center edit karein — yahan kuch
-     nahi chhedna padega.
+  ✅ COUNTER_TREND_STRATEGIES now imported from core/config_center.py.
 
-REV 4.0 (2026-10-02) — CENTRALIZED CONFIG (config_center.DECISION):
-  ✅ Saari hardcoded values ab core/config_center.py ke DECISION dict
-     se aati hain. Yeh file sirf LOGIC rakhti hai, values nahi.
-  ✅ Tuning ke liye:
-       • core/config_center.py → DECISION dict edit karein, YA
-       • .env mein CC_DEC_<key>=value set karein
-     e.g., CC_DEC_MIN_APPROVALS=4, CC_DEC_BTC_BIAS_MODE=high_risk_only
-  ✅ _btc_bias_blocks() ab 3 modes support karta hai:
-       • "disabled"       → gate band
-       • "high_risk_only" → sirf high-risk meme coins block
-       • "full"           → har TREND_UP mein SHORT block (purana behavior)
-  ✅ _btc_bias_blocks() ab `symbol` parameter leta hai (high-risk filter ke liye).
-  ✅ Callers (is file + base.py) `symbol` pass karte hain.
-
-REV 1.3.0 (2026-09-30) — DOCSTRING / COMMENT TRUTH-UP.
-REV 1.2.1 (2026-09-29) — SAME-SIDE CAP FROM CONFIG.
-REV 1.2.0 (2026-09-29) — SIMPLIFICATION PASS.
-REV 1.1.0 (2026-09-29) — FUNDING FILTER + WR CAP FIX. [superseded]
-REV 1.0.6 (2026-09-29) — SOLE MTF FILTER + DOC CLARITY.
-REV 1.0.5 (2026-09-29) — GLOBAL BTC BIAS HARD GATE.
-REV 1.0.4 (2026-09-29) — CORRELATION HARD GATE.
-REV 1.0.3 (2026-09-29) — MTF FLAG HONORED.
-REV 1.0.2 (2026-09-28) — WIN-RATE MULTIPLIER + CVD STRICT MODE.
-REV 1.0.1 (2026-09-28) — BE STREAK FIX + RING SIZE.
-REV 1.0.0 (2026-09-28) — initial release.
+REV 4.0 (2026-10-02) — CENTRALIZED CONFIG.
+REV 1.3.0 — 1.0.0 — various.
 """
 from __future__ import annotations
 
@@ -52,28 +27,16 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from core.client import logger
-from core.config import CONFIG       # needed for MTF flag + same-side cap
+from core import config_center as CC
 
-# ── REV 4.0 — Centralized decision config ──
-# ── REV 4.1 — COUNTER_TREND_STRATEGIES bhi yahan se import ──
+# ── REV 4.1 — COUNTER_TREND_STRATEGIES from config_center ──
 try:
-    from core.config_center import get_decision_cfg as _get_decision_cfg
     from core.config_center import COUNTER_TREND_STRATEGIES
-    _DEC = _get_decision_cfg()
-except Exception as _e:
-    # Graceful fallback — agar config_center load na ho to defaults
-    print(f"[decision_engine] config_center unavailable ({_e}) — using defaults")
-    _DEC = {
-        "min_approvals": 5, "total_filters": 6,
-        "btc_bias_enabled": True, "btc_bias_mode": "full",
-        "btc_bias_high_risk_coins": frozenset(),
-        "btc_regime_ttl_sec": 600,
-        "adx_counter_trend_hard_max": 45.0,
-        "adx_counter_trend_soft_max": 35.0,
-        "atr_ratio_extreme": 2.5,
-        "loss_streak_trigger": 4, "loss_streak_cooldown_min": 60,
-        "wr_mult_min": 0.85, "wr_mult_max": 1.10, "wr_mult_min_trades": 15,
-    }
+except Exception as _ct_err:
+    logger.warning(
+        f"[decision_engine] COUNTER_TREND_STRATEGIES import failed "
+        f"({_ct_err}); using built-in fallback"
+    )
     COUNTER_TREND_STRATEGIES = frozenset({
         "TREND_DOWN_FADE",
         "MEAN_REVERSION",
@@ -83,53 +46,48 @@ except Exception as _e:
 
 
 # ═════════════════════════════════════════════════════════════
-#  TUNABLES — REV 4.0: ab config_center se aate hain
-#  Tuning ke liye: core/config_center.py ka DECISION dict
-#  ya .env mein CC_DEC_* env vars set karein.
+#  REV 4.2 — LIVE CONFIG HELPERS
+#  Read fresh on every call so update_runtime() takes effect
+#  immediately. Falls back to safe defaults only in the
+#  pathological case where config_center is unavailable.
 # ═════════════════════════════════════════════════════════════
-MIN_APPROVALS              = _DEC["min_approvals"]
-TOTAL_FILTERS              = _DEC["total_filters"]
-
-ADX_COUNTER_TREND_HARD_MAX = _DEC["adx_counter_trend_hard_max"]
-ADX_COUNTER_TREND_SOFT_MAX = _DEC["adx_counter_trend_soft_max"]
-ATR_RATIO_EXTREME          = _DEC["atr_ratio_extreme"]
-
-# Same-side cap — still from CONFIG (.env MAX_SAME_SIDE_POSITIONS)
-MAX_SAME_SIDE_POSITIONS = CONFIG.max_same_side_positions
-
-LOSS_STREAK_TRIGGER        = _DEC["loss_streak_trigger"]
-LOSS_STREAK_COOLDOWN_MIN   = _DEC["loss_streak_cooldown_min"]
-
-# ── BTC global bias gate ──
-BLOCK_COUNTERTREND_TO_BTC  = _DEC["btc_bias_enabled"]
-BTC_BIAS_MODE              = _DEC["btc_bias_mode"]            # "full" | "high_risk_only" | "disabled"
-BTC_BIAS_HIGH_RISK_COINS   = _DEC["btc_bias_high_risk_coins"] # frozenset
-BTC_REGIME_TTL_SEC         = _DEC["btc_regime_ttl_sec"]
-
-# ── Win-rate multiplier bounds ──
-WR_MULT_MIN                = _DEC["wr_mult_min"]
-WR_MULT_MAX                = _DEC["wr_mult_max"]
-WR_MULT_MIN_TRADES         = _DEC["wr_mult_min_trades"]
-
-# NOTE (REV 4.1): COUNTER_TREND_STRATEGIES is now imported from
-# core.config_center above. Single source of truth — edit there only.
+_DEFAULT_DECISION = {
+    "min_approvals": 5,
+    "total_filters": 6,
+    "btc_bias_enabled": True,
+    "btc_bias_mode": "full",
+    "btc_bias_high_risk_coins": frozenset(),
+    "btc_regime_ttl_sec": 600,
+    "adx_counter_trend_hard_max": 45.0,
+    "adx_counter_trend_soft_max": 35.0,
+    "atr_ratio_extreme": 2.5,
+    "loss_streak_trigger": 4,
+    "loss_streak_cooldown_min": 60,
+    "wr_mult_min": 0.85,
+    "wr_mult_max": 1.10,
+    "wr_mult_min_trades": 15,
+}
 
 
-@dataclass
-class DecisionScore:
-    approved: bool = False
-    approvals: int = 0
-    total_filters: int = TOTAL_FILTERS
-    top_reason: str = ""
-    reasons: list = field(default_factory=list)
-    detail: dict = field(default_factory=dict)
+def _dec_get(key: str, default=None):
+    """Live decision config read (fresh each call)."""
+    try:
+        val = CC.get_decision_cfg().get(key)
+        if val is not None:
+            return val
+    except Exception:
+        pass
+    if default is not None:
+        return default
+    return _DEFAULT_DECISION.get(key)
 
-    def add(self, name: str, passed: bool, reason: str):
-        self.detail[name] = {"pass": passed, "reason": reason}
-        if passed:
-            self.approvals += 1
-        else:
-            self.reasons.append(f"{name}:{reason}")
+
+def _global_get(key: str, default=None):
+    """Live GLOBAL config read."""
+    try:
+        return CC.get(key, default)
+    except Exception:
+        return default
 
 
 # ═════════════════════════════════════════════════════════════
@@ -160,11 +118,15 @@ def set_btc_regime(regime: str) -> None:
 
 
 def get_btc_regime() -> str:
-    """Returns cached BTC regime, or UNKNOWN if stale."""
+    """Returns cached BTC regime, or UNKNOWN if stale.
+
+    REV 4.2 — TTL read LIVE from config_center each call.
+    """
+    _ttl = float(_dec_get("btc_regime_ttl_sec", 600) or 600)
     with _btc_lock:
         if _btc_regime_ts <= 0:
             return "UNKNOWN"
-        if time.time() - _btc_regime_ts > BTC_REGIME_TTL_SEC:
+        if time.time() - _btc_regime_ts > _ttl:
             return "UNKNOWN"
         return _btc_regime
 
@@ -203,18 +165,20 @@ def record_trade_result(strategy: str, pnl: float) -> None:
 def _check_and_pause_strategy(strategy: str) -> None:
     if not strategy:
         return
+    _trigger = int(_dec_get("loss_streak_trigger", 4) or 4)
+    _cooldown = int(_dec_get("loss_streak_cooldown_min", 60) or 60)
     with _recent_lock:
         recent_same = [r for r in _recent_results if r["strategy"] == strategy]
-    if len(recent_same) < LOSS_STREAK_TRIGGER:
+    if len(recent_same) < _trigger:
         return
-    last_n = recent_same[-LOSS_STREAK_TRIGGER:]
+    last_n = recent_same[-_trigger:]
     if all(not r["won"] for r in last_n):
-        pause_until = time.time() + LOSS_STREAK_COOLDOWN_MIN * 60
+        pause_until = time.time() + _cooldown * 60
         with _pauses_lock:
             _strategy_pauses[strategy] = pause_until
         logger.warning(
-            f"[decision] {strategy} paused for {LOSS_STREAK_COOLDOWN_MIN}m "
-            f"after {LOSS_STREAK_TRIGGER} consecutive losses"
+            f"[decision] {strategy} paused for {_cooldown}m "
+            f"after {_trigger} consecutive losses"
         )
 
 
@@ -232,29 +196,29 @@ def _is_strategy_paused(strategy: str):
 def get_strategy_multiplier(strategy: str) -> float:
     """
     Return a 0.85–1.10 confidence multiplier based on the strategy's
-    recent win rate.
+    recent win rate. Live-reads bounds from config_center each call.
 
     Contract:
       • Returns 1.0 (neutral) when:
           - strategy is empty/None
-          - fewer than WR_MULT_MIN_TRADES recorded for that strategy
-      • Otherwise: multiplier = WR_MULT_MIN + (WR_MULT_MAX - WR_MULT_MIN) * win_rate
-          - WR = 0.0  → 0.85x
-          - WR = 0.5  → 0.975x
-          - WR = 1.0  → 1.10x
+          - fewer than `wr_mult_min_trades` recorded for that strategy
+      • Otherwise: multiplier = min + (max - min) * win_rate
 
     Soft confidence nudge, not a gate.
     """
     if not strategy:
         return 1.0
+    _min = float(_dec_get("wr_mult_min", 0.85) or 0.85)
+    _max = float(_dec_get("wr_mult_max", 1.10) or 1.10)
+    _min_trades = int(_dec_get("wr_mult_min_trades", 15) or 15)
     try:
         with _recent_lock:
             rows = [r for r in _recent_results if r["strategy"] == strategy]
-        if len(rows) < WR_MULT_MIN_TRADES:
+        if len(rows) < _min_trades:
             return 1.0
         wins = sum(1 for r in rows if r["won"])
         wr = wins / len(rows)
-        return WR_MULT_MIN + (WR_MULT_MAX - WR_MULT_MIN) * wr
+        return _min + (_max - _min) * wr
     except Exception:
         return 1.0
 
@@ -267,9 +231,11 @@ def _filter_trend_strength(side: str, strategy: str, ind_1h: dict):
     adx = float(ind_1h.get("adx", 0) or 0)
     if not is_counter:
         return True, f"trend-following adx={adx:.0f}"
-    if adx > ADX_COUNTER_TREND_HARD_MAX:
-        return False, f"counter-trend adx={adx:.0f}>{ADX_COUNTER_TREND_HARD_MAX:.0f}"
-    if adx > ADX_COUNTER_TREND_SOFT_MAX:
+    _hard = float(_dec_get("adx_counter_trend_hard_max", 45.0) or 45.0)
+    _soft = float(_dec_get("adx_counter_trend_soft_max", 35.0) or 35.0)
+    if adx > _hard:
+        return False, f"counter-trend adx={adx:.0f}>{_hard:.0f}"
+    if adx > _soft:
         return True, f"counter-trend adx={adx:.0f} (soft-warn)"
     return True, f"counter-trend adx={adx:.0f} (weak, ideal)"
 
@@ -279,19 +245,16 @@ def _filter_mtf_consensus(side: str, ind_1h: dict, ind_4h: dict,
     """
     SOLE MTF FILTER in the system.
 
-    future.py REV 1.4.13 removed the duplicate binary MTF hard-gate
-    that used to run before the decision engine.
-
     TF set: 1h, 4h, 1d — EXACTLY the TFs the scan loop caches.
-
     Behaviour: 2 of 3 TFs must agree with the trade direction.
       • BUY  agrees if e20 > e50 AND price > e50
       • SELL agrees if e20 < e50 AND price < e50
-    When CONFIG.use_mtf_confluence is False, short-circuits to PASS
-    with reason "mtf_disabled" and still counts toward the 6-filter
-    total (a "free vote").
+    When `use_mtf_confluence` is False, short-circuits to PASS with
+    reason "mtf_disabled" and still counts toward the total (free vote).
+
+    REV 4.2 — reads flag LIVE from config_center each call.
     """
-    if not CONFIG.use_mtf_confluence:
+    if not _global_get("use_mtf_confluence", False):
         return True, "mtf_disabled"
 
     def agrees(ind, s):
@@ -355,20 +318,22 @@ def _filter_correlation(side: str, active_trades: list):
     """
     Correlation counter for same-side positions.
 
-    NOTE: this filter still runs inside the 6-filter vote. The HARD
-    GATE in evaluate_trade() already short-circuits when same-side
-    >= MAX_SAME_SIDE_POSITIONS, so this filter will always pass when
-    reached. Kept for defence-in-depth and for the detail[] trail.
+    NOTE: the HARD GATE in evaluate_trade() already short-circuits when
+    same-side >= max_same_side_positions, so this filter will always
+    pass when reached. Kept for defence-in-depth and detail[] trail.
+
+    REV 4.2 — cap read LIVE from config_center each call.
     """
     if not active_trades:
         return True, "no_positions"
+    _max_ss = int(_global_get("max_same_side_positions", 2) or 2)
     same_side = sum(
         1 for t in active_trades
         if (side == "BUY" and t.get("side") == "LONG")
         or (side == "SELL" and t.get("side") == "SHORT")
     )
-    if same_side >= MAX_SAME_SIDE_POSITIONS:
-        return False, f"{same_side}_same_side>={MAX_SAME_SIDE_POSITIONS}"
+    if same_side >= _max_ss:
+        return False, f"{same_side}_same_side>={_max_ss}"
     return True, f"{same_side}_same_side"
 
 
@@ -388,18 +353,20 @@ def _filter_volatility(ind_1h: dict):
         atr_ratio = float(ind_1h.get("atr_ratio", 1.0) or 1.0)
     except (TypeError, ValueError):
         return True, "atr_parse_fail"
-    if atr_ratio > ATR_RATIO_EXTREME:
-        return False, f"atr_{atr_ratio:.2f}x>={ATR_RATIO_EXTREME}"
+    _extreme = float(_dec_get("atr_ratio_extreme", 2.5) or 2.5)
+    if atr_ratio > _extreme:
+        return False, f"atr_{atr_ratio:.2f}x>={_extreme}"
     return True, f"atr_{atr_ratio:.2f}x"
 
 
 # ═════════════════════════════════════════════════════════════
 #  BTC BIAS GATE (helper)
 #  REV 4.0 — 3 modes support (full | high_risk_only | disabled)
+#  REV 4.2 — all reads LIVE from config_center each call
 # ═════════════════════════════════════════════════════════════
 def _btc_bias_blocks(side: str, symbol: str = "") -> Optional[str]:
     """
-    REV 4.0 — BTC bias gate with 3 modes.
+    BTC bias gate with 3 modes.
 
     Modes (config_center.DECISION.btc_bias_mode):
       • "disabled"       → gate OFF, no block
@@ -409,11 +376,16 @@ def _btc_bias_blocks(side: str, symbol: str = "") -> Optional[str]:
 
     Returns rejection reason string, or None if allowed.
     """
-    if not BLOCK_COUNTERTREND_TO_BTC:
+    if not _dec_get("btc_bias_enabled", True):
         return None
 
-    if BTC_BIAS_MODE == "disabled":
+    _mode = _dec_get("btc_bias_mode", "full")
+    if _mode == "disabled":
         return None
+
+    _high_risk = _dec_get("btc_bias_high_risk_coins", frozenset())
+    if not isinstance(_high_risk, (set, frozenset, list, tuple)):
+        _high_risk = frozenset()
 
     # Normalize symbol for high-risk check
     _sym = (symbol or "").upper()
@@ -421,8 +393,8 @@ def _btc_bias_blocks(side: str, symbol: str = "") -> Optional[str]:
         _sym += "USDT"
 
     # High-risk-only mode: allow all other coins freely
-    if BTC_BIAS_MODE == "high_risk_only":
-        if not _sym or _sym not in BTC_BIAS_HIGH_RISK_COINS:
+    if _mode == "high_risk_only":
+        if not _sym or _sym not in _high_risk:
             return None
 
     # Full mode or high-risk coin → check regime
@@ -432,6 +404,26 @@ def _btc_bias_blocks(side: str, symbol: str = "") -> Optional[str]:
     if regime == "TREND_DOWN" and side == "BUY":
         return "BTC_TREND_DOWN_blocks_LONG"
     return None
+
+
+# ═════════════════════════════════════════════════════════════
+#  DECISION SCORE
+# ═════════════════════════════════════════════════════════════
+@dataclass
+class DecisionScore:
+    approved: bool = False
+    approvals: int = 0
+    total_filters: int = 6
+    top_reason: str = ""
+    reasons: list = field(default_factory=list)
+    detail: dict = field(default_factory=dict)
+
+    def add(self, name: str, passed: bool, reason: str):
+        self.detail[name] = {"pass": passed, "reason": reason}
+        if passed:
+            self.approvals += 1
+        else:
+            self.reasons.append(f"{name}:{reason}")
 
 
 # ═════════════════════════════════════════════════════════════
@@ -449,12 +441,22 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
               • "high_risk_only" → sirf high-risk meme coins block
               • "disabled"       → gate OFF
 
-      GATE 2: Same-side correlation limit (CONFIG.max_same_side_positions).
+      GATE 2: Same-side correlation limit.
 
-    If both gates pass, the 6-filter vote runs.
-    Approve iff approvals >= MIN_APPROVALS.
+    If both gates pass, the N-filter vote runs.
+    Approve iff approvals >= min_approvals.
+
+    REV 4.2 — All config values read LIVE from config_center, so
+    update_runtime() takes effect on the very next call.
     """
+    # Live reads (fresh per call)
+    _min_approvals = int(_dec_get("min_approvals", 5) or 5)
+    _total_filters = int(_dec_get("total_filters", 6) or 6)
+    _max_ss = int(_global_get("max_same_side_positions", 2) or 2)
+    _btc_mode = _dec_get("btc_bias_mode", "full")
+
     result = DecisionScore()
+    result.total_filters = _total_filters
     active = active_trades_list or []
 
     # ═══════════════════════════════════════════════════════════
@@ -464,13 +466,12 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
     if btc_reason:
         result.approved = False
         result.approvals = 0
-        result.total_filters = TOTAL_FILTERS
         result.top_reason = f"HARD_REJECT: {btc_reason}"
         result.reasons = [f"btc_bias:{btc_reason}"]
         result.detail["btc_bias"] = {"pass": False, "reason": btc_reason}
         logger.warning(
             f"[decision] 🚫 HARD REJECT {symbol} {side} [{strategy}] — "
-            f"BTC regime={get_btc_regime()} mode={BTC_BIAS_MODE} → {btc_reason} | "
+            f"BTC regime={get_btc_regime()} mode={_btc_mode} → {btc_reason} | "
             f"conf={conf:.0f}% rr={rr:.2f}"
         )
         return result
@@ -479,30 +480,29 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
     #  HARD GATE #2 — same-side correlation limit
     # ═══════════════════════════════════════════════════════════
     same_side_count = _count_same_side(side, active)
-    if same_side_count >= MAX_SAME_SIDE_POSITIONS:
+    if same_side_count >= _max_ss:
         result.approved = False
         result.approvals = 0
-        result.total_filters = TOTAL_FILTERS
         result.top_reason = (
             f"HARD_REJECT: {same_side_count} same-side already open "
-            f"(max {MAX_SAME_SIDE_POSITIONS})"
+            f"(max {_max_ss})"
         )
         result.reasons = [
-            f"correlation:{same_side_count}_same_side>={MAX_SAME_SIDE_POSITIONS}"
+            f"correlation:{same_side_count}_same_side>={_max_ss}"
         ]
         result.detail["correlation"] = {
             "pass": False,
-            "reason": f"{same_side_count}_same_side>={MAX_SAME_SIDE_POSITIONS}",
+            "reason": f"{same_side_count}_same_side>={_max_ss}",
         }
         logger.warning(
             f"[decision] 🚫 HARD REJECT {symbol} {side} [{strategy}] — "
             f"{same_side_count} same-side already open "
-            f"(max {MAX_SAME_SIDE_POSITIONS}) | conf={conf:.0f}% rr={rr:.2f}"
+            f"(max {_max_ss}) | conf={conf:.0f}% rr={rr:.2f}"
         )
         return result
 
     # ═══════════════════════════════════════════════════════════
-    #  NORMAL 6-FILTER VOTE
+    #  NORMAL N-FILTER VOTE
     # ═══════════════════════════════════════════════════════════
     _is_trend_following = strategy not in COUNTER_TREND_STRATEGIES
 
@@ -520,7 +520,7 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
     result.add("volatility",
                *_filter_volatility(ind_1h))
 
-    result.approved = result.approvals >= MIN_APPROVALS
+    result.approved = result.approvals >= _min_approvals
     result.top_reason = (
         "APPROVED" if result.approved
         else (result.reasons[0] if result.reasons else "unknown_reject")
@@ -560,7 +560,7 @@ def get_stats() -> dict:
         "by_strategy": by_strat,
         "paused_strategies": pauses,
         "btc_regime": get_btc_regime(),
-        "btc_bias_mode": BTC_BIAS_MODE,
-        "min_approvals": MIN_APPROVALS,
-        "total_filters": TOTAL_FILTERS,
+        "btc_bias_mode": _dec_get("btc_bias_mode", "full"),
+        "min_approvals": int(_dec_get("min_approvals", 5) or 5),
+        "total_filters": int(_dec_get("total_filters", 6) or 6),
     }
