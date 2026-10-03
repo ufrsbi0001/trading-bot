@@ -1,20 +1,18 @@
 """
 range_coins.py — RANGE family signal engine.
 
-REV 23.2 (2026-10-02) — PHASE 3 CLEANUP:
-  ✅ Legacy sizing helpers removed from imports and __all__.
-  ✅ FALLBACK_CAPS now sourced from config_center.FAMILY[*]["CAPS"].
-     Was: {"sl": 0.035, "tp1": 0.035, "tp2": 0.080}
-     Now: {"sl": 0.040, "tp1": 0.060, "tp2": 0.100} (config_center)
-  ✅ st_rsi_sell_floor / rsi_buy_overbought / rsi_sell_oversold now
-     live in config_center.FAMILY[*]["FILTERS"].
+REV 23.3 (2026-10-03) — DEAD CODE CLEANUP:
+  ✅ Removed dead `from core.config import CONFIG` import.
+  ✅ Removed dead `_SPEC._rs_rng_min/_rs_rng_max` assignments —
+     values now passed as constructor kwargs (base.py REV 23.7).
+  ✅ Zero behaviour change for every other parameter.
 
+REV 23.2 (2026-10-02) — PHASE 3 CLEANUP.
 REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP.
 REV 21.2 (2026-09-30) — FAMILY-SPECIFIC TUNING.
 """
 from __future__ import annotations
 
-from core.config import CONFIG
 from core import config_center as CC
 from core.coins_config import get_family_coins
 from core.config_center import FAMILY as _CC_FAMILY
@@ -80,7 +78,6 @@ _SPEC = FamilySpec(
     counter_trend_adx_cutoff=35.0,
     rsi_buy_overbought=78.0,
     rsi_sell_oversold=22.0,
-    # ── REV 21.2: family-specific tuning (stricter than others) ──
     st_min_dist_atr=0.5,
     st_max_chase_atr=1.5,
     st_flips_min=5,
@@ -106,9 +103,10 @@ _SPEC = FamilySpec(
     td_fade_min_adx=18.0,
     td_fade_bb_pos_sell=0.97,
     td_fade_bb_pos_buy=0.03,
+    # REV 23.3 — per-family rng bounds now proper fields.
+    rs_rng_min=0.003,
+    rs_rng_max=0.20,
 )
-_SPEC._rs_rng_min = 0.003
-_SPEC._rs_rng_max = 0.20
 
 _TRACKER = DiagnosticsTracker()
 _ALL_STRATEGIES = build_all_strategies(_SPEC, _TRACKER)

@@ -1,25 +1,18 @@
 """
 orders/manage.py — Trade management loop.
 
-REV 1.9.0 (2026-10-02) — RUNTIME TOGGLE AWARENESS:
-  ✅ Removed module-level cached imports `MAX_HOLD_MINUTES` and
-     `PARTIAL_CLOSE_USDT` from .utils. Both are now read LIVE from
-     config_center on every call via _cc_get(). UI runtime updates
-     (config_center.update_runtime(hold_minutes=..., ...)) take effect
-     immediately — no bot restart required.
-  ✅ Trailing SL tunables (TRAIL_DISTANCE_R, TRAIL_HYSTERESIS_R,
-     TRAIL_MIN_LEVEL) promoted from hardcoded module constants to
-     config_center.GLOBAL reads. Tune via .env (CC_TRAIL_*) or
-     runtime update_runtime(trail_distance_r=...). Re-added the 3
-     keys to config_center (REV 5.2) — previously flagged 'dead'
-     because they were hardcoded locals, never read from GLOBAL.
-  ✅ is_time_exit_enabled() already live (REV 1.8.0) — unchanged.
-  ✅ Zero behaviour change for default values.
+REV 1.9.1 (2026-10-03) — DEFENSIVE HARDENING:
+  ✅ markPrice / entryPrice reads use .get() with clear guards.
+     Previously raw_pos['markPrice'] would KeyError if the API
+     returned a partial record; now we log and skip that tick.
+  ✅ reconcile_active_trade() is staggered per symbol (hash-based
+     offset) so all tracked symbols don't hit the API in the same
+     iteration burst.
+  ✅ _cc_get_num() helper added for consistency with exit.py /
+     entry.py. Notably `partial_close_usdt or 0.0` idiom replaced.
 
-REV 1.8.0 (2026-10-02) — TIME_EXIT TOGGLE GATE:
-  ✅ TIME_EXIT block gated by is_time_exit_enabled().
-  ✅ SL/TP/trailing/partial logic unchanged.
-
+REV 1.9.0 (2026-10-02) — RUNTIME TOGGLE AWARENESS.
+REV 1.8.0 (2026-10-02) — TIME_EXIT TOGGLE GATE.
 REV 1.7.1 (2026-10-02) — UNIFIED CONFIG CLEANUP.
 REV 1.7.0 (2026-10-02) — CONFIG CENTER INTEGRATION (Phase 1).
 REV 1.6.3 (2026-09-28) — DEAD IMPORT CLEANUP.
@@ -50,8 +43,8 @@ from market.indicators import calculate_pro_indicators, get_trading_config
 
 # ── REV 1.7.1 — Unified config source for hold_minutes fallback ──
 # ── REV 1.8.0 — is_time_exit_enabled() for TIME_EXIT toggle gate ──
-# ── REV 1.9.0 — _cc_get() for live reads (hold_minutes, partial_close_usdt,
-#               trail_*). Replaces cached imports from .utils. ──
+# ── REV 1.9.0 — _cc_get() for live reads ──
+# ── REV 1.9.1 — _cc_get_num() helper ──
 from core.config_center import (
     get_config as _get_central_config,
     is_time_exit_enabled,
@@ -68,13 +61,12 @@ from .exit import emergency_close_retry, handle_trade_close
 
 
 # ═════════════════════════════════════════════════════════════
-#  REV 1.9.0 — Trailing SL tunables now LIVE from config_center.
-#  No module-level constants. Read via _cc_get('trail_*') at use site.
-#  Defaults documented here for reference only:
-#     trail_distance_r   = 0.50
-#     trail_hysteresis_r = 0.10
-#     trail_min_level    = 1
+#  REV 1.9.1 — SAFE CC NUMERIC READ
+#  Mirrors exit.py REV 1.6.1 / entry.py REV 1.8.1. Preserves 0.
 # ═════════════════════════════════════════════════════════════
+def _cc_get_num(key: str, default):
+    v = _cc_get(key, None)
+    return default if v is None else v
 
 
 # ═════════════════════════════════════════════════════════════
@@ -239,7 +231,18 @@ def manage_single_trade(symbol):
     if amt == 0:
         handle_trade_close(symbol, pair, reason="detected amt=0")
         return
-    mark = float(raw_pos['markPrice'])
+
+    # ── REV 1.9.1 — defensive markPrice read ──
+    _mark_raw = raw_pos.get('markPrice')
+    if _mark_raw is None:
+        logger.debug(f"[{symbol}] manage: markPrice missing from position payload — skipping tick")
+        return
+    try:
+        mark = float(_mark_raw)
+    except (TypeError, ValueError):
+        logger.debug(f"[{symbol}] manage: markPrice={_mark_raw!r} not numeric — skipping tick")
+        return
+
     is_long = amt > 0
     pnl_pct = ((mark - entry) / entry * 100) if is_long else ((entry - mark) / entry * 100)
     close_side = 'SELL' if is_long else 'BUY'
@@ -257,19 +260,13 @@ def manage_single_trade(symbol):
 
     # ═══════════════════════════════════════════════════════════
     #  TIME EXIT — REV 1.8.0: TOGGLE-GATED
-    #    • time_exit_enabled = False (default) → poora block skip
-    #    • time_exit_enabled = True            → regime-aware hold-time
-    #  Toggle: dashboard UI / update_runtime() / CC_TIME_EXIT_ENABLED
-    #
-    #  REV 1.9.0 — hold_minutes ab LIVE read ho rahi hai (module-level
-    #  cache hata diya). UI change turant reflect hoti hai.
+    #  REV 1.9.0 — hold_minutes LIVE read
     # ═══════════════════════════════════════════════════════════
     try:
         entry_time_str = active.get('entry_time', '')
         if entry_time_str:
             strat_name = active.get("strategy", "UNKNOWN")
 
-            # ── REV 1.8.0 — TIME_EXIT gate (live read every call) ──
             _time_exit_on = False
             try:
                 _time_exit_on = bool(is_time_exit_enabled())
@@ -277,7 +274,6 @@ def manage_single_trade(symbol):
                 _time_exit_on = False
 
             if not _time_exit_on:
-                # TIME_EXIT OFF — skip (SL/TP/RR_COLLAPSE still active)
                 logger.debug(f"[{symbol}] TIME_EXIT skipped (disabled)")
             else:
                 entry_dt = datetime.strptime(entry_time_str, '%Y-%m-%d %I:%M:%S %p')
@@ -287,16 +283,9 @@ def manage_single_trade(symbol):
                 r_th_early = _r_thresholds_per_class(symbol, get_trading_config())
                 bars_cap_min = float(r_th_early.get("max_hold_bars", 28)) * 60.0
 
-                # ── REV 1.9.0 — LIVE hold_minutes fallback ──
-                # Read fresh every call so UI/runtime changes take effect
-                # without a bot restart.
-                _live_hold = float(_cc_get('hold_minutes', 180) or 180)
+                # ── REV 1.9.0 / 1.9.1 — LIVE hold_minutes fallback ──
+                _live_hold = float(_cc_get_num('hold_minutes', 180))
 
-                # ── REV 1.7.0 — prefer stored regime-aware hold time ──
-                # `hold_time_minutes` was frozen at entry time (entry.py
-                # REV 1.7.0) so regime flips mid-trade don't retroactively
-                # change the hold budget. Falls back gracefully for old
-                # trades that don't have the field.
                 stored_hold = active.get('hold_time_minutes')
                 _source = None
                 effective_cap = None
@@ -308,7 +297,6 @@ def manage_single_trade(symbol):
                         effective_cap = None
 
                 if effective_cap is None:
-                    # ── REV 1.7.1 — fallback: config_center hold_minutes (live) ──
                     try:
                         _cfg_hold = _get_central_config(symbol, strat_name, "UNKNOWN")
                         effective_cap = float(_cfg_hold.get("hold_minutes", _live_hold))
@@ -376,7 +364,8 @@ def manage_single_trade(symbol):
 
     # ═══════════════════════════════════════════════════════════
     #  PARTIAL 70% (disabled by default)
-    #  REV 1.9.0 — partial_close_usdt ab LIVE read hoti hai
+    #  REV 1.9.0 — partial_close_usdt LIVE
+    #  REV 1.9.1 — 0-preserving read
     # ═══════════════════════════════════════════════════════════
     try:
         unrealized_usdt = float(raw_pos.get('unRealizedProfit', '0') or 0)
@@ -386,8 +375,7 @@ def manage_single_trade(symbol):
 
         partial_done = active.get('partial_70_done', False)
 
-        # ── REV 1.9.0 — LIVE partial_close_usdt ──
-        _partial_usdt = float(_cc_get('partial_close_usdt', 0.0) or 0.0)
+        _partial_usdt = float(_cc_get_num('partial_close_usdt', 0.0))
 
         if _partial_usdt > 0 and not partial_done and unrealized_usdt >= _partial_usdt:
             skip_partial = False
@@ -455,7 +443,6 @@ def manage_single_trade(symbol):
                     except Exception:
                         pass
 
-                    # Cancel ONLY stops, keep TPs (need except_ids for the new BE below)
                     try:
                         oo = client.futures_get_open_orders(symbol=pair)
                         for o in oo:
@@ -534,9 +521,7 @@ def manage_single_trade(symbol):
         logger.warning(f"[{symbol}] partial block error: {e}")
 
     # ═══════════════════════════════════════════════════════════
-    #  update_sl  (REV 1.6.0 — force param)
-    #             (REV 1.6.1 — directional no-downgrade guard)
-    #             (REV 1.6.2 — SL-first ordering)
+    #  update_sl  (REV 1.6.0 / 1.6.1 / 1.6.2)
     # ═══════════════════════════════════════════════════════════
     def update_sl(new_sl, new_level, force=False):
         nonlocal current_sl_price, last_sl_level, sl_id_stored
@@ -566,7 +551,6 @@ def manage_single_trade(symbol):
             logger.error(f"[{symbol}] SL parse failed for {new_sl_adj!r}")
             return False
 
-        # ── REV 1.6.1 — directional no-downgrade guard ──
         if current_sl_price > 0:
             if is_long and new_sl_f <= current_sl_price:
                 logger.debug(
@@ -581,7 +565,6 @@ def manage_single_trade(symbol):
                 )
                 return False
 
-        # ── REV 1.6.2 — SL-FIRST: place new SL, THEN cancel old ──
         old_sl_id = sl_id_stored
         for attempt in range(3):
             try:
@@ -598,12 +581,9 @@ def manage_single_trade(symbol):
                 if not new_id:
                     raise ValueError("no orderId")
 
-                # New SL is live. Now cancel the old one (by ID if we
-                # know it, else sweep-all-except-new).
                 try:
                     if old_sl_id:
                         cancel_specific_sl(pair, old_sl_id)
-                    # Also sweep any unknown orphan stops (excluding new)
                     cancel_all_sl_stops(pair, except_ids=[new_id])
                 except Exception as e:
                     logger.warning(f"[{symbol}] post-place SL sweep failed: {e} "
@@ -624,9 +604,6 @@ def manage_single_trade(symbol):
                     logger.info(f" [{symbol}] SL → level {new_level} (price {new_sl_adj})")
                 return True
             except Exception as e:
-                # New placement failed — old SL is STILL ACTIVE.
-                # Do NOT cancel-all here; that would create the naked
-                # window we're trying to eliminate.
                 logger.warning(f"[{symbol}] SL update attempt {attempt+1}/3: {e} "
                                f"(old SL still active)")
                 time.sleep(1)
@@ -667,11 +644,12 @@ def manage_single_trade(symbol):
 
     # ═══════════════════════════════════════════════════════════
     #  CONTINUOUS TRAILING SL  (REV 1.6.0)
-    #  REV 1.9.0 — tunables ab LIVE from config_center
+    #  REV 1.9.0 — tunables LIVE from config_center
+    #  REV 1.9.1 — 0-preserving reads
     # ═══════════════════════════════════════════════════════════
-    trail_min_level    = int(_cc_get('trail_min_level',    1))
-    trail_distance_r   = float(_cc_get('trail_distance_r',   0.50))
-    trail_hysteresis_r = float(_cc_get('trail_hysteresis_r', 0.10))
+    trail_min_level    = int(_cc_get_num('trail_min_level',    1))
+    trail_distance_r   = float(_cc_get_num('trail_distance_r',   0.50))
+    trail_hysteresis_r = float(_cc_get_num('trail_hysteresis_r', 0.10))
 
     if r_mode and mark_r is not None and mark_r > 0 and last_sl_level >= trail_min_level:
         try:
@@ -702,6 +680,7 @@ def manage_single_trade(symbol):
 
 # ═════════════════════════════════════════════════════════════
 #  Trade manager loop
+#  REV 1.9.1 — reconcile staggered per symbol
 # ═════════════════════════════════════════════════════════════
 def trade_manager_loop():
     iteration = 0
@@ -715,7 +694,15 @@ def trade_manager_loop():
                     manage_single_trade(symbol)
                 except Exception as e:
                     logger.debug(f"[TM] manage {symbol}: {e}")
-                if iteration % 6 == 0:
+                # REV 1.9.1 — stagger reconcile per symbol so all
+                # tracked symbols don't hit the API in the same burst.
+                # hash() is deterministic per process for str keys via
+                # PYTHONHASHSEED at runtime; fallback to a stable value.
+                try:
+                    _offset = abs(hash(symbol)) % 6
+                except Exception:
+                    _offset = 0
+                if (iteration + _offset) % 6 == 0:
                     try:
                         reconcile_active_trade(symbol)
                     except Exception as e:

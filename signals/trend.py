@@ -1,25 +1,18 @@
 """
 trend_coins.py — TREND family signal engine.
 
-REV 23.2 (2026-10-02) — PHASE 3 CLEANUP:
-  ✅ Legacy sizing helpers (calc_risk_usd, get_risk_per_trade,
-     calc_position_size, calc_notional, calc_margin) removed from
-     imports and __all__. They were dead code — returned hardcoded
-     0.0 and were never actually called.
-  ✅ FALLBACK_CAPS now sourced from config_center.FAMILY[*]["CAPS"]
-     — single source of truth.
-     Was: {"sl": 0.050, "tp1": 0.050, "tp2": 0.125}
-     Now: {"sl": 0.045, "tp1": 0.0675, "tp2": 0.125} (config_center)
+REV 23.3 (2026-10-03) — DEAD CODE CLEANUP:
+  ✅ Removed dead `from core.config import CONFIG` import.
+  ✅ Removed dead `_SPEC._rs_rng_min/_rs_rng_max` assignments —
+     values now passed as constructor kwargs (base.py REV 23.7).
+  ✅ Zero behaviour change for every other parameter.
 
-REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
-  ✅ Removed dead late_entry_guard_* / top_chase_* from FamilySpec.
-     config_center.py provides these values via _cfg.
-
+REV 23.2 (2026-10-02) — PHASE 3 CLEANUP.
+REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP.
 REV 21.2 (2026-09-30) — FAMILY-SPECIFIC TUNING.
 """
 from __future__ import annotations
 
-from core.config import CONFIG
 from core import config_center as CC
 from core.coins_config import get_family_coins
 from core.config_center import FAMILY as _CC_FAMILY
@@ -85,8 +78,6 @@ _SPEC = FamilySpec(
     counter_trend_adx_cutoff=35.0,
     rsi_buy_overbought=82.0,
     rsi_sell_oversold=25.0,
-    # NOTE: late_entry_guard_* / top_chase_* removed — config_center provides.
-    # ── REV 21.2: family-specific tuning ──
     st_min_dist_atr=0.5,
     st_max_chase_atr=1.8,
     st_flips_min=4,
@@ -111,9 +102,10 @@ _SPEC = FamilySpec(
     td_fade_min_adx=20.0,
     td_fade_bb_pos_sell=0.98,
     td_fade_bb_pos_buy=0.02,
+    # REV 23.3 — per-family rng bounds now proper fields.
+    rs_rng_min=0.004,
+    rs_rng_max=0.20,
 )
-_SPEC._rs_rng_min = 0.004
-_SPEC._rs_rng_max = 0.20
 
 _TRACKER = DiagnosticsTracker()
 _ALL_STRATEGIES = build_all_strategies(_SPEC, _TRACKER)

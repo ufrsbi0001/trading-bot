@@ -1,60 +1,30 @@
 """
 signals/base.py — Shared signal-engine core for all 4 families.
 
-REV 23.5 (2026-10-02) — DOCSTRING PATH FIX:
-  ✅ Top docstring was `families/base.py` (legacy path from before
-     the folder rename). Actual path is `signals/base.py`. Fixed
-     for consistency with the rest of the codebase.
-  ✅ Zero code change.
+REV 23.7 (2026-10-03) — RANGE-BOUNDS FIELD FIX:
+  ✅ Added rs_rng_min / rs_rng_max as PROPER FamilySpec fields.
+     My REV 23.6 tried to read these from config_center.FAMILY[*]
+     FILTERS, but those keys never existed there — so all four
+     family modules silently fell back to the _RS_RNG_* module
+     defaults, losing per-family tuning.
+  ✅ strategy_range_scalper now reads from spec.rs_rng_min /
+     spec.rs_rng_max — the family-level values that every family
+     module passes as constructor kwargs.
+  ✅ Family modules (trend/range/momentum/volatility REV 23.3) now
+     accept these kwargs without TypeError.
 
-REV 23.4 (2026-10-02) — LIVE CONFIG READS + DEAD IMPORT CLEANUP:
-  ✅ Removed dead `from core.config import CONFIG` import — never
-     referenced anywhere in this module (verified via grep).
-  ✅ Removed `GLOBAL as _CC_GLOBAL` import — the single usage in
-     _mk() has been migrated to a LIVE `CC.get("min_confidence", ...)`
-     call so runtime/env overrides propagate immediately.
-  ✅ _mk(): min_confidence read now LIVE (was: snapshot of
-     _CC_GLOBAL dict at import time).
-  ✅ Zero behaviour change for default values.
+REV 23.6 (2026-10-03) — RANGE-BOUNDS + ZERO-COERCION FIX:
+  ✅ FIXED: spec_range_min / spec_range_max were dead shims.
+  ✅ REMOVED: spec_range_min / spec_range_max helper functions.
+  ✅ FIXED: _mk() min_confidence read no longer uses `or` idiom.
+  ✅ ADDED: _cc_get_num() helper.
 
-REV 23.3 (2026-10-02) — COSMETIC CLEANUP:
-  ✅ Removed unused module constant `DEFAULT_TREND_FOLLOW_RSI_FLOOR`
-     (was only used as FamilySpec dataclass default). Inlined as
-     literal `15.0` in the dataclass. Zero behaviour change.
-
-REV 23.2 (2026-10-02) — PHASE 3 CLEANUP:
-  ✅ Removed legacy sizing helpers (calc_risk_usd, get_risk_per_trade,
-     calc_position_size, calc_notional, calc_margin). They returned
-     hardcoded 0.0 and were never actually used — only re-exported by
-     family modules.
-  ✅ strategy_supertrend_ride now reads rsi_buy_overbought /
-     rsi_sell_oversold from `filters` (config_center.FAMILY[*].FILTERS)
-     with FamilySpec values as fallback. Consistent with the rest of
-     the filter pipeline.
-
-REV 23.1 (2026-10-02) — PHASE 2 CLEANUP:
-  ✅ Removed duplicate BTC bias check from _mk() — decision_engine.py
-     already runs _btc_bias_blocks() as HARD GATE #1 in evaluate_trade().
-     Single source of truth → no more double log entries.
-  ✅ min_confidence now read from config_center.GLOBAL["min_confidence"]
-     (single source), with spec.min_confidence as fallback.
-     .env MIN_CONFIDENCE still works (synced in config.py).
-
-REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
-  ✅ Removed `_MIN_RR_BY_STRATEGY` hardcoded dict — now uses
-     config_center.get_min_rr().
-  ✅ Removed dead `MAX_HOLD_MINUTES=1800` (CC.get('hold_minutes')
-     used by orders/utils.py).
-  ✅ Removed FamilySpec `late_entry_guard_*` and `top_chase_*` fields
-     — dead since config_center always provides these values.
-  ✅ Extended-move guard thresholds now read from config_center:
-     max_move_20bar_pct, rsi_1h_extreme_buy, rsi_1h_extreme_sell,
-     rsi_4h_extreme_buy, rsi_4h_extreme_sell, near_120high_tol,
-     near_120low_tol.
-  ✅ Exhausted filter constants read from config_center:
-     exhausted_rsi_buy, exhausted_rsi_sell, exhausted_dist_mult.
-  ✅ All thresholds live in ONE place: core/config_center.py.
-
+REV 23.5 (2026-10-02) — DOCSTRING PATH FIX.
+REV 23.4 (2026-10-02) — LIVE CONFIG READS + DEAD IMPORT CLEANUP.
+REV 23.3 (2026-10-02) — COSMETIC CLEANUP.
+REV 23.2 (2026-10-02) — PHASE 3 CLEANUP.
+REV 23.1 (2026-10-02) — PHASE 2 CLEANUP.
+REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP.
 REV 22.2 (2026-10-02) — VOL CLASS CAP ADJUSTMENT.
 REV 22.1 (2026-10-02) — CONFIG CENTER INTEGRATION.
 REV 22.0 (2026-10-01) — PHASE 1 (3 CHANGES).
@@ -93,6 +63,17 @@ _DEBUG_STRAT = os.getenv("DEBUG_STRATEGY", "false").strip().lower() == "true"
 
 
 # ═══════════════════════════════════════════════════════════
+#  REV 23.6 — 0-PRESERVING CC NUMERIC READ
+#  Mirrors orders/exit.py REV 1.6.1 / entry.py REV 1.8.1 /
+#  manage.py REV 1.9.1 / decision_engine.py REV 4.3 /
+#  future.py REV 1.4.29.
+# ═══════════════════════════════════════════════════════════
+def _cc_get_num(key: str, default):
+    v = CC.get(key, None)
+    return default if v is None else v
+
+
+# ═══════════════════════════════════════════════════════════
 #  TUNABLES
 # ═══════════════════════════════════════════════════════════
 # NOTE (REV 23.3): DEFAULT_TREND_FOLLOW_RSI_FLOOR removed — inlined
@@ -109,6 +90,13 @@ REVERSAL_TP2_MULT = 2.7
 
 # REV 21.5 — Float tolerance for boundary RR comparisons.
 _RR_FLOAT_EPS = 1e-6
+
+# REV 23.7 — These are FamilySpec dataclass DEFAULT values.
+# Individual families override via the rs_rng_min / rs_rng_max
+# constructor kwargs (see trend/volatility/momentum/range modules).
+_RS_RNG_MIN_DEFAULT = 0.005
+_RS_RNG_MAX_DEFAULT = 0.15
+_RS_RNG_MAX_VOLATILE = 0.30
 
 
 # ═══════════════════════════════════════════════════════════
@@ -229,6 +217,8 @@ class DiagnosticsTracker:
 #  FAMILY SPEC
 #  REV 23.0 — Removed dead late_entry_guard_* / top_chase_* fields.
 #  config_center always provides these values via _cfg.
+#  REV 23.7 — rs_rng_min / rs_rng_max added as proper fields
+#             (previously loose attrs set post-construction).
 # ═══════════════════════════════════════════════════════════
 @dataclass
 class FamilySpec:
@@ -292,6 +282,15 @@ class FamilySpec:
     td_fade_min_adx: float = 20.0
     td_fade_bb_pos_sell: float = 0.98
     td_fade_bb_pos_buy: float = 0.02
+
+    # ═══════════════════════════════════════════════════════════
+    #  REV 23.7 — RANGE_SCALPER range-bounds (per-family tunable)
+    #  Previously stored as loose attrs (_SPEC._rs_rng_min/max) set
+    #  AFTER construction — fragile, easy to lose, and NOT read by
+    #  strategy_range_scalper after REV 23.6. Now first-class fields.
+    # ═══════════════════════════════════════════════════════════
+    rs_rng_min: float = 0.005
+    rs_rng_max: float = 0.15
 
 
 # ═══════════════════════════════════════════════════════════
@@ -476,6 +475,8 @@ def _mk(spec: FamilySpec, side, conf, entry, sl, tp1, tp2,
       • RR floor from config_center.get_min_rr().
     REV 23.4 —
       • min_confidence read LIVE (was: snapshot via _CC_GLOBAL).
+    REV 23.6 —
+      • min_confidence read 0-preserving via _cc_get_num().
     """
     # NOTE (REV 23.1): The BTC bias gate was REMOVED from here.
     # decision_engine.evaluate_trade() runs the gate as HARD GATE #1
@@ -561,8 +562,9 @@ def _mk(spec: FamilySpec, side, conf, entry, sl, tp1, tp2,
                   f"(entry={entry} sl={sl} tp1={tp1} risk={risk})")
         return None
 
-    # ── REV 23.4 — min_confidence LIVE read (fallback: spec) ──
-    _min_conf = float(CC.get("min_confidence", spec.min_confidence) or spec.min_confidence)
+    # ── REV 23.4 / 23.6 — min_confidence LIVE read (fallback: spec) ──
+    # 0-preserving: a CC_MIN_CONFIDENCE=0 config is honoured as-is.
+    _min_conf = float(_cc_get_num("min_confidence", spec.min_confidence))
     if conf < _min_conf:
         if _DEBUG_STRAT:
             print(f"[_mk] {symbol} REJECT: conf {conf:.1f} < "
@@ -939,12 +941,21 @@ def strategy_mean_reversion(spec, tracker, ind_1h, ind_4h,
 
 # ═══════════════════════════════════════════════════════════
 #  STRATEGY: RANGE_SCALPER
+#  REV 23.7 — range bounds now read from spec.rs_rng_min/max
+#             (proper FamilySpec fields, per-family tunable).
+#             _RS_RNG_MAX_VOLATILE still overrides in VOLATILE regime.
 # ═══════════════════════════════════════════════════════════
 def strategy_range_scalper(spec, tracker, ind_1h, ind_4h,
                            ind_1d=None, symbol=""):
     filters = get_coin_filters(symbol)
     rsi_buy_max  = filters.get("rs_rsi_buy_max",  spec.rs_rsi_buy_max)
     rsi_sell_min = filters.get("rs_rsi_sell_min", spec.rs_rsi_sell_min)
+
+    # REV 23.7 — read from spec fields (was: dead filters.get on
+    # keys that never existed). Family modules now pass
+    # rs_rng_min / rs_rng_max as constructor kwargs.
+    rng_min = float(spec.rs_rng_min)
+    rng_max_base = float(spec.rs_rng_max)
 
     regime = ind_1h.get("regime", "UNKNOWN")
     if regime not in ("QUIET", "CHOP", "VOLATILE"):
@@ -977,8 +988,8 @@ def strategy_range_scalper(spec, tracker, ind_1h, ind_4h,
 
     rng = dc_hi - dc_lo
     rng_pct = rng / price
-    rng_max = 0.30 if regime == "VOLATILE" else spec_range_max(spec)
-    if rng_pct < spec_range_min(spec) or rng_pct > rng_max:
+    rng_max = _RS_RNG_MAX_VOLATILE if regime == "VOLATILE" else rng_max_base
+    if rng_pct < rng_min or rng_pct > rng_max:
         tracker.rej("RANGE_SCALPER", f"range_bad_{rng_pct*100:.2f}%")
         return None
     mid = (dc_hi + dc_lo) / 2
@@ -1020,15 +1031,6 @@ def strategy_range_scalper(spec, tracker, ind_1h, ind_4h,
 
     tracker.rej("RANGE_SCALPER", "no_pattern")
     return None
-
-
-# ── Range-scalper bounds shim ────────────────────────────
-def spec_range_min(spec) -> float:
-    return getattr(spec, "_rs_rng_min", 0.005)
-
-
-def spec_range_max(spec) -> float:
-    return getattr(spec, "_rs_rng_max", 0.15)
 
 
 # ═══════════════════════════════════════════════════════════

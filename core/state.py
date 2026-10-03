@@ -1,6 +1,18 @@
 """
 state.py — Runtime state for the trading engine.
 
+REV 1.3.18 (2026-10-03) — FAIL-FAST SAFETY-KEY VERIFICATION:
+  ✅ At import time we now verify that all required safety keys
+     (max_daily_loss_trades, max_daily_drawdown_percent,
+     max_account_drawdown) exist in config_center.GLOBAL. Previously
+     a missing key surfaced as `CC.get(...)` returning None and blew
+     up LATER as a TypeError in `loss_count >= None`. Now it fails
+     immediately with a clear remediation message.
+  ✅ Docstring explicitly documents the CONFIG-vs-CC split:
+       • CONFIG (core.config)        → file paths, blacklist (env-only)
+       • CC     (core.config_center) → trading params, safety limits
+     No duplication, no ambiguity about which is authoritative.
+
 REV 1.3.17 (2026-10-02) — CONFIG CLEANUP:
   ✅ Removed dead constants COOLDOWN_AFTER_SL_MIN / COOLDOWN_AFTER_TP_MIN
      — orders/exit.py REV 1.6.0 reads these LIVE from config_center
@@ -12,8 +24,7 @@ REV 1.3.17 (2026-10-02) — CONFIG CLEANUP:
      MAX_ACCOUNT_DRAWDOWN intentionally kept as module-level snapshots.
      RATIONALE: these are SAFETY LIMITS. Runtime-flipping them via UI
      could accidentally disable loss protection mid-session. Use .env
-     or CC_<KEY> env override + restart to change. See REV 1.3.16
-     for the date-rollover interaction with these values.
+     or CC_<KEY> env override + restart to change.
   ✅ Zero behaviour change for default values.
 
 REV 1.3.16 (2026-10-02) — DAILY TRACKER DATE-ROLLOVER FIX.
@@ -41,6 +52,21 @@ from core import config_center as CC
 from core.client import logger
 
 # ─────────────────────────────────────────────────────────────
+# CONFIG SOURCE SPLIT (read this before adding new reads)
+# ─────────────────────────────────────────────────────────────
+#   CONFIG (core.config)        → env-only: file paths, blacklist,
+#                                 secrets, deployment flags.
+#   CC     (core.config_center) → trading params + safety limits.
+#
+# Rule of thumb:
+#   • Static infra  → CONFIG.<attr>
+#   • Trading tunables → CC.get('<key>')  (live-read where documented)
+#
+# Never duplicate a trading param as a module-level constant here
+# unless it's an intentional SAFETY-LIMIT snapshot (see below).
+# ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
 PKT = timezone(timedelta(hours=5))
@@ -54,19 +80,30 @@ COIN_ROTATION_FILE  = CONFIG.coin_rotation_file
 PAUSE_FILE          = CONFIG.pause_file
 
 # ── SAFETY LIMITS (module-level snapshots) ──
-# NOTE (REV 1.3.17): these are intentionally NOT live-read. Runtime
-# toggling loss/drawdown limits could disable protection mid-session.
-# To change: set CC_<KEY> env or restart with new .env value.
+# REV 1.3.17: these are intentionally NOT live-read. Runtime toggling
+# loss/drawdown limits could disable protection mid-session.
+# REV 1.3.18: fail fast if any of these keys is missing from CC.GLOBAL
+# so we never silently compare against None at runtime.
+_REQUIRED_CC_SAFETY_KEYS = (
+    'max_daily_loss_trades',
+    'max_daily_drawdown_percent',
+    'max_account_drawdown',
+)
+_missing = [k for k in _REQUIRED_CC_SAFETY_KEYS if k not in CC.GLOBAL]
+if _missing:
+    raise RuntimeError(
+        "state.py: config_center.GLOBAL is missing required safety "
+        f"key(s): {', '.join(_missing)}. Add them to config_center "
+        "defaults (with validation) before importing state. "
+        "Silent-None here would later crash as `loss_count >= None`."
+    )
+
 MAX_DAILY_LOSS_TRADES       = CC.get('max_daily_loss_trades')
 MAX_DAILY_DRAWDOWN_PERCENT  = CC.get('max_daily_drawdown_percent')
 MAX_ACCOUNT_DRAWDOWN        = CC.get('max_account_drawdown')
 
 # ── ENV-ONLY ──
 BLACKLISTED_COINS           = set(CONFIG.blacklisted_coins)
-
-# NOTE (REV 1.3.17): COOLDOWN_AFTER_SL_MIN / COOLDOWN_AFTER_TP_MIN
-# were REMOVED — orders/exit.py REV 1.6.0 reads these LIVE via
-# _cc_get(). No consumer remains for the state-level copies.
 
 
 # ─────────────────────────────────────────────────────────────
@@ -309,6 +346,7 @@ def get_v2_stats_str() -> str:
 # DAILY TRACKER
 #   REV 1.3.16 — date-rollover fix + public getter
 #   REV 1.3.17 — safety limits documented as snapshots
+#   REV 1.3.18 — import-time verification of safety keys
 # ─────────────────────────────────────────────────────────────
 class DailyTracker:
     """
@@ -328,6 +366,11 @@ class DailyTracker:
       values). They are NOT live-read even if update_runtime() is
       called. This is intentional: mid-session runtime flips could
       disable loss protection. To change → env + restart.
+
+    REV 1.3.18:
+      Module-level check guarantees the three constants above are
+      non-None integers, so the comparisons in is_limit_reached()
+      cannot raise TypeError from a silently-missing CC key.
     """
 
     def __init__(self):

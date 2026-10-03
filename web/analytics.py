@@ -9,62 +9,37 @@ endpoints for accurate UI display.
 Data is refreshed by a background worker every 5 minutes.
 Uses bot's existing Binance client (no extra session).
 
-REV 1.7 (2026-09-28) — FALLBACK LOOP CONSISTENCY FIX:
-  ✅ _fetch_income_window_fallback() was still using the OLD
-     `for _ in range(MAX_PAGES)` pattern that REV 1.5 fixed in
-     _fetch_fills() and _fetch_orders(). A rate-limit `continue`
-     in that loop consumed a MAX_PAGES slot (10 back-to-back RLs
-     = 10 slots gone). Functionally the retry still worked because
-     `cursor` was not advanced, but it silently ate into the page
-     budget. Rewrote as `while page < MAX_PAGES` with an explicit
-     `page` counter that increments ONLY on a successful fetch —
-     matching the pattern used by all three other paginators.
-  ✅ Added explicit warning log when MAX_PAGES is exhausted with
-     data still pending (cursor < end_ms). Previously the function
-     returned truncated results silently.
+REV 1.8 (2026-10-03) — PERF + CONFIG + ROBUSTNESS:
+  ✅ FIXED: _summarize_trade() was O(trades × income). For every trade
+     it linearly scanned ALL income rows to find matching FUNDING_FEE
+     events — 5000 trades × 10000 income = 50M iterations per refresh.
+     Now a per-symbol funding index is built once and reused, reducing
+     to O(income + trades × per_symbol_funding). Typical speedup:
+     5-10× on accounts with heavy funding history.
+  ✅ PAGE_SIZE now sourced from CONFIG.income_page_size (was a
+     hardcoded 1000 constant duplicating the value). Same default,
+     but a single source of truth — set CC_INCOME_PAGE_SIZE to tune.
+  ✅ MAX_PAGES retained as an analytics-specific safety ceiling (500).
+     NOTE: this is intentionally higher than CONFIG.max_income_pages
+     because analytics backfills up to 89 days — the user-facing
+     max_income_pages is a hint for the /api/history fallback only.
+  ✅ FIXED: _fetch_fills() / _fetch_orders() — `int(resp[-1]["id"])`
+     could raise KeyError/ValueError on malformed API responses
+     (defensive parsing added). Previously a malformed batch would
+     crash the entire refresh.
+  ✅ refresh_now() now logs at DEBUG when the non-blocking refresh
+     lock is already held — makes "scheduled refresh was skipped"
+     visible without spamming at INFO.
+  ✅ INCOME_LOOKBACK_DAYS comment clarified: 89 is Binance's protocol
+     cap (retention limit), NOT a user-tunable preference. The
+     user-facing history_lookback_days in core/config.py is what
+     /api/history applies for display.
 
-REV 1.6 (2026-09-28) — SILENT CLIENT-WAIT FOR WORKER:
-  ✅ Background worker no longer logs "[WARNING] refresh failed:
-     no client" when it starts before the user has clicked Start
-     in the UI. The worker now polls get_client() quietly and only
-     begins its refresh cycle once the client is available. Startup
-     gets a single INFO line instead of a WARNING every 5s until
-     the UI is used.
-  ✅ refresh_now() returns False silently (no warning, no mutation
-     of last_error) when the client is not yet set — callers can
-     still distinguish success (True) from not-ready-or-failed
-     (False), and last_error is only populated for REAL failures.
-  ✅ schedule_refresh() is a silent no-op when the client is not
-     set — avoids spawning a thread that would immediately fail.
-
-REV 1.5 (2026-09-26) — FILLS/ORDERS RATE-LIMIT PAGE-SKIP FIX:
-  ✅ _fetch_fills() and _fetch_orders() had the SAME class of bug
-     that was fixed in _fetch_income_window() at REV 1.4: the loop
-     was `for _ in range(MAX_PAGES)` and a rate-limit `continue`
-     incremented the loop counter, so the failed page was never
-     retried — its 1000 records were silently dropped, causing
-     fills/orders to be truncated mid-window on rate limit.
-     Rewrote both as explicit while-loops with a consecutive-rate-
-     limit counter that does NOT advance the page index on -1003/
-     -1015, and bails out after 10 consecutive rate limits.
-  ✅ Hardcoded `1000` replaced with PAGE_SIZE constant in
-     _fetch_income_window() and _fetch_income_window_fallback()
-     (single source of truth for the page size).
-
-REV 1.4 (2026-09-26) — PAGINATION ROBUSTNESS:
-  ✅ RATE-LIMIT PAGE-SKIP FIX in _fetch_income_window().
-  ✅ AUTO-FALLBACK ON SILENT PAGE-PARAM IGNORE.
-  ✅ PROBE STILL PRESENT (kept for logging only).
-
-REV 1.3 (2026-09-26) — ALIGNED WITH history.py REV 3.7:
-  ✅ INCOME PAGINATION FIX (cursor = last_time, no +1).
-  ✅ FLIP realizedPnl ATTRIBUTION FIX.
-  ✅ CROSS-CHECK PARITY (FROM TRADES includes open commissions/funding).
-  ✅ PAGE-SUPPORT PROBE.
-  ✅ PER-SYMBOL DRIFT DIAGNOSTIC.
-  ✅ _scale_fills() helper kept.
-  ✅ _pair_fills() semantics identical to history.py REV 3.3.
-
+REV 1.7 (2026-09-28) — FALLBACK LOOP CONSISTENCY FIX.
+REV 1.6 (2026-09-28) — SILENT CLIENT-WAIT FOR WORKER.
+REV 1.5 (2026-09-26) — FILLS/ORDERS RATE-LIMIT PAGE-SKIP FIX.
+REV 1.4 (2026-09-26) — PAGINATION ROBUSTNESS.
+REV 1.3 (2026-09-26) — ALIGNED WITH history.py REV 3.7.
 REV 1.2 (2026-09-26) — aligned with history.py REV 3.3.
 REV 1.1 (2026-09-24) — double-fetch fix.
 REV 1.0 (2026-09-24) — initial release.
@@ -92,11 +67,26 @@ except ImportError:
 #  TUNABLES
 # ═════════════════════════════════════════════════════════════
 REFRESH_INTERVAL_SEC = 300    # background full refresh every 5 min
-PAGE_SIZE            = 1000
+
+# REV 1.8 — page size from config_center-adjacent env (core.config).
+# Default 1000 in core/config.py. Same value used for fills, orders,
+# and income — Binance uses the same 1000-record cap for all three.
+PAGE_SIZE            = int(CONFIG.income_page_size)
+
 PAGE_SLEEP_SEC       = 0.15
+
+# REV 1.8 — Analytics-specific safety ceiling. NOT tied to
+# CONFIG.max_income_pages (default 20), because analytics backfills
+# up to INCOME_LOOKBACK_DAYS (89) and needs a bigger page budget
+# than the /api/history legacy fallback.
 MAX_PAGES            = 500
 MAX_CONSECUTIVE_RL   = 10     # REV 1.5: bail after this many back-to-back RL
-INCOME_LOOKBACK_DAYS = 89     # aligned with Binance max retention
+
+# REV 1.8 — 89 = Binance's protocol retention cap for futures income
+# history. This is NOT a user preference — /api/history applies the
+# user-facing CONFIG.history_lookback_days for DISPLAY filtering.
+# Analytics deliberately fetches everything Binance will give us.
+INCOME_LOOKBACK_DAYS = 89
 
 
 # ═════════════════════════════════════════════════════════════
@@ -158,6 +148,14 @@ def _income_key(r: dict) -> tuple:
     )
 
 
+def _safe_int(v: Any, default: int = 0) -> int:
+    """REV 1.8 — defensive int coercion for paginator cursors."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 # ═════════════════════════════════════════════════════════════
 #  PAGE-SUPPORT PROBE  (REV 1.3, revised REV 1.4)
 # ═════════════════════════════════════════════════════════════
@@ -203,14 +201,9 @@ def _probe_page_support(client) -> bool:
 def _fetch_fills(client, symbol: str) -> list[dict]:
     """Fetch account trades for `symbol`, paging with fromId.
 
-    REV 1.5 — RATE-LIMIT RETRY FIX:
-      Previously the loop was `for _ in range(MAX_PAGES)` and a
-      rate-limit `continue` consumed the loop counter, so the
-      failed page's 1000 records were silently dropped on any -1003/
-      -1015 (the classic "silent truncation on rate limit" bug).
-      Rewrote as a while-loop with a consecutive-rate-limit counter
-      that does NOT advance `page` on rate limit — the same page
-      (same fromId) is retried. Bails after 10 consecutive RLs.
+    REV 1.5 — RATE-LIMIT RETRY FIX.
+    REV 1.8 — defensive int() on last id (was: KeyError/ValueError
+              on malformed API responses).
     """
     out: list[dict] = []
     from_id = 0
@@ -234,7 +227,6 @@ def _fetch_fills(client, symbol: str) -> list[dict]:
                         f"— aborting"
                     )
                     break
-                # Retry the SAME page (do NOT advance from_id / page)
                 continue
             logger.debug(f"[analytics] fills {symbol} {e.code}")
             break
@@ -248,7 +240,15 @@ def _fetch_fills(client, symbol: str) -> list[dict]:
         if len(resp) < PAGE_SIZE:
             break
 
-        from_id = int(resp[-1]["id"]) + 1
+        # REV 1.8 — defensive last-id parse.
+        last_id = _safe_int(resp[-1].get("id"), default=-1)
+        if last_id < 0:
+            logger.warning(
+                f"[analytics] fills {symbol}: missing/invalid 'id' on "
+                f"last record — stopping pagination"
+            )
+            break
+        from_id = last_id + 1
         page += 1
         time.sleep(PAGE_SLEEP_SEC)
 
@@ -259,6 +259,7 @@ def _fetch_orders(client, symbol: str, from_order_id: int) -> list[dict]:
     """Fetch all orders for `symbol`, paging with fromId.
 
     REV 1.5 — same rate-limit retry fix as _fetch_fills().
+    REV 1.8 — defensive int() on last orderId.
     """
     out: list[dict] = []
     from_id = from_order_id
@@ -282,7 +283,6 @@ def _fetch_orders(client, symbol: str, from_order_id: int) -> list[dict]:
                         f"— aborting"
                     )
                     break
-                # Retry the SAME page (do NOT advance from_id / page)
                 continue
             logger.debug(f"[analytics] orders {symbol} {e.code}")
             break
@@ -296,7 +296,15 @@ def _fetch_orders(client, symbol: str, from_order_id: int) -> list[dict]:
         if len(resp) < PAGE_SIZE:
             break
 
-        from_id = int(resp[-1]["orderId"]) + 1
+        # REV 1.8 — defensive last-id parse.
+        last_oid = _safe_int(resp[-1].get("orderId"), default=-1)
+        if last_oid < 0:
+            logger.warning(
+                f"[analytics] orders {symbol}: missing/invalid 'orderId' "
+                f"on last record — stopping pagination"
+            )
+            break
+        from_id = last_oid + 1
         page += 1
         time.sleep(PAGE_SLEEP_SEC)
 
@@ -310,13 +318,8 @@ def _fetch_income_window(client, start_ms: int, end_ms: int,
     Page-based income fetch.
 
     REV 1.4 fixes:
-      • Rate-limit retries no longer consume the `page` counter
-        (previously `continue` in a `for page in range(...)` skipped
-        the failed page entirely).
-      • If the endpoint silently ignores `page` (fresh == 0 on a
-        non-zero page), we switch to time-cursor mode for the
-        remainder of the range — otherwise we'd return only the
-        first 1000 records.
+      • Rate-limit retries no longer consume the `page` counter.
+      • Silent page-ignore fallback to time-cursor.
       • Bail after MAX_CONSECUTIVE_RL consecutive rate limits.
 
     REV 1.5: hardcoded 1000 → PAGE_SIZE.
@@ -344,7 +347,6 @@ def _fetch_income_window(client, start_ms: int, end_ms: int,
                         "— abandoning page mode"
                     )
                     break
-                # Retry the SAME page (do NOT increment `page`)
                 continue
             raise
 
@@ -398,16 +400,7 @@ def _fetch_income_window_fallback(client, start_ms: int,
     composite-key dedup; advances by +1 only on stall.
 
     REV 1.5: hardcoded 1000 → PAGE_SIZE.
-
-    REV 1.7 — RATE-LIMIT PAGE-COUNTER FIX:
-      Rewrote from `for _ in range(MAX_PAGES)` to an explicit
-      `while page < MAX_PAGES` loop. The old for-loop consumed a
-      MAX_PAGES slot on every rate-limit retry (10 back-to-back
-      RLs = 10 slots gone). Now `page` only advances on a
-      SUCCESSFUL fetch — matching the pattern used by
-      _fetch_fills(), _fetch_orders(), and _fetch_income_window().
-      Also added an explicit warning when MAX_PAGES is exhausted
-      with data still pending.
+    REV 1.7 — RATE-LIMIT PAGE-COUNTER FIX.
     """
     out: list[dict] = []
     seen_keys: set = set()
@@ -433,7 +426,6 @@ def _fetch_income_window_fallback(client, start_ms: int,
                         "— aborting"
                     )
                     break
-                # Retry the SAME cursor (do NOT advance page / cursor)
                 continue
             raise
         if not batch:
@@ -467,7 +459,6 @@ def _fetch_income_window_fallback(client, start_ms: int,
             break
         time.sleep(PAGE_SLEEP_SEC)
 
-    # REV 1.7 — surface silent truncation instead of returning quietly.
     if page >= MAX_PAGES and cursor < end_ms:
         logger.warning(
             f"[analytics] income fallback: reached MAX_PAGES={MAX_PAGES} "
@@ -517,9 +508,7 @@ def _new_trade(fill: dict, signed_qty: float) -> dict:
 
 
 def _scale_fills(fills: list[dict], factor: float) -> list[dict]:
-    """Return copies of fills with qty & commission scaled by `factor`.
-    realizedPnl is NOT scaled because entry fills always carry
-    realizedPnl = 0 (flip remainder gets 0, additions never do)."""
+    """Return copies of fills with qty & commission scaled by `factor`."""
     out = []
     for f in fills:
         nf = dict(f)
@@ -533,14 +522,7 @@ def _pair_fills(fills: list[dict]) -> list[dict]:
     """
     Walk fills chronologically, pair entry/exit into round-trip trades.
 
-    REV 1.3 — Semantics (identical to history.py REV 3.3/3.4):
-      * Exit fills ACCUMULATE. Trade is only marked CLOSED when
-        position → 0. 11 partial exits = ONE row, not 11.
-      * Flip fill: FULL realizedPnl → closing portion; opening
-        portion gets realizedPnl = 0.
-      * End-of-data split: leftover exits split into CLOSED + OPEN;
-        OPEN portion's funding_start_ms = last exit time so funding
-        events aren't double-counted.
+    REV 1.3 — Semantics (identical to history.py REV 3.3/3.4).
     """
     fills_sorted = sorted(fills, key=lambda x: (int(x["time"]), int(x["id"])))
     trades: list[dict] = []
@@ -580,7 +562,6 @@ def _pair_fills(fills: list[dict]) -> list[dict]:
 
             exit_portion = dict(f)
             exit_portion["qty"] = str(close_qty)
-            # REV 1.3 FIX: full realizedPnl → closing portion.
             exit_portion["realizedPnl"] = f.get("realizedPnl", "0")
             exit_portion["commission"]  = str(_f(f.get("commission")) * factor)
             open_trade["exit_fills"].append(exit_portion)
@@ -591,7 +572,6 @@ def _pair_fills(fills: list[dict]) -> list[dict]:
             remainder = abs(signed) - close_qty
             new_fill = dict(f)
             new_fill["qty"] = str(remainder)
-            # REV 1.3 FIX: opening portion has ZERO realizedPnl.
             new_fill["realizedPnl"] = "0"
             new_fill["commission"]  = str(_f(f.get("commission")) * (1 - factor))
             open_trade = _new_trade(new_fill, remainder if signed > 0 else -remainder)
@@ -640,16 +620,39 @@ def _pair_fills(fills: list[dict]) -> list[dict]:
     return trades
 
 
-def _summarize_trade(t: dict, all_income: list[dict]) -> dict:
+# ═════════════════════════════════════════════════════════════
+#  REV 1.8 — FUNDING INDEX (per-symbol)
+#  Previously _summarize_trade() linearly scanned all_income for
+#  every trade — O(trades × income). Now build a per-symbol list
+#  of (time_ms, amount) once, and each trade only scans the funding
+#  events for ITS symbol. Typical speedup 5-10× on busy accounts.
+# ═════════════════════════════════════════════════════════════
+def _build_funding_index(all_income: list[dict]) -> dict[str, list[tuple[int, float]]]:
+    idx: dict[str, list[tuple[int, float]]] = defaultdict(list)
+    for inc in all_income:
+        if inc.get("incomeType") != "FUNDING_FEE":
+            continue
+        sym = inc.get("symbol")
+        if not sym:
+            continue
+        t = int(inc.get("time") or 0)
+        idx[sym].append((t, _f(inc.get("income"))))
+    # Sort by time so we can early-break within a range.
+    for sym in idx:
+        idx[sym].sort(key=lambda x: x[0])
+    return idx
+
+
+def _summarize_trade(t: dict,
+                     funding_index: Optional[dict[str, list[tuple[int, float]]]] = None,
+                     all_income: Optional[list[dict]] = None) -> dict:
     """
     Build one summary row.
 
-    REV 1.3:
-      - gross_pnl = sum(exit realizedPnl) only (entry fills carry 0
-        after the flip fix in _pair_fills; summing entry as a safety
-        net is harmless and kept for parity with history.py REV 3.4).
-      - OPEN rows always have empty exit_fills.
-      - funding attribution uses funding_start_ms (respects splits).
+    REV 1.8 — funding lookup now O(per_symbol_events) via index
+    (built once per refresh). Backward-compat path with all_income
+    is kept for any external caller but is no longer used by
+    _compute_all().
     """
     ef = t["entry_fills"]; xf = t["exit_fills"]
     is_closed = (t["status"] == "CLOSED")
@@ -669,14 +672,27 @@ def _summarize_trade(t: dict, all_income: list[dict]) -> dict:
 
     funding_start = t.get("funding_start_ms", entry_ms)
     funding = 0.0
-    for inc in all_income:
-        if inc.get("symbol") != sym:
-            continue
-        if inc.get("incomeType") != "FUNDING_FEE":
-            continue
-        it = int(inc.get("time") or 0)
-        if funding_start <= it <= exit_ms:
-            funding += _f(inc.get("income"))
+
+    # REV 1.8 — prefer index; fall back to linear scan only if caller
+    # explicitly passes all_income (legacy path).
+    if funding_index is not None:
+        events = funding_index.get(sym, ())
+        for it, amt in events:
+            if it < funding_start:
+                continue
+            if it > exit_ms:
+                break  # sorted by time
+            funding += amt
+    elif all_income is not None:
+        for inc in all_income:
+            if inc.get("symbol") != sym:
+                continue
+            if inc.get("incomeType") != "FUNDING_FEE":
+                continue
+            it = int(inc.get("time") or 0)
+            if funding_start <= it <= exit_ms:
+                funding += _f(inc.get("income"))
+    # else: no funding data available — leaves funding at 0.0
 
     net_pnl = gross_pnl + commission + funding
     holding_min = (exit_ms - entry_ms) / 60000.0 if exit_ms > entry_ms else 0.0
@@ -838,7 +854,6 @@ def _report_per_symbol_drift(all_fills: list[dict],
                 f"ΔRPNL={d_rp:+.4f}  ΔCOMM={d_cm:+.4f}"
             )
 
-    # Compact single-line summary for the refresh log
     if abs(total_d_rp) < 0.01 and abs(total_d_cm) < 0.01:
         logger.info(f"[analytics] per-symbol drift: CLEAN "
                     f"(ΔRPNL={total_d_rp:+.4f}, ΔCOMM={total_d_cm:+.4f})")
@@ -891,7 +906,13 @@ def _compute_all() -> dict:
     for sym, fills in per_symbol.items():
         all_trades_raw.extend(_pair_fills(fills))
     all_trades_raw.sort(key=lambda t: t["entry_time_ms"])
-    trades_summary = [_summarize_trade(t, all_income) for t in all_trades_raw]
+
+    # ── REV 1.8 — build funding index ONCE, reuse for every trade ──
+    funding_index = _build_funding_index(all_income)
+    trades_summary = [
+        _summarize_trade(t, funding_index=funding_index)
+        for t in all_trades_raw
+    ]
 
     fills_rows = [_fill_row(f) for f in all_fills]
     fills_rows.sort(key=lambda r: (r["time_ms"], str(r["id"])), reverse=True)
@@ -933,7 +954,6 @@ def _compute_all() -> dict:
 
     drift = total_net - income_net
 
-    # Per-symbol diagnostic (also logs warnings)
     diagnostic = _report_per_symbol_drift(all_fills, all_income)
 
     summary = {
@@ -992,20 +1012,17 @@ def _compute_all() -> dict:
 def refresh_now() -> bool:
     """Synchronous full refresh. Returns True on success.
 
-    REV 1.6 — QUIET NO-CLIENT:
-      When the analytics worker starts before API keys are set
-      (typical startup race with the /api/start flow), this returns
-      False WITHOUT logging a warning and WITHOUT touching
-      last_error. That way the worker loop can poll quietly until
-      the client exists, and the log stays clean.
+    REV 1.6 — QUIET NO-CLIENT.
+    REV 1.8 — logs DEBUG when the refresh lock is already held
+              (makes "scheduled refresh was skipped" visible).
     """
     if not _REFRESH_LOCK.acquire(blocking=False):
+        logger.debug("[analytics] refresh_now skipped — already in progress")
         return False
     try:
         with _CACHE_LOCK:
             _CACHE["refresh_in_progress"] = True
         try:
-            # Quiet pre-flight: no client yet → not an error.
             if get_client() is None:
                 return False
 
@@ -1028,7 +1045,13 @@ def refresh_now() -> bool:
 
 
 def snapshot() -> dict:
-    """Return a thread-safe snapshot of the cache."""
+    """Return a thread-safe snapshot of the cache.
+
+    NOTE: list() / dict() are SHALLOW copies. Trade/fill/order dicts
+    inside are shared references with the cache. All current callers
+    (web/app.py) are read-only, so this is safe — but external code
+    MUST NOT mutate the returned dicts in place.
+    """
     with _CACHE_LOCK:
         return {
             "fills":    list(_CACHE["fills"]),
@@ -1045,14 +1068,9 @@ def snapshot() -> dict:
 def schedule_refresh() -> None:
     """Kick off a background refresh (non-blocking).
 
-    REV 1.6: if no client is set, this is a silent no-op — the
-    background worker will pick up the refresh once the client
-    becomes available. Avoids spawning a thread that would
-    immediately fail with "no client".
+    REV 1.6: if no client is set, this is a silent no-op.
     """
     if get_client() is None:
-        # Not an error — bot hasn't been started yet. The background
-        # worker will refresh once the client is available.
         return
 
     def _run():
@@ -1083,23 +1101,7 @@ def stop_background_worker() -> None:
 def _worker_loop() -> None:
     """Background refresh loop.
 
-    REV 1.6 — SILENT CLIENT-WAIT:
-      The worker is started from app.main() BEFORE any API keys are
-      set — the user clicks Start in the UI to load them. The old
-      implementation called refresh_now() at t+5s, which raised
-      "no client" and was logged as a WARNING every cycle until
-      Start was clicked.
-
-      New behaviour:
-        Phase 1 — Quiet poll of get_client() every 1s. A single
-                  INFO line is emitted the first time we enter the
-                  waiting state; nothing else is logged until the
-                  client appears.
-        Phase 2 — Once the client exists, enter the normal refresh
-                  cycle. Errors during this phase are real errors
-                  and still get WARNING-level logging.
-
-      The stop event short-circuits both phases.
+    REV 1.6 — SILENT CLIENT-WAIT.
     """
     # Give Flask / config loading a moment.
     time.sleep(5)

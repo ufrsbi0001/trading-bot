@@ -1,14 +1,29 @@
 """
 orders/exit.py — Trade close and emergency close.
 
+REV 1.6.1 (2026-10-03) — CORRECTNESS HARDENING:
+  ✅ FIXED: `_cc_get(k, d) or d` silently coerced legitimate 0 values
+     (cooldown_after_sl_min=0, cooldown_after_tp_min=0, tiny_loss_r=0)
+     back to their defaults. Zero is a valid runtime value for all three
+     (validation allows it). Replaced with explicit None-check helper
+     `_cc_get_num()`.
+  ✅ FIXED: get_total_pnl() hardcoded limit=200 → silently truncated
+     income history on long trades with many funding-fee records →
+     understated PnL → wrong SL/TP classification → wrong daily-loss
+     count. Now paginates via CONFIG.income_page_size and
+     CONFIG.max_income_pages (which existed but were unused).
+  ✅ unmanaged_positions.json now anchored to CSV_EXIT_FILE's parent
+     (DATA_DIR) instead of CWD-relative. Matches every other state file.
+  ✅ robust_cancel_all() failure now logs WARNING (was silent); caller
+     still proceeds (cooldown blocks re-entry), but operator sees it.
+  ✅ Removed redundant flush_active_trades() call —
+     state.remove_active_trade() already flushes internally.
+
 REV 1.6.0 (2026-10-02) — RUNTIME TOGGLE AWARENESS:
   ✅ Removed cached imports COOLDOWN_AFTER_SL_MIN, COOLDOWN_AFTER_TP_MIN
      from core.state. Both now read LIVE via _cc_get() so UI runtime
      changes take effect on the very next close.
-  ✅ `_TINY_LOSS_R` promoted from hardcoded module constant to
-     config_center.GLOBAL["tiny_loss_r"]. Now tunable via CC_TINY_LOSS_R
-     env or update_runtime(tiny_loss_r=...). Default 0.30 (unchanged).
-  ✅ Zero behaviour change for default values.
+  ✅ `_TINY_LOSS_R` promoted to config_center.GLOBAL["tiny_loss_r"].
 
 REV 1.5.6 (2026-10-02) — DAILY-LOSS COUNT CLARITY.
 REV 1.5.5 (2026-09-29) — DUPLICATE-CLOSE REASON TRACKING.
@@ -22,6 +37,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from core.client import (
     fetch_position_raw, get_filters, adjust_qty,
@@ -29,8 +45,9 @@ from core.client import (
     invalidate_account_cache, send_telegram, logger,
     _requests_lock,
 )
+from core.config import CONFIG
 from core.state import (
-    PKT, get_active_trade, remove_active_trade, flush_active_trades,
+    PKT, get_active_trade, remove_active_trade,
     bot_tracked_symbols, BOT_TRACKED_LOCK,
     cooldown_until, COOLDOWN_LOCK, save_cooldowns,
     fail_counts, FAIL_COUNTS_LOCK,
@@ -45,6 +62,16 @@ from .utils import _cl, _JUST_CLOSED, _JUST_CLOSED_LOCK
 
 
 # ═════════════════════════════════════════════════════════════
+#  REV 1.6.1 — DATA_DIR-ANCHORED PATHS
+#  All state files live next to each other; do NOT use CWD-relative
+#  paths (breaks when the bot is launched from a different directory).
+# ═════════════════════════════════════════════════════════════
+_UNMANAGED_POSITIONS_FILE = str(
+    Path(CSV_EXIT_FILE).parent / "unmanaged_positions.json"
+)
+
+
+# ═════════════════════════════════════════════════════════════
 #  Reason classification
 # ═════════════════════════════════════════════════════════════
 _MANUAL_UI_REASONS = frozenset({"MANUAL_UI"})
@@ -54,6 +81,17 @@ _MANUAL_UI_REASONS = frozenset({"MANUAL_UI"})
 #  REV 1.5.5 — FIRST-REASON TRACKER (diagnostic only)
 # ═════════════════════════════════════════════════════════════
 _CLOSED_REASONS: dict[str, str] = {}
+
+
+# ═════════════════════════════════════════════════════════════
+#  REV 1.6.1 — SAFE CC NUMERIC READ
+#  `_cc_get(k, default) or default` was silently coercing legitimate
+#  0 values back to the default. This helper preserves 0 while still
+#  returning `default` when the key is genuinely absent (None).
+# ═════════════════════════════════════════════════════════════
+def _cc_get_num(key: str, default):
+    v = _cc_get(key, None)
+    return default if v is None else v
 
 
 # ═════════════════════════════════════════════════════════════
@@ -108,11 +146,11 @@ def emergency_close_retry(symbol, pair, close_side):
 
     logger.critical(f"❌ Could not close {symbol}")
     try:
-        with open("unmanaged_positions.json", "a", encoding='utf-8') as f:
+        with open(_UNMANAGED_POSITIONS_FILE, "a", encoding='utf-8') as f:
             f.write(f"{datetime.now(PKT).isoformat()} - {symbol} - {pair} - "
                     f"MANUAL CLOSE REQUIRED\n")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to log unmanaged position {symbol}: {e}")
     send_telegram(f"🚨 CRITICAL {symbol} – MANUAL CHECK REQUIRED")
 
 
@@ -162,6 +200,9 @@ def robust_cancel_all(symbol_pair):
 
 # ═════════════════════════════════════════════════════════════
 #  get_total_pnl
+#  REV 1.6.1 — now paginates via CONFIG.income_page_size /
+#              CONFIG.max_income_pages. The old limit=200 was silently
+#              truncating income history on long trades.
 # ═════════════════════════════════════════════════════════════
 def get_total_pnl(symbol, entry_time_ms):
     pair = symbol + 'USDT'
@@ -169,16 +210,32 @@ def get_total_pnl(symbol, entry_time_ms):
     if client is None:
         return 0.0
     total = 0.0
+    page_size = int(CONFIG.income_page_size)
+    max_pages = int(CONFIG.max_income_pages)
     try:
         refresh_timestamp()
-        income = client.futures_income_history(
-            symbol=pair, startTime=entry_time_ms, limit=200
-        )
-        for entry in income:
-            if entry['symbol'] == pair and entry['incomeType'] in (
-                'REALIZED_PNL', 'COMMISSION', 'FUNDING_FEE'
-            ):
-                total += float(entry['income'])
+        cursor = int(entry_time_ms)
+        for _page in range(max_pages):
+            income = client.futures_income_history(
+                symbol=pair, startTime=cursor, limit=page_size
+            )
+            if not income:
+                break
+            for entry in income:
+                if entry['symbol'] == pair and entry['incomeType'] in (
+                    'REALIZED_PNL', 'COMMISSION', 'FUNDING_FEE'
+                ):
+                    total += float(entry['income'])
+            # Last page → fewer records than requested → done.
+            if len(income) < page_size:
+                break
+            # Advance cursor past the latest timestamp we saw. Guard
+            # against non-progress to avoid an infinite loop on a
+            # misbehaving API.
+            last_time = max(int(e.get('time', cursor)) for e in income)
+            if last_time <= cursor:
+                break
+            cursor = last_time + 1
     except Exception as e:
         logger.debug(f"Income sum error {symbol}: {e}")
     return total
@@ -218,8 +275,15 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
         _JUST_CLOSED[symbol] = now
         _CLOSED_REASONS[symbol] = reason
 
+    # REV 1.6.1 — log cancel failure (was silent). Proceed regardless:
+    # cooldown below will block re-entry; a stray orphan order will be
+    # caught by the monitor on the next tick.
     try:
-        robust_cancel_all(pair)
+        if not robust_cancel_all(pair):
+            logger.warning(
+                f"[{symbol}] robust_cancel_all did not confirm full cleanup "
+                f"— proceeding with close (monitor will reconcile)"
+            )
     except Exception as e:
         logger.debug(f"robust_cancel_all in handle_trade_close failed: {e}")
 
@@ -268,8 +332,10 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
     except Exception:
         _r_mult = None
 
-    # ── REV 1.6.0: LIVE tiny_loss_r from config_center ──
-    _tiny_loss_r = float(_cc_get("tiny_loss_r", 0.30) or 0.30)
+    # ── REV 1.6.0 / 1.6.1: LIVE tiny_loss_r from config_center.
+    #    NOTE: 0.0 is a valid value (means "no tiny-loss tolerance").
+    #    The old `or 0.30` silently coerced it back to 0.30.
+    _tiny_loss_r = float(_cc_get_num("tiny_loss_r", 0.30))
     _is_real_loss = pnl < 0 and (
         reason != "TIME_EXIT" or _r_mult is None or _r_mult <= -_tiny_loss_r
     )
@@ -300,9 +366,11 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
 
     _r_txt = "" if _r_mult is None else f" ({_r_mult:+.2f}R)"
 
-    # ── REV 1.6.0: LIVE cooldowns from config_center ──
-    _cooldown_sl = int(_cc_get("cooldown_after_sl_min", 20) or 20)
-    _cooldown_tp = int(_cc_get("cooldown_after_tp_min", 15) or 15)
+    # ── REV 1.6.0 / 1.6.1: LIVE cooldowns from config_center.
+    #    NOTE: 0 is a valid value (immediate re-entry allowed). The old
+    #    `or 20` / `or 15` idiom silently coerced it back.
+    _cooldown_sl = int(_cc_get_num("cooldown_after_sl_min", 20))
+    _cooldown_tp = int(_cc_get_num("cooldown_after_tp_min", 15))
 
     if pnl < 0:
         # ═══════════════════════════════════════════════════════
@@ -341,8 +409,8 @@ def handle_trade_close(symbol, pair=None, reason="closed"):
 
     with BOT_TRACKED_LOCK:
         bot_tracked_symbols.discard(symbol)
+    # REV 1.6.1 — remove_active_trade() already flushes internally.
     remove_active_trade(symbol)
-    flush_active_trades()
     with FAIL_COUNTS_LOCK:
         fail_counts.pop(symbol, None)
     try:

@@ -1,6 +1,19 @@
 """
 config.py — Environment / infrastructure configuration ONLY.
 
+REV 2.0.1 (2026-10-03) — PROXY HARDENING:
+  ✅ _ATTR_TO_CC_KEY renamed to _PROXIED_TRADING_ATTRS and expanded
+     to an EXPLICIT full map of every trading attribute this module
+     proxies to core.config_center.GLOBAL. This is now the single
+     source of truth for the proxy surface.
+  ✅ __getattr__ now raises a CLEAR AttributeError on contract
+     violation (missing CC key) instead of an opaque failure at the
+     first read site deep in the codebase.
+  ✅ public_dict() no longer routes through self.<attr> proxy chain —
+     it reads _PROXIED_TRADING_ATTRS directly from config_center.GLOBAL.
+     No duplicate attribute list to keep in sync.
+  ✅ Docstring documents the proxy contract for future maintainers.
+
 REV 2.0.0 (2026-10-02) — CONFIG UNIFICATION:
   ✅ Trading parameters MOVED OUT to core/config_center.py (sole
      source of truth). This file now holds only:
@@ -10,7 +23,7 @@ REV 2.0.0 (2026-10-02) — CONFIG UNIFICATION:
        • coin universe resolution (coins_config / BOT_COINS)
        • API pagination settings
        • log level
-  ✅ Backward compat: Config dataclass now exposes moved fields as
+  ✅ Backward compat: Config dataclass exposes moved fields as
      read-through proxies (via __getattr__) → core.config_center.GLOBAL.
      So existing code `CONFIG.leverage` continues to work, but the
      authoritative value lives in config_center.
@@ -19,26 +32,13 @@ REV 2.0.0 (2026-10-02) — CONFIG UNIFICATION:
   ✅ Legacy .env names (LEVERAGE, RISK_PERCENT, MIN_CONFIDENCE, ...)
      still work — they're mapped inside config_center._LEGACY_ENV_MAP.
 
-REV 1.6.0 → 1.5.x history retained below for audit trail.
-
-Prior revisions (see git log for full history):
-  • REV 1.6.0 — MIN_CONFIDENCE sync to config_center
-  • REV 1.5.1 — use_1m_trend_filter → use_5m_trend_filter rename
-  • REV 1.5.0 — max_same_side_positions configurable
-  • REV 1.4.9 — dead news/sentiment removed
-  • REV 1.4.8 — per-family spread caps
-  • REV 1.4.7 — spread filter config
-  • REV 1.4.5 — HTF align relaxed flag
-  • REV 1.4.2 — KZ_BYPASS single source of truth
-  • REV 1.4.1 — fail-fast coin resolution
-  • REV 1.4.0 — modern indicators flags (Phase 1)
-
 Design goals:
   • Frozen dataclass — immutable after load, thread-safe reads
   • Fail-fast validation at import (env-level only)
   • public_dict() for /api/config (never leaks secrets)
   • All file paths anchored to DATA_DIR
   • Coin universe sourced EXCLUSIVELY from coins_config.py or .env
+  • NO trading param duplicated here — proxy only, source in CC
 """
 from __future__ import annotations
 
@@ -132,14 +132,53 @@ def _strip_usdt(sym: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# PROXY MAP: Config attr name → config_center.GLOBAL key
+# PROXY CONTRACT — trading params owned by config_center
 # ─────────────────────────────────────────────────────────────
-# Fields that used to be dataclass fields but now live in config_center.
-# __getattr__ uses this to transparently proxy reads.
-# NOTE: only renames go here — same-name fields don't need an entry
-#       (fall-through lookup uses the attribute name directly).
-_ATTR_TO_CC_KEY = {
-    "max_hold_minutes": "hold_minutes",
+# Each entry maps a legacy CONFIG.<attr> name to its authoritative
+# key inside core.config_center.GLOBAL.
+#
+# ►►► THIS DICT IS THE SINGLE SOURCE OF TRUTH FOR THE PROXY SURFACE ◄◄◄
+#
+# Adding a new trading param?
+#   1. Add it to core.config_center.GLOBAL (with default + validation).
+#   2. Add its mapping here if you want legacy `CONFIG.<name>` access.
+#   3. Do NOT reintroduce a dataclass field — that reopens the
+#      duplication wound REV 2.0.0 closed.
+#
+# Removing a param?
+#   1. Delete it from config_center.GLOBAL.
+#   2. Delete its entry here.
+#   3. Fix any call sites still using CONFIG.<name> → use CC.get().
+_PROXIED_TRADING_ATTRS: dict[str, str] = {
+    # Legacy attr name  →  config_center.GLOBAL key
+    "leverage":                    "leverage",
+    "risk_percent":                "risk_percent",
+    "max_open_positions":          "max_open_positions",
+    "max_same_side_positions":     "max_same_side_positions",
+    "max_daily_loss_trades":       "max_daily_loss_trades",
+    "max_daily_drawdown_percent":  "max_daily_drawdown_percent",
+    "max_account_drawdown":        "max_account_drawdown",
+    "max_hold_minutes":            "hold_minutes",  # renamed in CC
+    "min_confidence":              "min_confidence",
+    "min_adx":                     "min_adx",
+    "require_htf_agreement":       "require_htf_agreement",
+    "use_5m_trend_filter":         "use_5m_trend_filter",
+    "max_trades_per_coin_per_day": "max_trades_per_coin_per_day",
+    "htf_align_relaxed":           "htf_align_relaxed",
+    "cooldown_after_sl_min":       "cooldown_after_sl_min",
+    "cooldown_after_tp_min":       "cooldown_after_tp_min",
+    "partial_close_usdt":          "partial_close_usdt",
+    "use_taker_volume":            "use_taker_volume",
+    "use_volume_profile":          "use_volume_profile",
+    "use_anchored_vwap":           "use_anchored_vwap",
+    "use_funding_z":               "use_funding_z",
+    "use_mtf_confluence":          "use_mtf_confluence",
+    "kz_bypass":                   "kz_bypass",
+    "use_spread_filter":           "use_spread_filter",
+    "max_spread_pct":              "max_spread_pct",
+    "max_spread_trend":            "max_spread_trend",
+    "max_spread_range":            "max_spread_range",
+    "max_spread_volatility":       "max_spread_volatility",
 }
 
 
@@ -195,20 +234,30 @@ class Config:
     # ─────────────────────────────────────────────────────────
     # PROXY: trading params → config_center.GLOBAL
     # ─────────────────────────────────────────────────────────
-    # Called only when normal attribute lookup fails (i.e. for fields
-    # that were removed from the dataclass but are still read by
-    # legacy code paths).
+    # Only called when normal attribute lookup fails, i.e. for
+    # legacy reads like CONFIG.leverage that no longer have a
+    # dataclass field. Unknown names raise a clean AttributeError;
+    # known-but-missing CC keys raise a contract-violation error.
     # ─────────────────────────────────────────────────────────
     def __getattr__(self, name: str):
+        cc_key = _PROXIED_TRADING_ATTRS.get(name)
+        if cc_key is None:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}. "
+                f"If this is a trading param, add it to "
+                f"config.py:_PROXIED_TRADING_ATTRS AND "
+                f"config_center.GLOBAL."
+            )
         # Lazy import — avoids circular import at module load.
         from core import config_center as _cc
-
-        cc_key = _ATTR_TO_CC_KEY.get(name, name)
-        if cc_key in _cc.GLOBAL:
-            return _cc.GLOBAL[cc_key]
-        raise AttributeError(
-            f"{type(self).__name__!r} object has no attribute {name!r}"
-        )
+        if cc_key not in _cc.GLOBAL:
+            raise AttributeError(
+                f"CONFIG.{name} → config_center.GLOBAL[{cc_key!r}] is "
+                f"MISSING. This is a proxy-contract violation: the key "
+                f"is advertised in _PROXIED_TRADING_ATTRS but absent "
+                f"from config_center. Fix config_center defaults."
+            )
+        return _cc.GLOBAL[cc_key]
 
     # ── Derived ─────────────────────────────────────────────
     @property
@@ -236,8 +285,24 @@ class Config:
         return "MAINNET — REAL MONEY"
 
     def public_dict(self) -> dict:
-        """Safe for /api/config — never leaks secrets."""
-        return {
+        """Safe for /api/config — never leaks secrets.
+
+        Trading params are read DIRECTLY from config_center.GLOBAL via
+        _PROXIED_TRADING_ATTRS, not via self.<attr> proxy chain. This
+        keeps the mapping in exactly one place and avoids cascading
+        __getattr__ calls.
+        """
+        from core import config_center as _cc
+
+        missing = [k for k in _PROXIED_TRADING_ATTRS.values()
+                   if k not in _cc.GLOBAL]
+        if missing:
+            raise ConfigError(
+                "public_dict(): config_center.GLOBAL is missing proxied "
+                "keys: " + ", ".join(missing)
+            )
+
+        out = {
             # ── env ──
             "demo_mode": self.demo_mode,
             "testnet": self.testnet,
@@ -248,36 +313,11 @@ class Config:
             "keys_present": self.keys_present,
             "token_present": self.token_present,
             "history_lookback_days": self.history_lookback_days,
-            # ── proxied trading params (read from config_center) ──
-            "leverage": self.leverage,
-            "risk_percent": self.risk_percent,
-            "max_open_positions": self.max_open_positions,
-            "max_same_side_positions": self.max_same_side_positions,
-            "max_daily_loss_trades": self.max_daily_loss_trades,
-            "max_daily_drawdown_percent": self.max_daily_drawdown_percent,
-            "max_account_drawdown": self.max_account_drawdown,
-            "max_hold_minutes": self.max_hold_minutes,
-            "min_confidence": self.min_confidence,
-            "min_adx": self.min_adx,
-            "require_htf_agreement": self.require_htf_agreement,
-            "use_5m_trend_filter": self.use_5m_trend_filter,
-            "max_trades_per_coin_per_day": self.max_trades_per_coin_per_day,
-            "htf_align_relaxed": self.htf_align_relaxed,
-            "cooldown_after_sl_min": self.cooldown_after_sl_min,
-            "cooldown_after_tp_min": self.cooldown_after_tp_min,
-            "partial_close_usdt": self.partial_close_usdt,
-            "use_taker_volume": self.use_taker_volume,
-            "use_volume_profile": self.use_volume_profile,
-            "use_anchored_vwap": self.use_anchored_vwap,
-            "use_funding_z": self.use_funding_z,
-            "use_mtf_confluence": self.use_mtf_confluence,
-            "kz_bypass": self.kz_bypass,
-            "use_spread_filter": self.use_spread_filter,
-            "max_spread_pct": self.max_spread_pct,
-            "max_spread_trend": self.max_spread_trend,
-            "max_spread_range": self.max_spread_range,
-            "max_spread_volatility": self.max_spread_volatility,
         }
+        # ── proxied trading params ──
+        for attr, cc_key in _PROXIED_TRADING_ATTRS.items():
+            out[attr] = _cc.GLOBAL[cc_key]
+        return out
 
 
 # ─────────────────────────────────────────────────────────────
@@ -452,9 +492,10 @@ CONFIG: Config = load_config()
 # BANNER HELPERS
 # ─────────────────────────────────────────────────────────────
 def _partial_close_label() -> str:
-    if CONFIG.partial_close_usdt == 0:
+    pc = CONFIG.partial_close_usdt   # proxied → config_center
+    if pc == 0:
         return "DISABLED (TP1/TP2 mode)"
-    return f"${CONFIG.partial_close_usdt:.2f} profit (70% lock)"
+    return f"${pc:.2f} profit (70% lock)"
 
 
 def _spread_label() -> str:

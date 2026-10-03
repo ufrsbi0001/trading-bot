@@ -1,33 +1,29 @@
 """
 TRADING DESK · Flask Backend — Production Refactor
 ─────────────────────────────────────────────────────────────
+REV 1.5.0 (2026-10-03) — DEFENSIVE HARDENING:
+  ✅ Analytics snapshot reads no longer use direct dict access
+     (snap["fills"] etc). All reads go through .get() with typed
+     defaults so a shape change in analytics.py can't 500 the API.
+  ✅ _read_daily_loss_count() now accepts a `fallback` param and
+     get_bot_status() passes the PREVIOUS bot_state value. Previously
+     a transient tracker failure (import error, exception) returned 0
+     and overwrote a correct non-zero count on the dashboard.
+  ✅ _engine_attr() fallback module strings corrected for the
+     orders/ package split:
+       "orders" → "orders.exit"   (handle_trade_close)
+       "orders" → "orders.manage" (trade_manager_loop)
+     Primary path (via `tt.*` / future.py re-export) unchanged.
+  ✅ /api/health returns a tz-aware timestamp (was naive local).
+  ✅ /api/time_exit POST now bounds hold_minutes to [0, 1440]
+     (24 h). Out-of-range values are rejected with 400.
+
 REV 1.4.2 (2026-10-02) — DAILY LOSS DASHBOARD WIRING:
-  ✅ get_bot_status() now reads daily_tracker.get_loss_count()
-     and writes it into bot_state["daily_loss"].
-     Bug fix: dashboard previously ALWAYS showed 0/10 even
-     when real SL hits were logged, because bot_state["daily_loss"]
-     was hardcoded to 0 and never updated.
-  ✅ Uses try/except ImportError for graceful UI-only mode.
+  ✅ get_bot_status() reads daily_tracker.get_loss_count() into
+     bot_state["daily_loss"]. Previously always 0.
 
-REV 1.4.1 (2026-10-02) — TIME_EXIT TOGGLE API:
-  ✅ Added GET  /api/time_exit  → current state (public read)
-  ✅ Added POST /api/time_exit  → toggle on/off at runtime
-     Body: {"enabled": true|false, "hold_minutes": 180}
-     Uses core.config_center.update_runtime().
-  ✅ Rate-limited + token-required on POST.
-
-REV 1.4.0 (2026-10-02) — PHASE 4 WEB MIGRATION:
-  ✅ Moved app.py → web/app.py.
-  ✅ Templates moved to web/templates/ (Flask auto-detects via __name__).
-  ✅ `import analytics` → `from web import analytics` (8x) — analytics
-     now lives at web/analytics.py.
-  ✅ `_engine_attr` fallback module strings updated:
-       "client" → "core.client"
-       "state"  → "core.state"
-     Primary path (via `tt.*`) unchanged; fallbacks corrected for
-     post-Phase-2 layout.
-  ✅ Entry point is now root `run.py` (calls web.app.main()).
-
+REV 1.4.1 (2026-10-02) — TIME_EXIT TOGGLE API.
+REV 1.4.0 (2026-10-02) — PHASE 4 WEB MIGRATION.
 REV 1.3.16 (2026-09-28) — DEAD-PROXY FALLOUT CLEANUP.
 REV 1.3.15 (2026-09-28) — MANUAL CLOSE FROM UI.
 REV 1.3.14 (2026-09-28) — DECISION ENGINE STATS EXPOSED.
@@ -62,6 +58,9 @@ from core.config import CONFIG, print_config_banner
 # ─────────────────────────────────────────────────────────────
 PKT = timezone(timedelta(hours=5))
 LOG_PREFIX_IDLE = "⏳ System idle. Waiting for API keys."
+
+# ── REV 1.5.0 — TIME_EXIT hold_minutes bound (24 h) ──
+_MAX_HOLD_MINUTES = 1440
 
 # ─────────────────────────────────────────────────────────────
 # LOGGING
@@ -226,19 +225,19 @@ def add_log(msg: str) -> None:
     log.info(msg)
 
 
-def _read_daily_loss_count() -> int:
+def _read_daily_loss_count(fallback: int = 0) -> int:
     """
     REV 1.4.2 — Read the current day's loss count from DailyTracker.
-
-    Returns 0 on any error (UI-only mode, import failure, etc.) so
-    the dashboard never breaks just because the tracker is unavailable.
+    REV 1.5.0 — accepts a fallback (previous value) so a transient
+                tracker failure doesn't overwrite a correct non-zero
+                count with 0 on the dashboard.
     """
     try:
         from core.state import daily_tracker
         return int(daily_tracker.get_loss_count())
     except Exception as e:
-        log.debug(f"[daily_loss] read failed (using 0): {e}")
-        return 0
+        log.debug(f"[daily_loss] read failed (using fallback={fallback}): {e}")
+        return fallback
 
 
 # ─────────────────────────────────────────────────────────────
@@ -307,7 +306,9 @@ def bot_runner() -> None:
         bot_state["running"] = True
     add_log("🚀 Bot engine started successfully")
 
-    tm_loop = _engine_attr("trade_manager_loop", "orders")
+    # REV 1.5.0 — trade_manager_loop lives in orders.manage (fallback
+    # corrected; primary path is future.py re-export).
+    tm_loop = _engine_attr("trade_manager_loop", "orders.manage", "orders")
     if callable(tm_loop):
         tm_thread = threading.Thread(
             target=tm_loop, daemon=True, name="tm_engine"
@@ -378,7 +379,9 @@ def _normalize_position(client: Any, pos: dict) -> Optional[dict]:
         symbol_short = symbol_pair.replace("USDT", "")
 
         st: Optional[dict] = None
-        get_status = _engine_attr("get_trade_status", "orders")
+        # REV 1.5.0 — get_trade_status is expected in future.py (primary)
+        # or orders/__init__.py re-export. Keep the fallback chain wide.
+        get_status = _engine_attr("get_trade_status", "orders", "orders.utils")
         if callable(get_status):
             try:
                 st = get_status(symbol_short, pos=pos)
@@ -419,11 +422,15 @@ def get_bot_status() -> dict[str, Any]:
     """
     No network call inside state_lock — prevents UI freeze / DoS.
 
-    REV 1.4.2 — now reads daily_tracker.get_loss_count() and mirrors
-    it into bot_state["daily_loss"]. Previously hardcoded to 0.
+    REV 1.4.2 — reads daily_tracker.get_loss_count() and mirrors into
+                bot_state["daily_loss"].
+    REV 1.5.0 — passes the PREVIOUS bot_state["daily_loss"] as a
+                fallback so a transient tracker failure doesn't
+                overwrite a correct count with 0.
     """
     with state_lock:
         is_running = bot_state["running"]
+        prev_daily_loss = int(bot_state.get("daily_loss", 0) or 0)
 
     if is_running and start_time:
         elapsed = int(time.time() - start_time)
@@ -433,8 +440,8 @@ def get_bot_status() -> dict[str, Any]:
     else:
         uptime_str = "00:00:00"
 
-    # ── REV 1.4.2 — read live daily-loss count ──
-    daily_loss_now = _read_daily_loss_count()
+    # ── REV 1.5.0 — fall back to previous value on read failure ──
+    daily_loss_now = _read_daily_loss_count(fallback=prev_daily_loss)
 
     if not is_running:
         with state_lock:
@@ -755,7 +762,8 @@ def api_close_position(symbol: str) -> Any:
         add_log(f"⚠️ {sym_short} manual close did not settle — state unchanged")
 
     if settled:
-        handle = _engine_attr("handle_trade_close", "orders")
+        # REV 1.5.0 — handle_trade_close lives in orders.exit
+        handle = _engine_attr("handle_trade_close", "orders.exit", "orders")
         if callable(handle):
             try:
                 handle(sym_short, pair, reason="MANUAL_UI")
@@ -999,8 +1007,8 @@ def api_history() -> Response:
     trades_summary: list[dict] = []
     analytics_summary: dict = {}
     if analytics_snap is not None:
-        trades_summary = analytics_snap.get("trades", []) or []
-        analytics_summary = analytics_snap.get("summary", {}) or {}
+        trades_summary = analytics_snap.get("trades") or []
+        analytics_summary = analytics_snap.get("summary") or {}
 
     return jsonify({
         "income_history": income_history,
@@ -1055,19 +1063,30 @@ def _is_buyer(t: dict) -> bool:
 
 @app.route("/api/history/detailed")
 def api_history_detailed() -> Response:
-    """Raw fills + orders (served from analytics; legacy fallback)."""
+    """
+    Raw fills + orders (served from analytics; legacy fallback).
+
+    REV 1.5.0 — all analytics snapshot reads use .get() so a shape
+    change in analytics.py cannot 500 this endpoint.
+    """
     try:
         from web import analytics
-        snap = analytics.snapshot()
-        if snap["fills"]:
+        snap = analytics.snapshot() or {}
+        snap_fills = snap.get("fills") or []
+        snap_orders = snap.get("orders") or []
+        if snap_fills:
             return jsonify({
-                "trades": snap["fills"],
-                "orders": snap["orders"],
-                "total_pnl": sum(f["realizedPnl"] for f in snap["fills"]),
-                "total_commission": sum(f["commission"] for f in snap["fills"]),
-                "total_count": len(snap["fills"]),
-                "orders_count": len(snap["orders"]),
-                "last_refresh_ms": snap["last_refresh_ms"],
+                "trades": snap_fills,
+                "orders": snap_orders,
+                "total_pnl": sum(
+                    float(f.get("realizedPnl", 0) or 0) for f in snap_fills
+                ),
+                "total_commission": sum(
+                    float(f.get("commission", 0) or 0) for f in snap_fills
+                ),
+                "total_count": len(snap_fills),
+                "orders_count": len(snap_orders),
+                "last_refresh_ms": snap.get("last_refresh_ms"),
                 "source": "analytics",
             })
     except Exception as e:
@@ -1147,7 +1166,12 @@ def api_history_detailed() -> Response:
 # ANALYTICS ROUTES
 # ─────────────────────────────────────────────────────────────
 def _analytics_payload() -> dict[str, Any]:
-    """Common shape for all analytics routes — includes cache status."""
+    """
+    Common shape for all analytics routes — includes cache status.
+
+    REV 1.5.0 — defensive .get() reads on the snapshot dict so a
+    shape change in analytics.py cannot 500 these endpoints.
+    """
     try:
         from web import analytics
     except ImportError:
@@ -1157,15 +1181,15 @@ def _analytics_payload() -> dict[str, Any]:
             "items": [],
             "cache": {},
         }
-    snap = analytics.snapshot()
+    snap = analytics.snapshot() or {}
     return {
         "success": True,
         "cache": {
-            "last_refresh_ms": snap["last_refresh_ms"],
-            "in_progress": snap["refresh_in_progress"],
-            "last_error": snap["last_error"],
+            "last_refresh_ms": snap.get("last_refresh_ms"),
+            "in_progress": snap.get("refresh_in_progress", False),
+            "last_error": snap.get("last_error"),
         },
-        "summary": snap["summary"],
+        "summary": snap.get("summary", {}),
         "snapshot": snap,
     }
 
@@ -1175,7 +1199,7 @@ def api_analytics_trades() -> Response:
     payload = _analytics_payload()
     if not payload["success"]:
         return jsonify(payload), 503
-    payload["items"] = payload["snapshot"]["trades"]
+    payload["items"] = payload["snapshot"].get("trades", [])
     payload.pop("snapshot", None)
     return jsonify(payload)
 
@@ -1185,7 +1209,7 @@ def api_analytics_fills() -> Response:
     payload = _analytics_payload()
     if not payload["success"]:
         return jsonify(payload), 503
-    payload["items"] = payload["snapshot"]["fills"]
+    payload["items"] = payload["snapshot"].get("fills", [])
     payload.pop("snapshot", None)
     return jsonify(payload)
 
@@ -1195,7 +1219,7 @@ def api_analytics_orders() -> Response:
     payload = _analytics_payload()
     if not payload["success"]:
         return jsonify(payload), 503
-    payload["items"] = payload["snapshot"]["orders"]
+    payload["items"] = payload["snapshot"].get("orders", [])
     payload.pop("snapshot", None)
     return jsonify(payload)
 
@@ -1205,7 +1229,7 @@ def api_analytics_income() -> Response:
     payload = _analytics_payload()
     if not payload["success"]:
         return jsonify(payload), 503
-    payload["items"] = payload["snapshot"]["income"]
+    payload["items"] = payload["snapshot"].get("income", [])
     payload.pop("snapshot", None)
     return jsonify(payload)
 
@@ -1302,7 +1326,7 @@ def api_time_exit_set() -> Any:
     Body:
         {
           "enabled": true|false,       # required
-          "hold_minutes": 180          # optional (int >= 0)
+          "hold_minutes": 180          # optional, 0–1440 (24 h)
         }
 
     Response:
@@ -1311,6 +1335,8 @@ def api_time_exit_set() -> Any:
           "time_exit_enabled": bool,
           "hold_minutes": int
         }
+
+    REV 1.5.0 — hold_minutes bounded to [0, _MAX_HOLD_MINUTES].
     """
     try:
         from core import config_center as cc
@@ -1326,11 +1352,16 @@ def api_time_exit_set() -> Any:
     if "hold_minutes" in data:
         try:
             hm = int(data["hold_minutes"])
-            if hm < 0:
-                return api_error("hold_minutes must be >= 0", 400)
-            updates["hold_minutes"] = hm
         except (ValueError, TypeError):
             return api_error("invalid hold_minutes", 400)
+        if hm < 0:
+            return api_error("hold_minutes must be >= 0", 400)
+        if hm > _MAX_HOLD_MINUTES:
+            return api_error(
+                f"hold_minutes must be <= {_MAX_HOLD_MINUTES} (24 h)",
+                400,
+            )
+        updates["hold_minutes"] = hm
 
     if not updates:
         return api_error("no valid fields (enabled / hold_minutes)", 400)
@@ -1379,7 +1410,8 @@ def api_health() -> Response:
         "running": running,
         "analytics": analytics_ok,
         "decision_engine": decision_ok,
-        "timestamp": datetime.now().isoformat(),
+        # REV 1.5.0 — tz-aware UTC timestamp (was naive local)
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
 

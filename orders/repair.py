@@ -1,52 +1,28 @@
 """
 orders/repair.py — Reconciliation and order repair.
 
-REV 1.6.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
-  ✅ `_PER_CLASS_CFG` removed (was duplicated from utils). Now reads
-     directly from `core.config_center.VOL_CLASS_R_THRESHOLDS`.
-     Same structure — zero behaviour change.
+REV 1.6.1 (2026-10-03) — TP QTY NORMALIZATION FIX:
+  ✅ FIXED: _repair_tps_if_missing() had an unhandled edge case —
+     when TP1 qty < min_qty AND TP2 qty >= min_qty, neither of the
+     two guards fired, so TP1 was submitted below minQty and the
+     exchange rejected it with -1013 / -4005. Now uses a
+     _normalize_tp_qtys() helper that:
+       • absorbs sub-minQty TP2 into TP1
+       • bumps sub-minQty TP1 to minQty when TP2 is zero
+       • merges TP1+TP2 into a single TP when TP1 is below minQty
+     Same behavior as before for all previously-working cases.
+  ✅ Moved `BOT_CONDITIONAL_TYPES` import from a lazy inside-function
+     import to the top-level imports (no functional change, just
+     removes a per-call import lookup).
+  ✅ cancel_all_sl_stops: appended a clarifying comment on the
+     "STOP not in otype" filter — empty type is treated as a
+     positive match (algo endpoint only returns SL/TP), which is
+     the same policy as before.
 
-REV 1.5.3 (2026-09-30) — CRITICAL FIX Bug #4 (algoId vs orderId):
-  ✅ cancel_all_sl_stops() now checks BOTH algoId AND orderId
-     against except_ids.
-
-     Why this matters: manage.py uses SL-first ordering (place new
-     SL → cancel old). It calls cancel_all_sl_stops(except_ids=[new_id])
-     with the ID returned by the SL placement. Binance can return
-     different algoId vs orderId for the same order, so an except_set
-     containing only one field would fail to match the other — and
-     the just-placed new SL would be cancelled by the same sweep,
-     leaving the position NAKED.
-
-     Previous code: `oid = o.get('algoId') or o.get('orderId')` — a
-     single check. New code checks both fields independently.
-
-REV 1.5.2 (2026-09-28) — DEAD IMPORT CLEANUP:
-  ✅ Removed two unused imports (zero behaviour change):
-       • `fetch_position_raw` (from .client) — the module only
-         uses `_position_amt()` and direct
-         `client.futures_position_information()` calls; the helper
-         was never referenced.
-       • `from core.config import CONFIG`         — every config value
-         (tp1_qty) comes via indicators.get_trading_config().
-
-REV 1.5.1 (2026-09-28) — DICT COPY + EXCEPT-IDS PARAM:
-  ✅ P1 Bug #5: get_active_trade() returns the LIVE dict reference
-     from state.active_trades. Both _repair_tps_if_missing() and
-     reconcile_active_trade() were mutating it directly without
-     re-acquiring the state lock, exposing a race where the scan
-     thread could observe a half-updated trade (e.g. sl_level=1
-     but tp1_crossed not yet set). Now we work on a shallow copy
-     `dict(get_active_trade(symbol) or {})` and persist atomically
-     via add_active_trade().
-  ✅ cancel_all_sl_stops() now accepts `except_ids` — a list/set of
-     order IDs to SKIP. Used by manage.py's new SL-first ordering:
-     we place the new SL BEFORE cancelling the old one, then call
-     cancel_all_sl_stops(except_ids=[new_id]). Without this, the
-     new SL was itself cancelled by the same sweep (it's a
-     STOP_MARKET reduceOnly order, indistinguishable from the old).
-     Backward compatible — default None means "cancel everything".
-
+REV 1.6.0 (2026-10-02) — UNIFIED CONFIG CLEANUP.
+REV 1.5.3 (2026-09-30) — CRITICAL FIX Bug #4 (algoId vs orderId).
+REV 1.5.2 (2026-09-28) — DEAD IMPORT CLEANUP.
+REV 1.5.1 (2026-09-28) — DICT COPY + EXCEPT-IDS PARAM.
 REV 1.5.0 (2026-09-28) — SPLIT + P0 FIXES.
 """
 from __future__ import annotations
@@ -76,7 +52,51 @@ from core.config_center import (
 from .utils import (
     _cl, _get_risk_unit, _pick_real_sl,
     _derive_sl_level, _vol_class, _RECONCILE_SKIP_FRESH_SEC,
+    BOT_CONDITIONAL_TYPES,   # REV 1.6.1 — hoisted from lazy import
 )
+
+
+# ═════════════════════════════════════════════════════════════
+#  REV 1.6.1 — TP QTY NORMALIZATION
+#  Ensures both TP quantities are valid for exchange placement,
+#  given the step/min constraints. Called AFTER the stored-qty
+#  scaling and ratio computation, BEFORE string formatting.
+# ═════════════════════════════════════════════════════════════
+def _normalize_tp_qtys(qty_tp1: Decimal, qty_tp2: Decimal,
+                       min_qty: Decimal, step: Decimal
+                       ) -> tuple[Decimal, Decimal]:
+    """
+    Normalize TP1/TP2 quantities so both are either 0 or >= min_qty.
+
+    Rules (in order):
+      1. TP2 in (0, min_qty)      → absorb into TP1, TP2 = 0.
+      2. TP1 in (0, min_qty) and TP2 == 0  → bump TP1 to min_qty.
+      3. TP1 in (0, min_qty) and TP2 >= min_qty → merge TP1+TP2
+         into single TP (TP1 = floor((TP1+TP2)/step)*step, TP2 = 0).
+
+    Returns (qty_tp1, qty_tp2), both step-aligned.
+    """
+    zero = Decimal('0')
+
+    # Rule 1
+    if zero < qty_tp2 < min_qty:
+        qty_tp1 = qty_tp1 + qty_tp2
+        qty_tp2 = zero
+
+    # Rule 2 & 3 (mutually exclusive by TP2 state)
+    if zero < qty_tp1 < min_qty:
+        if qty_tp2 <= zero:
+            # Rule 2 — nothing to merge; just raise TP1 to min.
+            qty_tp1 = min_qty
+        else:
+            # Rule 3 — merge into single TP.
+            combined = qty_tp1 + qty_tp2
+            qty_tp1 = (combined // step) * step
+            if qty_tp1 < min_qty:
+                qty_tp1 = min_qty
+            qty_tp2 = zero
+
+    return qty_tp1, qty_tp2
 
 
 # ═════════════════════════════════════════════════════════════
@@ -121,12 +141,16 @@ def cancel_all_sl_stops(pair, except_ids=None):
     manage.py's SL-first ordering so the just-placed new SL isn't
     swept up by this same call.
 
-    REV 1.5.3 — Bug #4 fix: the algo-orders loop now checks BOTH
-    algoId AND orderId against except_ids. Binance can return
-    different IDs for the same order on different endpoints, and
-    failing to match either field meant the just-placed new SL
-    could be cancelled by the same sweep, leaving the position
-    unprotected.
+    REV 1.5.3 — Bug #4 fix: the algo-orders loop checks BOTH algoId
+    AND orderId against except_ids. Binance can return different IDs
+    for the same order on different endpoints, and failing to match
+    either field meant the just-placed new SL could be cancelled by
+    the same sweep, leaving the position unprotected.
+
+    REV 1.6.1 — the `'STOP' in otype` filter intentionally treats an
+    empty type as a positive match, because the algo endpoint only
+    returns protective orders (SL/TP). Empty type ≠ "unknown order
+    type"; it means the algo response schema didn't carry the field.
     """
     client = _cl()
     if client is None:
@@ -262,11 +286,10 @@ def _repair_tps_if_missing(symbol, pair, is_long, cur_amt):
         qty_tp1_dec = (cur_qty_dec * tp1_ratio // step) * step
         qty_tp2_dec = cur_qty_dec - qty_tp1_dec
 
-    if Decimal('0') < qty_tp2_dec < min_qty:
-        qty_tp1_dec = qty_tp1_dec + qty_tp2_dec
-        qty_tp2_dec = Decimal('0')
-    if Decimal('0') < qty_tp1_dec < min_qty and qty_tp2_dec <= 0:
-        qty_tp1_dec = min_qty
+    # REV 1.6.1 — single normalization pass (fixes TP1<minQty + TP2>=minQty)
+    qty_tp1_dec, qty_tp2_dec = _normalize_tp_qtys(
+        qty_tp1_dec, qty_tp2_dec, min_qty, step
+    )
 
     qty_tp1 = format(qty_tp1_dec, f'.{prec}f') if qty_tp1_dec > 0 else '0'
     qty_tp2 = format(qty_tp2_dec, f'.{prec}f') if qty_tp2_dec > 0 else '0'
@@ -532,7 +555,6 @@ def reconcile_active_trade(symbol):
 #  Orphan cancel
 # ═════════════════════════════════════════════════════════════
 def cancel_orphan_bot_orders(symbol_pair, force=False):
-    from .utils import BOT_CONDITIONAL_TYPES
     client = _cl()
     if client is None:
         return 0

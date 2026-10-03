@@ -1,18 +1,20 @@
 """
 orders/entry.py — Order placement.
 
+REV 1.8.1 (2026-10-03) — ZERO-COERCION FIX:
+  ✅ FIXED: `_cc_get(k, d) or d` idiom silently coerced legitimate 0
+     values back to defaults. The critical case is `rr_collapse_tol`
+     (validation allows ≥0): setting CC_RR_COLLAPSE_TOL=0 silently
+     became 0.02, defeating the "exact RR check" intent.
+     Replaced all instances with _cc_get_num() helper (explicit
+     None-check, preserves 0). Matches orders/exit.py REV 1.6.1.
+  ✅ Zero behaviour change for default values.
+
 REV 1.8.0 (2026-10-02) — RUNTIME TOGGLE AWARENESS:
   ✅ Removed cached imports LEVERAGE, RISK_PERCENT, MAX_OPEN_POSITIONS,
-     MAX_TOTAL_MARGIN_PCT from .utils. All now read LIVE via _cc_get()
-     so UI runtime changes take effect immediately.
-  ✅ _VOL_CLASS_QTY_MULT module dict → config_center.VOL_CLASS_QTY_MULT
-     (single source). Read live at sizing time.
-  ✅ Promoted 7 hardcoded scalars to config_center (REV 5.3):
-     margin_buffer_pct, counter_trend_size_mult,
-     min_notional_bump_mult, corrected_qty_close_ratio,
-     sl_tight_ratio, sl_wide_ratio, risk_oversize_warn_mult,
-     rr_collapse_tol.
-  ✅ Zero behaviour change for default values.
+     MAX_TOTAL_MARGIN_PCT from .utils. All now read LIVE via _cc_get().
+  ✅ _VOL_CLASS_QTY_MULT module dict → config_center.VOL_CLASS_QTY_MULT.
+  ✅ Promoted 7 hardcoded scalars to config_center (REV 5.3).
 
 REV 1.7.3 (2026-10-02) — COSMETIC CLEANUP.
 REV 1.7.2 (2026-10-02) — PHASE 2 CLEANUP.
@@ -48,6 +50,7 @@ from .exit import emergency_close_retry, handle_trade_close
 
 # ── REV 1.7.0 — Centralized config (single source of truth) ──
 # ── REV 1.8.0 — _cc_get() for LIVE runtime-tunable reads ──
+# ── REV 1.8.1 — _cc_get_num() to preserve 0 values ──
 from core.config_center import get_config as _get_central_config
 from core.config_center import get_min_rr as _get_min_rr_central
 from core.config_center import get as _cc_get
@@ -58,6 +61,17 @@ try:
     from signals.decision_engine import COUNTER_TREND_STRATEGIES as _CT_STRATS
 except Exception:
     _CT_STRATS = frozenset()
+
+
+# ═════════════════════════════════════════════════════════════
+#  REV 1.8.1 — SAFE CC NUMERIC READ
+#  `_cc_get(k, d) or d` coerced legitimate 0 to default. This
+#  helper preserves 0 while still returning `default` when the key
+#  is genuinely absent (None). Mirrors orders/exit.py REV 1.6.1.
+# ═════════════════════════════════════════════════════════════
+def _cc_get_num(key: str, default):
+    v = _cc_get(key, None)
+    return default if v is None else v
 
 
 def _apply_vol_class_sizing(symbol: str, qty_dec: Decimal, step: Decimal, min_qty: Decimal) -> Decimal:
@@ -90,8 +104,8 @@ def _apply_vol_class_sizing(symbol: str, qty_dec: Decimal, step: Decimal, min_qt
 def _apply_counter_trend_sizing(symbol: str, strategy: str, qty_dec: Decimal, step: Decimal, min_qty: Decimal) -> Decimal:
     """REV 1.5.3 / 1.5.9 — scale down qty for counter-trend strategies.
 
-    REV 1.8.0 — multiplier now read LIVE from config_center
-    (`counter_trend_size_mult`, default 0.60).
+    REV 1.8.0 — multiplier now read LIVE from config_center.
+    REV 1.8.1 — 0-preserving read.
     """
     if not _CT_STRATS:
         return qty_dec
@@ -106,7 +120,7 @@ def _apply_counter_trend_sizing(symbol: str, strategy: str, qty_dec: Decimal, st
         return qty_dec
 
     try:
-        _mult_f = float(_cc_get("counter_trend_size_mult", 0.60) or 0.60)
+        _mult_f = float(_cc_get_num("counter_trend_size_mult", 0.60))
         mult = Decimal(str(_mult_f))
         scaled = qty_dec * mult
         scaled = (scaled // step) * step
@@ -124,9 +138,10 @@ def _apply_counter_trend_sizing(symbol: str, strategy: str, qty_dec: Decimal, st
 def _snapshot_regime(symbol: str, strategy: str) -> tuple[str, int]:
     """
     REV 1.7.0 — Capture regime + hold time at entry time.
+    REV 1.8.1 — 0-preserving hold_minutes read.
     """
     _regime_now = 'UNKNOWN'
-    _hold_min = int(_cc_get('hold_minutes', 180) or 180)
+    _hold_min = int(_cc_get_num('hold_minutes', 180))
     try:
         from market.indicators import get_cached_indicator
         _ind_1h = get_cached_indicator(symbol + 'USDT', '1h')
@@ -179,13 +194,13 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
         return True
 
     # ═══════════════════════════════════════════════════════════
-    #  REV 1.8.0 — LIVE config reads (runtime-tunable)
+    #  REV 1.8.0 / 1.8.1 — LIVE config reads, 0-preserving
     # ═══════════════════════════════════════════════════════════
-    _leverage            = int(_cc_get("leverage", 5) or 5)
-    _risk_percent        = float(_cc_get("risk_percent", 0.5) or 0.5)
-    _max_open            = int(_cc_get("max_open_positions", 3) or 3)
-    _max_total_margin    = float(_cc_get("max_total_margin_pct", 0.60) or 0.60)
-    _margin_buffer_pct   = float(_cc_get("margin_buffer_pct", 0.80) or 0.80)
+    _leverage            = int(_cc_get_num("leverage", 5))
+    _risk_percent        = float(_cc_get_num("risk_percent", 0.5))
+    _max_open            = int(_cc_get_num("max_open_positions", 3))
+    _max_total_margin    = float(_cc_get_num("max_total_margin_pct", 0.60))
+    _margin_buffer_pct   = float(_cc_get_num("margin_buffer_pct", 0.80))
 
     # ═══════════════════════════════════════════════════════════
     #  REV 1.7.0 / 1.7.2 — SIGNAL DRIFT CAP (from config_center)
@@ -353,7 +368,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
 
         if notional < min_notional:
             _pre_bump_qty = qty_dec
-            _bump_mult = float(_cc_get("min_notional_bump_mult", 1.02) or 1.02)
+            _bump_mult = float(_cc_get_num("min_notional_bump_mult", 1.02))
             logger.warning(f"Notional {notional:.2f} < min {min_notional}, increasing qty")
             qty_dec = Decimal(str(min_notional / entry_price_est * _bump_mult))
             qty_dec = (qty_dec // step) * step
@@ -558,8 +573,8 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 logger.warning(f"handle_trade_close CROSSED_SL failed: {htce}")
             return False
 
-        # ── REV 1.8.0 — LIVE ratios for SL sanity fixes ──
-        _sl_tight_ratio = float(_cc_get("sl_tight_ratio", 0.70) or 0.70)
+        # ── REV 1.8.0 / 1.8.1 — LIVE ratios for SL sanity fixes ──
+        _sl_tight_ratio = float(_cc_get_num("sl_tight_ratio", 0.70))
 
         if actual_dist_post < min_dist_post * _sl_tight_ratio:
             logger.warning(f"[{symbol}] SL too tight after fill (dist {actual_dist_post:.6f} < {min_dist_post:.6f}), widening")
@@ -604,7 +619,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             except Exception as fix_t:
                 logger.error(f"Tight branch fix failed: {fix_t}", exc_info=True)
 
-        elif intended_dist > 0 and actual_dist_post > intended_dist * float(_cc_get("sl_wide_ratio", 1.05) or 1.05):
+        elif intended_dist > 0 and actual_dist_post > intended_dist * float(_cc_get_num("sl_wide_ratio", 1.05)):
             risk_multiplier = actual_dist_post / intended_dist
             logger.warning(f"[{symbol}] SL widened vs intended (actual {actual_dist_post:.6f} vs intended {intended_dist:.6f}) - real risk {risk_multiplier:.2f}x")
             try: send_telegram(f"⚠️ {symbol} slippage: SL wider than intended, risk {risk_multiplier:.2f}x\nEntry {entry_price:.4f} SL {sl_price_f:.4f}")
@@ -624,7 +639,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
                 corrected_qty_dec = Decimal(str(risk_amount / actual_dist_post)) if actual_dist_post > 0 else qty_dec
                 corrected_qty_dec = (corrected_qty_dec // f['stepSize']) * f['stepSize']
                 if corrected_qty_dec < f['minQty']: corrected_qty_dec = f['minQty']
-                _close_ratio = Decimal(str(_cc_get("corrected_qty_close_ratio", 0.50) or 0.50))
+                _close_ratio = Decimal(str(_cc_get_num("corrected_qty_close_ratio", 0.50)))
                 if corrected_qty_dec < (qty_dec * _close_ratio):
                     logger.critical(f"[{symbol}] Corrected qty {corrected_qty_dec} < 50% of {qty_dec} - closing position to prevent huge loss")
                     try:
@@ -692,11 +707,12 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
 
         # ── REV 1.5.10 — RR RE-CHECK AFTER CAPS ──
         # ── REV 1.8.0 — Live tol from config_center ──
+        # ── REV 1.8.1 — 0 preserved (was silently coerced to 0.02) ──
         _risk_final = abs(entry_price - float(sl_price))
         _reward_final = abs(float(tp1_price) - entry_price)
         _rr_final = (_reward_final / _risk_final) if _risk_final > 0 else 0.0
         _min_rr = _get_min_rr_central(strategy)
-        _RR_COLLAPSE_TOL = float(_cc_get("rr_collapse_tol", 0.02) or 0.02)
+        _RR_COLLAPSE_TOL = float(_cc_get_num("rr_collapse_tol", 0.02))
 
         logger.info(f"[{symbol}] RR check: signal_rr={rr:.2f} → placed_rr={_rr_final:.3f} (min {_min_rr:.2f}, tol {_RR_COLLAPSE_TOL}) [strategy={strategy}] | caps sl={_caps['sl']:.4f} tp1={_caps['tp1']:.4f} tp2={_caps['tp2']:.4f} | tp1 {_tp1_before_cap:.6f}→{float(tp1_price):.6f} tp2 {_tp2_before_cap:.6f}→{float(tp2_price):.6f}")
 
@@ -729,7 +745,7 @@ def place_order_fixed(symbol, side, quantity, sl_price, tp1_price, tp2_price,
             _final_risk_usd = float(qty_dec) * abs(entry_price - float(sl_price))
             _final_risk_pct = ((_final_risk_usd / wallet_balance * 100.0) if wallet_balance > 0 else 0.0)
             _target_risk_pct = _risk_percent
-            _oversize_mult = float(_cc_get("risk_oversize_warn_mult", 1.20) or 1.20)
+            _oversize_mult = float(_cc_get_num("risk_oversize_warn_mult", 1.20))
             logger.info(f"[{symbol}] RISK CHECK: actual {_final_risk_pct:.3f}% (target {_target_risk_pct:.3f}%) | qty={qty_dec} dist={abs(entry_price - float(sl_price)):.6f} strategy={strategy}")
             if _final_risk_pct > _target_risk_pct * _oversize_mult:
                 logger.warning(f"[{symbol}] RISK OVER-SIZE: {_final_risk_pct:.3f}% > {_target_risk_pct * _oversize_mult:.3f}% (compound-scaling issue? qty={qty_dec})")

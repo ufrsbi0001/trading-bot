@@ -1,17 +1,32 @@
 """
 decision_engine.py — Multi-filter trade approval layer.
 
+REV 4.3 (2026-10-03) — CORRECTNESS HARDENING:
+  ✅ _check_and_pause_strategy() now bounds loss-streak lookback to a
+     24 h window. Previously ANY 4 consecutive losses for a strategy
+     triggered a pause, even if they were spread over days/weeks —
+     causing spurious "strategy paused" states that blocked entries
+     long after the losing regime had passed.
+  ✅ _dec_get() now uses an explicit _UNSET sentinel so callers can
+     pass `default=None` and receive None (was silently substituted
+     with _DEFAULT_DECISION[key]). Zero behaviour change for existing
+     callers (all pass non-None defaults or nothing).
+  ✅ get_btc_regime() preserves explicit TTL=0 as "never expire"
+     (was coerced to 600 by `or 600`).
+  ✅ evaluate_trade() captures the BTC regime snapshot ONCE before
+     logging the reject message (was called twice — small TTL race).
+  ✅ DecisionScore.total_filters class default removed (was 6 —
+     misleading since the instance always sets it from config).
+  ✅ _UNSET sentinel + _LOSS_STREAK_WINDOW_SEC documented at module
+     top so future maintainers know the intent.
+
 REV 4.2 (2026-10-02) — LIVE CONFIG READS:
   ✅ Removed module-level caching of config values. All decision-engine
-     config now read LIVE from config_center on each call, so
-     `update_runtime()` takes effect immediately (no restart).
-  ✅ Removed dead `from core.config import CONFIG` import — the comment
-     claimed it was "needed for MTF flag + same-side cap", but both were
-     already migrated to `CC.get(...)`.
-  ✅ Removed dead `_DEC` module-level dict — replaced with `_dec_get()`
-     helper that reads fresh on every call.
+     config now read LIVE from config_center on each call.
+  ✅ Removed dead `from core.config import CONFIG` import.
+  ✅ Removed dead `_DEC` module-level dict — replaced with `_dec_get()`.
   ✅ Fallback path now uses `logger.warning` instead of `print()`.
-  ✅ `total_filters` moved to instance-level (was class default).
+  ✅ `total_filters` moved to instance-level.
 
 REV 4.1 (2026-10-02) — PHASE 1 CLEANUP:
   ✅ COUNTER_TREND_STRATEGIES now imported from core/config_center.py.
@@ -46,6 +61,19 @@ except Exception as _ct_err:
 
 
 # ═════════════════════════════════════════════════════════════
+#  MODULE CONSTANTS
+# ═════════════════════════════════════════════════════════════
+# Sentinel to distinguish "caller didn't pass a default" from
+# "caller explicitly passed None".
+_UNSET = object()
+
+# Only count losses within this window when deciding whether to pause
+# a strategy. Prevents ancient losses (from a different regime) from
+# triggering a spurious pause.
+_LOSS_STREAK_WINDOW_SEC = 24 * 3600  # 24 h
+
+
+# ═════════════════════════════════════════════════════════════
 #  REV 4.2 — LIVE CONFIG HELPERS
 #  Read fresh on every call so update_runtime() takes effect
 #  immediately. Falls back to safe defaults only in the
@@ -69,15 +97,23 @@ _DEFAULT_DECISION = {
 }
 
 
-def _dec_get(key: str, default=None):
-    """Live decision config read (fresh each call)."""
+def _dec_get(key: str, default=_UNSET):
+    """
+    Live decision config read (fresh each call).
+
+    REV 4.3 — sentinel-based default. Semantics:
+      • key present in DECISION (non-None)      → return it
+      • key absent + explicit default passed    → return default
+        (default=None means "return None", not "use _DEFAULT_DECISION")
+      • key absent + no default passed          → use _DEFAULT_DECISION
+    """
     try:
         val = CC.get_decision_cfg().get(key)
         if val is not None:
             return val
     except Exception:
         pass
-    if default is not None:
+    if default is not _UNSET:
         return default
     return _DEFAULT_DECISION.get(key)
 
@@ -118,15 +154,18 @@ def set_btc_regime(regime: str) -> None:
 
 
 def get_btc_regime() -> str:
-    """Returns cached BTC regime, or UNKNOWN if stale.
+    """
+    Returns cached BTC regime, or UNKNOWN if stale.
 
     REV 4.2 — TTL read LIVE from config_center each call.
+    REV 4.3 — TTL=0 preserved as "never expire" (was coerced to 600).
     """
-    _ttl = float(_dec_get("btc_regime_ttl_sec", 600) or 600)
+    _ttl = float(_dec_get("btc_regime_ttl_sec", 600))
     with _btc_lock:
         if _btc_regime_ts <= 0:
             return "UNKNOWN"
-        if time.time() - _btc_regime_ts > _ttl:
+        # TTL <= 0 disables staleness check (regime stays until re-set).
+        if _ttl > 0 and time.time() - _btc_regime_ts > _ttl:
             return "UNKNOWN"
         return _btc_regime
 
@@ -163,12 +202,25 @@ def record_trade_result(strategy: str, pnl: float) -> None:
 
 
 def _check_and_pause_strategy(strategy: str) -> None:
+    """
+    Pause a strategy after N consecutive losses.
+
+    REV 4.3 — losses older than _LOSS_STREAK_WINDOW_SEC are ignored.
+    Without this window, 4 losses spread over days/weeks triggered a
+    pause even though the losing regime was long gone.
+    """
     if not strategy:
         return
-    _trigger = int(_dec_get("loss_streak_trigger", 4) or 4)
-    _cooldown = int(_dec_get("loss_streak_cooldown_min", 60) or 60)
+    _trigger = int(_dec_get("loss_streak_trigger", 4))
+    _cooldown = int(_dec_get("loss_streak_cooldown_min", 60))
+    cutoff = time.time() - _LOSS_STREAK_WINDOW_SEC
+
     with _recent_lock:
-        recent_same = [r for r in _recent_results if r["strategy"] == strategy]
+        recent_same = [
+            r for r in _recent_results
+            if r["strategy"] == strategy and r["ts"] >= cutoff
+        ]
+
     if len(recent_same) < _trigger:
         return
     last_n = recent_same[-_trigger:]
@@ -178,7 +230,8 @@ def _check_and_pause_strategy(strategy: str) -> None:
             _strategy_pauses[strategy] = pause_until
         logger.warning(
             f"[decision] {strategy} paused for {_cooldown}m "
-            f"after {_trigger} consecutive losses"
+            f"after {_trigger} consecutive losses "
+            f"(within {_LOSS_STREAK_WINDOW_SEC // 3600}h)"
         )
 
 
@@ -208,9 +261,9 @@ def get_strategy_multiplier(strategy: str) -> float:
     """
     if not strategy:
         return 1.0
-    _min = float(_dec_get("wr_mult_min", 0.85) or 0.85)
-    _max = float(_dec_get("wr_mult_max", 1.10) or 1.10)
-    _min_trades = int(_dec_get("wr_mult_min_trades", 15) or 15)
+    _min = float(_dec_get("wr_mult_min", 0.85))
+    _max = float(_dec_get("wr_mult_max", 1.10))
+    _min_trades = int(_dec_get("wr_mult_min_trades", 15))
     try:
         with _recent_lock:
             rows = [r for r in _recent_results if r["strategy"] == strategy]
@@ -231,8 +284,8 @@ def _filter_trend_strength(side: str, strategy: str, ind_1h: dict):
     adx = float(ind_1h.get("adx", 0) or 0)
     if not is_counter:
         return True, f"trend-following adx={adx:.0f}"
-    _hard = float(_dec_get("adx_counter_trend_hard_max", 45.0) or 45.0)
-    _soft = float(_dec_get("adx_counter_trend_soft_max", 35.0) or 35.0)
+    _hard = float(_dec_get("adx_counter_trend_hard_max", 45.0))
+    _soft = float(_dec_get("adx_counter_trend_soft_max", 35.0))
     if adx > _hard:
         return False, f"counter-trend adx={adx:.0f}>{_hard:.0f}"
     if adx > _soft:
@@ -326,7 +379,7 @@ def _filter_correlation(side: str, active_trades: list):
     """
     if not active_trades:
         return True, "no_positions"
-    _max_ss = int(_global_get("max_same_side_positions", 2) or 2)
+    _max_ss = int(_global_get("max_same_side_positions", 2))
     same_side = sum(
         1 for t in active_trades
         if (side == "BUY" and t.get("side") == "LONG")
@@ -353,7 +406,7 @@ def _filter_volatility(ind_1h: dict):
         atr_ratio = float(ind_1h.get("atr_ratio", 1.0) or 1.0)
     except (TypeError, ValueError):
         return True, "atr_parse_fail"
-    _extreme = float(_dec_get("atr_ratio_extreme", 2.5) or 2.5)
+    _extreme = float(_dec_get("atr_ratio_extreme", 2.5))
     if atr_ratio > _extreme:
         return False, f"atr_{atr_ratio:.2f}x>={_extreme}"
     return True, f"atr_{atr_ratio:.2f}x"
@@ -364,7 +417,8 @@ def _filter_volatility(ind_1h: dict):
 #  REV 4.0 — 3 modes support (full | high_risk_only | disabled)
 #  REV 4.2 — all reads LIVE from config_center each call
 # ═════════════════════════════════════════════════════════════
-def _btc_bias_blocks(side: str, symbol: str = "") -> Optional[str]:
+def _btc_bias_blocks(side: str, symbol: str = "",
+                     regime: Optional[str] = None) -> Optional[str]:
     """
     BTC bias gate with 3 modes.
 
@@ -373,6 +427,9 @@ def _btc_bias_blocks(side: str, symbol: str = "") -> Optional[str]:
       • "high_risk_only" → sirf high-risk meme coins block
       • "full"           → har TREND_UP mein SHORT block,
                             TREND_DOWN mein LONG block
+
+    `regime` param (REV 4.3): optional pre-fetched BTC regime so the
+    caller can avoid a second get_btc_regime() call for logging.
 
     Returns rejection reason string, or None if allowed.
     """
@@ -398,10 +455,10 @@ def _btc_bias_blocks(side: str, symbol: str = "") -> Optional[str]:
             return None
 
     # Full mode or high-risk coin → check regime
-    regime = get_btc_regime()
-    if regime == "TREND_UP" and side == "SELL":
+    regime_now = regime if regime is not None else get_btc_regime()
+    if regime_now == "TREND_UP" and side == "SELL":
         return "BTC_TREND_UP_blocks_SHORT"
-    if regime == "TREND_DOWN" and side == "BUY":
+    if regime_now == "TREND_DOWN" and side == "BUY":
         return "BTC_TREND_DOWN_blocks_LONG"
     return None
 
@@ -413,7 +470,8 @@ def _btc_bias_blocks(side: str, symbol: str = "") -> Optional[str]:
 class DecisionScore:
     approved: bool = False
     approvals: int = 0
-    total_filters: int = 6
+    # REV 4.3 — default 0; instance always sets from live config.
+    total_filters: int = 0
     top_reason: str = ""
     reasons: list = field(default_factory=list)
     detail: dict = field(default_factory=dict)
@@ -448,12 +506,16 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
 
     REV 4.2 — All config values read LIVE from config_center, so
     update_runtime() takes effect on the very next call.
+    REV 4.3 — BTC regime captured ONCE per call.
     """
     # Live reads (fresh per call)
-    _min_approvals = int(_dec_get("min_approvals", 5) or 5)
-    _total_filters = int(_dec_get("total_filters", 6) or 6)
-    _max_ss = int(_global_get("max_same_side_positions", 2) or 2)
+    _min_approvals = int(_dec_get("min_approvals", 5))
+    _total_filters = int(_dec_get("total_filters", 6))
+    _max_ss = int(_global_get("max_same_side_positions", 2))
     _btc_mode = _dec_get("btc_bias_mode", "full")
+
+    # REV 4.3 — single snapshot for both gate check and reject log
+    _btc_regime_snapshot = get_btc_regime()
 
     result = DecisionScore()
     result.total_filters = _total_filters
@@ -462,7 +524,7 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
     # ═══════════════════════════════════════════════════════════
     #  HARD GATE #1 — BTC global bias
     # ═══════════════════════════════════════════════════════════
-    btc_reason = _btc_bias_blocks(side, symbol)
+    btc_reason = _btc_bias_blocks(side, symbol, regime=_btc_regime_snapshot)
     if btc_reason:
         result.approved = False
         result.approvals = 0
@@ -471,8 +533,8 @@ def evaluate_trade(symbol: str, side: str, ind_1h: dict, ind_4h: dict,
         result.detail["btc_bias"] = {"pass": False, "reason": btc_reason}
         logger.warning(
             f"[decision] 🚫 HARD REJECT {symbol} {side} [{strategy}] — "
-            f"BTC regime={get_btc_regime()} mode={_btc_mode} → {btc_reason} | "
-            f"conf={conf:.0f}% rr={rr:.2f}"
+            f"BTC regime={_btc_regime_snapshot} mode={_btc_mode} → "
+            f"{btc_reason} | conf={conf:.0f}% rr={rr:.2f}"
         )
         return result
 
@@ -561,6 +623,6 @@ def get_stats() -> dict:
         "paused_strategies": pauses,
         "btc_regime": get_btc_regime(),
         "btc_bias_mode": _dec_get("btc_bias_mode", "full"),
-        "min_approvals": int(_dec_get("min_approvals", 5) or 5),
-        "total_filters": int(_dec_get("total_filters", 6) or 6),
+        "min_approvals": int(_dec_get("min_approvals", 5)),
+        "total_filters": int(_dec_get("total_filters", 6)),
     }

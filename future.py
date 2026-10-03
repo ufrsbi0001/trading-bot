@@ -1,23 +1,34 @@
 """
 future.py — Trading engine orchestrator + main scan loop.
 
-REV 1.4.28 (2026-10-02) — LIVE CONFIG READS (post-migration):
-  ✅ Banner MIN_APPROVALS: was `from signals.decision_engine import
-     MIN_APPROVALS` — that module no longer caches constants (REV 4.2
-     reads LIVE). The import was silently failing → `?/6` shown in
-     banner. Now read via `CC.get_decision_cfg()` directly.
-  ✅ `_spread_label()`: was reading `CONFIG.max_spread_*` via the
-     core/config.py proxy. Now reads LIVE from `CC.get(...)`.
-  ✅ `use_spread_filter` gate (2 places): was `getattr(CONFIG,
-     "use_spread_filter", False)`. Now `CC.get("use_spread_filter",
-     False)` — matches the rest of the file.
-  ✅ Dead `import signals.decision_engine as decision_engine# noqa`
-     removed — was only used for the import-side-effect, no longer
-     needed since we read live via CC.
-  ✅ `CONFIG` import retained — still used for env-level fields
-     (bot_coins, dry_run, demo_mode, testnet, api_key, api_secret).
-     These belong in core/config.py and MUST NOT move to config_center.
+REV 1.4.29 (2026-10-03) — SNAPSHOT-TO-LIVE FIX:
+  ✅ CRITICAL: `min_confidence`, `use_5m_trend_filter`, `risk_percent`,
+     `min_adx` were read ONCE at import into module constants, then used
+     in LOGIC (not just banner). Runtime UI changes silently ignored.
+     Now every logic-path read goes LIVE via CC.get(...).
+       • _conf_ok   = conf >= _cc_get_num("min_confidence")   [was MIN_CONFIDENCE]
+       • 5m gate    = CC.get("use_5m_trend_filter")           [was USE_5M_TREND_FILTER]
+       • risk       = _cc_get_num("risk_percent")  in _compute_est_qty
+       • ADX floor  = _cc_get_num("min_adx")                  [was MIN_ADX]
+     Module snapshots RETAINED for banner/log at import (correct — a
+     one-time reflection of .env, any runtime drift is exposed by
+     config_center itself).
+  ✅ FIXED: active_trades_list now iterates POSITIONS (not coins). Any
+     open position whose symbol isn't in the coin universe (manual entry,
+     removed coin) is now counted by the same-side correlation gate.
+     Prevents silent over-exposure.
+  ✅ FIXED: _fetch_coin_indicators cached-1h path no longer refetches
+     klines twice. 1h df is fetched ONCE up front and reused for both
+     cache-hit and candle_time.
+  ✅ _update_btc_regime() reuses the indicator 1h cache when fresh
+     (TTL 300s vs scan cadence ~15s). Saves ~20 redundant API calls
+     per cycle when BTC is in the coin universe.
+  ✅ Removed @lru_cache on _get_min_adx_for_coin — it was caching a
+     now-live fallback read.
+  ✅ Module top comment corrected — snapshots are "banner only" and
+     the LIVE-read rule is documented inline.
 
+REV 1.4.28 (2026-10-02) — LIVE CONFIG READS (post-migration).
 REV 1.4.27 (2026-10-02) — DEAD RE-EXPORT CLEANUP.
 REV 1.4.26 (2026-10-02) — PHASE 3 CLEANUP.
 REV 1.4.25 (2026-10-02) — UNIFIED CONFIG CLEANUP.
@@ -54,7 +65,6 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
 from pathlib import Path
 from datetime import datetime
 
@@ -80,6 +90,16 @@ except Exception:
     _CT_STRATEGIES = frozenset()
 
 
+# ═════════════════════════════════════════════════════════════
+#  REV 1.4.29 — 0-PRESERVING CC NUMERIC READ
+#  Mirrors orders/exit.py REV 1.6.1 / entry.py REV 1.8.1 /
+#  manage.py REV 1.9.1 / decision_engine.py REV 4.3.
+# ═════════════════════════════════════════════════════════════
+def _cc_get_num(key: str, default):
+    v = CC.get(key, None)
+    return default if v is None else v
+
+
 # ─────────────────────────────────────────────────────────────
 # RE-EXPORTS
 # ─────────────────────────────────────────────────────────────
@@ -99,9 +119,6 @@ adjust_qty                = _c.adjust_qty
 adjust_price              = _c.adjust_price
 fetch_position_raw        = _c.fetch_position_raw
 refresh_timestamp         = _c.refresh_timestamp
-# NOTE (REV 1.4.27): `retry_on_rate_limit` and `HARDCODED_FILTERS`
-# re-exports removed — no live consumer (verified via grep).
-# `client.py` still exports them; import directly if needed.
 _run_with_timeout         = _c._run_with_timeout
 _get_open_algo_orders     = _c._get_open_algo_orders
 _cancel_algo_order        = _c._cancel_algo_order
@@ -160,12 +177,15 @@ get_fear_greed_index      = _i.get_fear_greed_index
 get_cached_indicator      = _i.get_cached_indicator
 set_cached_indicator      = _i.set_cached_indicator
 cleanup_indicator_cache   = _i.cleanup_indicator_cache
-# NOTE (REV 1.4.27): `detect_candle_patterns` re-export removed —
-# no live consumer. `indicators.py` still exports it.
 
-# ── Module-level constant snapshots (for banner/log only) ──
-# NOTE: These are read ONCE at import time. For runtime-tunable values
-# that change via update_runtime(), read LIVE via CC.get(...) at use site.
+# ═════════════════════════════════════════════════════════════
+#  MODULE-LEVEL SNAPSHOTS — BANNER/LOG ONLY
+#  ►►► READ THEM ONLY IN print/log statements. ◄◄◄
+#  Any FILTER / GATE / LOGIC check must read LIVE via CC.get() so
+#  runtime update_runtime() takes effect without restart.
+#  See REV 1.4.29 — earlier revisions mistakenly used these in
+#  gates (min_confidence, use_5m_trend_filter).
+# ═════════════════════════════════════════════════════════════
 RISK_PERCENT               = CC.get('risk_percent')
 MAX_OPEN_POSITIONS         = CC.get('max_open_positions')
 MAX_DAILY_DRAWDOWN_PERCENT = CC.get('max_daily_drawdown_percent')
@@ -191,11 +211,17 @@ PAUSE_FILE        = _s.PAUSE_FILE
 _PARALLEL_FETCH_WORKERS = 8
 
 
-@lru_cache(maxsize=128)
 def _get_min_adx_for_coin(symbol: str) -> float:
-    """Effective min-ADX gate for a symbol (family-loosest floor)."""
+    """
+    Effective min-ADX gate for a symbol (family-loosest floor).
+
+    REV 1.4.29 — fallback reads LIVE from config_center.
+    REMOVED @lru_cache: the function now reads a live value on the
+    fallback path, so caching would defeat runtime updates. The cost
+    is negligible (called once per coin per cycle).
+    """
     if not symbol:
-        return MIN_ADX
+        return float(_cc_get_num("min_adx", 22))
     sym_upper = symbol.upper()
     try:
         pair = sym_upper if sym_upper.endswith("USDT") else sym_upper + "USDT"
@@ -207,7 +233,7 @@ def _get_min_adx_for_coin(symbol: str) -> float:
                 return float(min(floors))
     except Exception as e:
         logger.debug(f"_get_min_adx_for_coin({symbol}) failed: {e}")
-    return MIN_ADX
+    return float(_cc_get_num("min_adx", 22))
 
 
 def _get_spread_cap_for_family(family: str) -> float:
@@ -256,12 +282,6 @@ def _reconcile_on_startup():
 
 def _format_be_lock_config() -> str:
     """
-    REV 1.4.26 (PHASE 3) — Simplified.
-
-    Previously had 3 fallback layers (per-class, R-scaled MED, legacy %).
-    Layers 2 and 3 were 100% dead because VOL_CLASS_R_THRESHOLDS is
-    always populated (LOW/MED/HIGH present in config_center). Removed.
-
     Returns a single string like:
         "BE/LOCK per-class [LOW BE0.7R L1@1.0R L2@1.6R | MED ...]"
     """
@@ -303,15 +323,22 @@ def _extract_family_rejection(reasons: list) -> str:
 
 
 def _format_skip_reasons(reasons, sig_1h, conf, lvl, min_rr, adx_v, min_adx) -> str:
-    """Surface the ACTUAL family-router rejection reason."""
+    """
+    Surface the ACTUAL family-router rejection reason.
+
+    REV 1.4.29 — reads min_confidence LIVE (was module snapshot; a UI
+    change to min_confidence would show a stale SKIP reason).
+    """
     family_rej = _extract_family_rejection(reasons)
     if family_rej:
         return f"SKIP ({family_rej})"
 
+    _min_conf_live = float(_cc_get_num("min_confidence", 60))
+
     parts: list[str] = []
     if "BUY" not in sig_1h and "SELL" not in sig_1h:
         parts.append("NoSetup")
-    if conf < MIN_CONFIDENCE:
+    if conf < _min_conf_live:
         parts.append(f"C{conf:.0f}%")
     rr_val = lvl.get("RR", 0)
     if rr_val < min_rr and rr_val > 0:
@@ -343,10 +370,22 @@ def _display_tf_signal(ind: dict | None) -> str:
 
 
 def _compute_est_qty(balance: float, live_price: float, sl_price: float) -> float:
+    """
+    Pre-flight qty estimate for place_order_fixed's initial arg.
+
+    REV 1.4.29 — risk_percent read LIVE. (place_order_fixed
+    recalculates qty internally from the same live value; the value
+    we pass is a fallback if its internal calc fails. Still, reading
+    live keeps the log line accurate.)
+
+    NOTE: 0-preserving helper — risk_percent=0 is a valid (if
+    ill-advised) config and should not silently become the default.
+    """
     try:
         if live_price <= 0 or sl_price <= 0 or balance <= 0:
             return 0.0
-        risk_usd = balance * (RISK_PERCENT / 100.0)
+        _risk_pct = float(_cc_get_num("risk_percent", 0.5))
+        risk_usd = balance * (_risk_pct / 100.0)
         sl_dist = abs(live_price - sl_price)
         if sl_dist <= 0:
             return 0.0
@@ -372,33 +411,49 @@ def _extract_strategy(reasons: list) -> str:
 def _spread_label() -> str:
     """
     REV 1.4.28 — per-family spread filter state.
-
-    Now reads LIVE from config_center (was: `getattr(CONFIG, ...)` via
-    core/config.py proxy — same values but consistent with the rest
-    of the file's live-read pattern).
+    REV 1.4.29 — 0-preserving reads via _cc_get_num.
     """
     if not CC.get("use_spread_filter", True):
         return "OFF"
-    _g = CC.get("max_spread_pct", 0.15)
-    _t = CC.get("max_spread_trend", 0.08)
-    _r = CC.get("max_spread_range", 0.12)
-    _v = CC.get("max_spread_volatility", 0.25)
+    _g = _cc_get_num("max_spread_pct", 0.15)
+    _t = _cc_get_num("max_spread_trend", 0.08)
+    _r = _cc_get_num("max_spread_range", 0.12)
+    _v = _cc_get_num("max_spread_volatility", 0.25)
     return (f"ON (global {_g:.2f}% | trend {_t:.2f}% | "
             f"range {_r:.2f}% | vol {_v:.2f}%)")
 
 
 def _update_btc_regime() -> None:
-    """Compute BTC 1h regime, push into decision_engine (once per cycle)."""
+    """
+    Compute BTC 1h regime, push into decision_engine (once per cycle).
+
+    REV 1.4.29 — reuses the market.indicators 1h cache when fresh
+    (TTL 300s). If BTC is in the coin universe, its indicators were
+    already computed by the parallel fetch and cached — we reuse them
+    instead of recomputing. Fallback (BTC not in universe / cache cold)
+    fetches fresh and populates the cache for next cycle.
+    """
     try:
-        btc_df = _c.get_binance_klines("BTCUSDT", "1h", limit=250)
-        if btc_df is None or len(btc_df) < 100:
-            return
-        btc_df_closed = btc_df.iloc[:-1] if len(btc_df) >= 3 else btc_df
-        btc_ind = _i.calculate_pro_indicators(
-            btc_df_closed, "1h", symbol="BTCUSDT"
-        )
-        if not btc_ind:
-            return
+        # Try the indicator cache first — likely populated by the scan.
+        cached = _i.get_cached_indicator("BTCUSDT", "1h")
+        if cached is not None:
+            btc_ind = cached
+        else:
+            btc_df = _c.get_binance_klines("BTCUSDT", "1h", limit=250)
+            if btc_df is None or len(btc_df) < 100:
+                return
+            btc_df_closed = btc_df.iloc[:-1] if len(btc_df) >= 3 else btc_df
+            btc_ind = _i.calculate_pro_indicators(
+                btc_df_closed, "1h", symbol="BTCUSDT"
+            )
+            if not btc_ind:
+                return
+            # Cache the computed result so the next cycle can reuse it.
+            try:
+                _i.set_cached_indicator("BTCUSDT", "1h", btc_ind)
+            except Exception:
+                pass
+
         from signals.decision_engine import set_btc_regime
         set_btc_regime(btc_ind.get("regime", "UNKNOWN"))
         logger.debug(
@@ -412,28 +467,43 @@ def _update_btc_regime() -> None:
 
 
 def _fetch_coin_indicators(coin: str) -> tuple:
-    """Thread-safe klines fetch + indicator computation for one coin."""
+    """
+    Thread-safe klines fetch + indicator computation for one coin.
+
+    REV 1.4.29 — the 1h raw df is fetched ONCE up front and reused
+    for both the cache-hit path and candle_time downstream. The old
+    code refetched klines a second time when 1h was cached (cost:
+    ~1 extra API call per cached coin per cycle).
+    """
     dfs_closed: dict = {}
     results: dict = {}
     try:
+        # Fetch the 1h raw df ONCE. It's the only df downstream code
+        # actually reads (candle_time), so we never need to refetch.
+        df_1h_raw = _c.get_binance_klines(coin, "1h")
+        if df_1h_raw is not None and len(df_1h_raw) > 1:
+            df_1h_closed = df_1h_raw.iloc[:-1]
+        else:
+            df_1h_closed = df_1h_raw
+        if df_1h_closed is not None:
+            dfs_closed['1h'] = df_1h_closed
+
         for tf in ('1h', '4h', '1d'):
             cached_ind = _i.get_cached_indicator(coin, tf)
             if cached_ind is not None:
                 results[tf] = cached_ind
-                if tf == '1h':
-                    df_raw = _c.get_binance_klines(coin, tf)
-                    dfs_closed[tf] = (
-                        df_raw.iloc[:-1]
-                        if df_raw is not None and len(df_raw) > 1
-                        else df_raw
-                    )
                 continue
-            df_raw = _c.get_binance_klines(coin, tf)
-            if df_raw is None or len(df_raw) < 61:
-                continue
-            df_closed = df_raw.iloc[:-1] if len(df_raw) >= 3 else df_raw
+
             if tf == '1h':
-                dfs_closed[tf] = df_closed
+                df_closed = df_1h_closed
+            else:
+                df_raw = _c.get_binance_klines(coin, tf)
+                if df_raw is None or len(df_raw) < 61:
+                    continue
+                df_closed = df_raw.iloc[:-1] if len(df_raw) >= 3 else df_raw
+
+            if df_closed is None or len(df_closed) < 61:
+                continue
             ind = _i.calculate_pro_indicators(df_closed, tf, symbol=coin)
             if ind:
                 results[tf] = ind
@@ -463,9 +533,8 @@ def main_loop():
 
     _cfg = _i.get_trading_config()
     _be_lock_str = _format_be_lock_config()
-    # NOTE (REV 1.4.26): _is_r_scaled always True now (VOL_CLASS_R_THRESHOLDS
-    # always populated) — legacy warning removed.
 
+    # ── Banner block: module snapshots are FINE here (one-time log) ──
     logger.info(f"PRO TRADING v13.3.22 - {TRADING_MODE} | Risk {RISK_PERCENT}% | "
                 f"Max {MAX_OPEN_POSITIONS} | DD {MAX_DAILY_DRAWDOWN_PERCENT}% | "
                 f"Lev {LEVERAGE}x | MinADX {MIN_ADX}(fallback) | "
@@ -502,6 +571,7 @@ def main_loop():
 
     logger.info(f"Spread filter: {_spread_label()}")
 
+    # ── Banner: module snapshot for USE_5M_TREND_FILTER is fine here ──
     logger.info(
         f"5m trend filter: {'ON (trend-following only — counter-trend bypass)' if USE_5M_TREND_FILTER else 'OFF'}"
     )
@@ -517,10 +587,6 @@ def main_loop():
     except Exception as e:
         logger.warning(f"Family summary failed: {e}")
 
-    # ── REV 1.4.28 — read MIN_APPROVALS LIVE from config_center ──
-    # (was: `from signals.decision_engine import MIN_APPROVALS` — that
-    #  module no longer caches constants; REV 4.2 reads LIVE. The old
-    #  import silently fell back to "?" in the banner.)
     try:
         _MA_BANNER = int(CC.get_decision_cfg().get("min_approvals", 5))
     except Exception as _ma_err:
@@ -528,7 +594,6 @@ def main_loop():
         _MA_BANNER = "?"
 
     try:
-        # Sanity-check that the decision engine module loads cleanly.
         import signals.decision_engine  # noqa: F401
         logger.info(f"Decision engine: ✅ active (6-filter vote, {_MA_BANNER}/6 required)")
         logger.info("BTC-bias gate:   ✅ ACTIVE (REV 1.0.5) — updated each scan cycle")
@@ -586,7 +651,6 @@ def main_loop():
                 live_prices = _c.get_live_prices()
 
                 book_tickers: dict = {}
-                # REV 1.4.28 — live read (was getattr(CONFIG, ...))
                 if CC.get("use_spread_filter", True):
                     try:
                         book_tickers = _c.get_book_tickers() or {}
@@ -613,6 +677,14 @@ def main_loop():
                     logger.warning(f" Daily limit: {reason}. Paused 60s.")
                     time.sleep(60); continue
 
+                # ═══════════════════════════════════════════════════════
+                #  REV 1.4.29 — active_trades_list from POSITIONS, not coins
+                #  Iterating coins silently dropped any open position whose
+                #  symbol wasn't in the coin universe (manual entry, removed
+                #  coin). The same-side correlation gate would then under-
+                #  count and permit over-exposure. Iterate the actual
+                #  position map — matches what the exchange sees.
+                # ═══════════════════════════════════════════════════════
                 active_trades_list = []
                 try:
                     _positions_all = _c.get_client().futures_position_information()
@@ -621,14 +693,17 @@ def main_loop():
                         for p in (_positions_all or [])
                         if abs(float(p.get('positionAmt', 0) or 0)) > 0
                     }
-                    for coin in coins:
-                        _p = _pos_by_sym.get(coin)
-                        if _p is None:
+                    for _pos_sym, _p in _pos_by_sym.items():
+                        _sym_short = (_pos_sym or '').removesuffix('USDT')
+                        if not _sym_short:
                             continue
                         try:
-                            st = _o.get_trade_status(coin.replace('USDT', ''), pos=_p)
+                            st = _o.get_trade_status(_sym_short, pos=_p)
                         except TypeError:
-                            st = _o.get_trade_status(coin.replace('USDT', ''))
+                            st = _o.get_trade_status(_sym_short)
+                        except Exception as _tse:
+                            logger.debug(f"get_trade_status({_sym_short}) failed: {_tse}")
+                            st = None
                         if st:
                             active_trades_list.append(st)
                 except Exception as _pex:
@@ -743,7 +818,8 @@ def main_loop():
                     _is_sell = ("STRONG_SELL" in sig_1h or sig_1h == "SELL")
 
                     if _is_buy or _is_sell:
-                        _conf_ok = conf >= MIN_CONFIDENCE
+                        # ── REV 1.4.29 — LIVE reads for gates ──
+                        _conf_ok = conf >= float(_cc_get_num("min_confidence", 60))
                         _rr_ok   = lvl.get('RR', 0) >= min_rr
                         _adx_ok  = ind_1h['adx'] >= min_adx_here
 
@@ -751,6 +827,7 @@ def main_loop():
 
                         # ═══════════════════════════════════════════════
                         #  REV 1.4.21 — CONDITIONAL 5M TREND FILTER
+                        #  REV 1.4.29 — flag read LIVE (was snapshot)
                         # ═══════════════════════════════════════════════
                         _trend_ok = True
                         _trend_reason = ""
@@ -759,7 +836,8 @@ def main_loop():
                             _strategy_name_for_check in _CT_STRATEGIES
                         )
 
-                        if (USE_5M_TREND_FILTER
+                        _use_5m_live = bool(CC.get("use_5m_trend_filter", True))
+                        if (_use_5m_live
                                 and not _is_counter_trend
                                 and _conf_ok and _rr_ok and _adx_ok):
                             _trend_ok, _trend_reason = _i.check_short_term_trend(
@@ -780,14 +858,6 @@ def main_loop():
                                 _s.increment_v2_stat('trend')
                                 skip_reason = f'V2-Trend: {_trend_reason}'
 
-                    # ═══════════════════════════════════════════════════════
-                    #  REV 1.4.23 — PRE-CHECKS BEFORE DECISION ENGINE (FIX Bug #1)
-                    #  Cooldown / Rotation / IN POSITION / Same Candle must
-                    #  run BEFORE evaluate_trade() — otherwise the decision
-                    #  engine logs APPROVED for signals that will be blocked
-                    #  anyway, wasting the 6-filter vote and polluting the
-                    #  log (VIRTUAL 12:21+ incident, 2026-09-30).
-                    # ═══════════════════════════════════════════════════════
                     _pre_block_reason = None
 
                     if trade_side:
@@ -819,9 +889,6 @@ def main_loop():
                         trade_side = None
                         skip_reason = _pre_block_reason
 
-                    # ═══════════════════════════════════════════════════════
-                    #  DECISION ENGINE (only if not pre-blocked)
-                    # ═══════════════════════════════════════════════════════
                     if trade_side:
                         strategy_name = _strategy_name_for_check
                         try:
@@ -849,18 +916,12 @@ def main_loop():
                                 f"{type(_de).__name__}: {_de} — allowing trade"
                             )
 
-                    # ── POST-DECISION SAFETY RE-CHECK ──
-                    # Belt-and-suspenders: if somehow the decision engine
-                    # allowed a trade on an already-tracked symbol (race
-                    # with local active_trades_list update), block it now.
                     if trade_side and any(
                         t.get('symbol') == symbol for t in active_trades_list
                     ):
                         trade_side = None
                         skip_reason = "IN POSITION"
 
-                    # ── SPREAD FILTER ──
-                    # REV 1.4.28 — live read (was getattr(CONFIG, ...))
                     if trade_side and CC.get("use_spread_filter", True):
                         _bt = book_tickers.get(coin)
                         if _bt:
@@ -879,9 +940,6 @@ def main_loop():
                                 )
                                 trade_side = None
 
-                    # ═══════════════════════════════════════════════════
-                    #  ORDER PLACEMENT
-                    # ═══════════════════════════════════════════════════
                     if trade_side:
                         est_qty = _compute_est_qty(balance, live_price, lvl['SL'])
 

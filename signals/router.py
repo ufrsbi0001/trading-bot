@@ -1,39 +1,29 @@
 """
 signals/router.py — Routes a symbol to its correct family module.
 
-REV 19.18 (2026-10-02) — DOCSTRING PATH + LOG PREFIX FIX:
-  ✅ Top docstring was `family_router.py` (legacy name from before
-     the folder/file rename). Actual path is `signals/router.py`.
-  ✅ Fixed internal reference `families/base.py` → `signals/base.py`.
-  ✅ Log prefixes `[family_router]` → `[router]` for consistency
-     with the module's actual name. Zero behaviour change — the
-     prefix is only used in diagnostic prints.
-  ✅ Fixed ARCHITECTURE note: `family_router only maps...` →
-     `router only maps...`.
-  ✅ Zero code change.
+REV 19.19 (2026-10-03) — RESOLUTION + LOGGING HARDENING:
+  ✅ FIXED: _resolve() fallback family-name mismatch. When get_family()
+     returned an unregistered string AND DEFAULT_FAMILY was also
+     unavailable (e.g. trend module import failed), the function
+     returned (unregistered_name, fallback_module) — a pair where the
+     name and module did not correspond. Now the registered name of
+     the actual fallback module is looked up, so the returned pair is
+     always self-consistent.
+  ✅ _resolve() now LOGS when it falls back (family_name != requested)
+     so silent routing degradation is visible in the log file.
+  ✅ print() → logger (warning/debug) in _safe_import, _resolve,
+     generate_signal_live, route_signal. Import-time and runtime
+     routing issues now land in the rotating bot.log alongside the
+     rest of the engine's logs.
+  ✅ generate_signal_live() now logs a CRITICAL when FAMILIES is
+     empty (all family modules failed to import) — previously it
+     silently returned "no_family_module_available" with no context.
+  ✅ route_signal() mode default aligned with generate_signal_live:
+     Optional[str] = None, documented as "family uses its default".
+     No caller is affected (neither signature is positional on mode).
 
-REV 19.17 (2026-09-28) — DYNAMIC ROUTING REVERTED (CRITICAL FIX):
-  ✅ Reverted _resolve() to static get_family() routing.
-     REV 19.16's get_family_dynamic() re-routed coins by live regime,
-     but family modules' is_family_coin() guard rejects any symbol
-     not in that family's FAMILY_COINS registry. Result: every coin
-     whose live regime didn't match its home family was routed away
-     and then immediately rejected with "not_X_coin" before any
-     strategy could run.
-     Live evidence (screenshot, 2026-09-28 23:41): every momentum
-     coin (APT, JUP, RENDER, RUNE, VIRTUAL, ZRO) showed
-     `SKIP (not_volatility_coin)` because its live regime was
-     VOLATILE. Every momentum coin with regime TREND_DOWN showed
-     `SKIP (not_trend_coin)`. Signal count stuck at Sig:1-2 across
-     all 44 coins.
-     Static routing is consistent with the is_family_coin guard —
-     it was working correctly before REV 19.16.
-
-     get_family_dynamic() remains available in coins_config.py for
-     future use, but is NOT consumed by the router. To re-enable,
-     ALSO fix the is_family_coin guard in signals/base.py to
-     accept dynamically-routed symbols (or remove the guard).
-
+REV 19.18 (2026-10-02) — DOCSTRING PATH + LOG PREFIX FIX.
+REV 19.17 (2026-09-28) — DYNAMIC ROUTING REVERTED (CRITICAL FIX).
 REV 19.16 (2026-09-28) — DYNAMIC FAMILY ROUTING. [superseded]
 REV 19.15 (2026-09-26) — EAGER-FALLBACK FIX + CONSOLIDATION.
 REV 19.14 (2026-09-25) — IDIOMATIC IMPORT.
@@ -77,8 +67,20 @@ ARCHITECTURE:
 from __future__ import annotations
 
 import importlib
+from typing import Optional
 
 from core.coins_config import get_family, is_known
+
+# ── REV 19.19 — shared logger with safe fallback ──
+# router.py is imported early by future.py; core.client is normally
+# available by then, but guard against import-order surprises so
+# routing messages are never lost silently.
+try:
+    from core.client import logger as _logger
+    logger = _logger
+except Exception:
+    import logging
+    logger = logging.getLogger("router")
 
 __all__ = [
     "FAMILIES", "DEFAULT_FAMILY",
@@ -100,7 +102,7 @@ def _safe_import(modname: str):
         return importlib.import_module(modname)
     except Exception as e:
         _IMPORT_ERRORS[modname] = f"{type(e).__name__}: {e}"
-        print(f"[router] WARNING: failed to import {modname}: {e}")
+        logger.warning(f"[router] failed to import {modname}: {e}")
         return None
 
 
@@ -141,6 +143,22 @@ def _fallback_module():
     return None
 
 
+def _registered_name_for(module) -> Optional[str]:
+    """
+    Reverse-lookup: given a module object, return its registered
+    family name. Returns None if the module is not in FAMILIES.
+
+    Used by _resolve() to keep the returned (name, module) pair
+    self-consistent after a fallback.
+    """
+    if module is None:
+        return None
+    for name, m in FAMILIES.items():
+        if m is module:
+            return name
+    return None
+
+
 # ═════════════════════════════════════════════════════════════
 #  RESOLUTION HELPER — single source of truth
 # ═════════════════════════════════════════════════════════════
@@ -149,17 +167,21 @@ def _resolve(symbol: str) -> tuple[str, object | None]:
     Resolve a symbol to (family_name, module_or_None).
 
     REV 19.17 — STATIC routing (dynamic routing reverted).
-      Every symbol is mapped to its home family via
-      coins_config.get_family(), which reads the static FAMILY
-      field from coins/*.py. This is consistent with the
-      is_family_coin() guard inside each family module (which only
-      accepts coins listed in that family's FAMILY_COINS set).
+    REV 19.19 — fallback pair is now ALWAYS self-consistent.
+      When the requested family is unregistered AND DEFAULT_FAMILY
+      is also unavailable, we previously returned the requested
+      (unregistered) name paired with a fallback module — a mismatch.
+      Now we reverse-lookup the actual registered name of the
+      fallback module.
 
     Steps:
       1. coins_config.get_family(symbol) → family string
          (exceptions → fall back to DEFAULT_FAMILY)
       2. If family string is registered → use its module.
-      3. Otherwise → fall back to _fallback_module().
+      3. Otherwise → use _fallback_module(); derive its registered
+         name so the return pair stays consistent.
+      4. Log a warning whenever we fall back from the requested name,
+         so silent routing degradation is visible in bot.log.
 
     Returns:
       (family_name_string, module_or_None)
@@ -170,19 +192,41 @@ def _resolve(symbol: str) -> tuple[str, object | None]:
         try:
             family_name = get_family(symbol)
         except Exception as e:
-            print(f"[router] get_family({symbol!r}) raised: "
-                  f"{type(e).__name__}: {e}")
+            logger.debug(
+                f"[router] get_family({symbol!r}) raised: "
+                f"{type(e).__name__}: {e} — using default"
+            )
             family_name = DEFAULT_FAMILY
     else:
         family_name = DEFAULT_FAMILY
 
+    requested_name = family_name
+
     # ── Step 2 + 3: module lookup with explicit fallback ──
-    # (avoids eager _fallback_module() evaluation in dict.get)
     module = FAMILIES.get(family_name)
     if module is None:
         module = _fallback_module()
-        # Report canonical fallback name, not the unregistered lookup key
-        family_name = DEFAULT_FAMILY if DEFAULT_FAMILY in FAMILIES else family_name
+        if module is not None:
+            # REV 19.19 — reverse-lookup so name/module are consistent.
+            resolved_name = _registered_name_for(module)
+            if resolved_name is not None:
+                family_name = resolved_name
+            # Only log a fallback when the request differed from what
+            # we ended up with — avoids spam for normal DEFAULT hits.
+            if family_name != requested_name:
+                logger.warning(
+                    f"[router] {symbol or '(empty)'}: requested "
+                    f"family={requested_name!r} not registered — "
+                    f"fell back to {family_name!r}"
+                )
+        else:
+            # FAMILIES is empty — no fallback available.
+            logger.critical(
+                f"[router] {symbol or '(empty)'}: requested "
+                f"family={requested_name!r} not registered AND no "
+                f"family modules loaded. _IMPORT_ERRORS="
+                f"{_IMPORT_ERRORS or '{}'}"
+            )
 
     return family_name, module
 
@@ -278,12 +322,21 @@ def generate_signal_live(ind_1h, ind_4h, ind_1d=None,
             accepted; family modules treat None as default.
 
     Returns (sig, conf, reasons, lvl, div).
+
+    REV 19.19 — logs CRITICAL when FAMILIES is empty (all family
+    modules failed at import time). Previously a silent
+    "no_family_module_available" reason was the only signal.
     """
     empty_lvl = {"SL": 0.0, "TP1": 0.0, "TP2": 0.0, "Qty": 0.0, "RR": 0.0}
 
     module = get_family_module(symbol)
 
     if module is None:
+        logger.critical(
+            f"[router] generate_signal_live({symbol or '(empty)'}): "
+            f"no family module available — all imports failed. "
+            f"_IMPORT_ERRORS={_IMPORT_ERRORS or '{}'}"
+        )
         return "NEUTRAL", 0.0, ["no_family_module_available"], empty_lvl, "NONE"
 
     mod_name = getattr(module, "__name__", "unknown")
@@ -294,22 +347,23 @@ def generate_signal_live(ind_1h, ind_4h, ind_1d=None,
             mode=mode,
         )
     except AttributeError as e:
-        print(f"[router] {mod_name} missing generate_signal_live: {e}")
+        logger.error(f"[router] {mod_name} missing generate_signal_live: {e}")
         return "NEUTRAL", 0.0, [f"router_error_{mod_name}"], empty_lvl, "NONE"
     except Exception as e:
-        print(f"[router] {mod_name} raised {type(e).__name__}: {e}")
+        logger.error(f"[router] {mod_name} raised {type(e).__name__}: {e}")
         return "NEUTRAL", 0.0, [f"router_exception_{type(e).__name__}"], empty_lvl, "NONE"
 
 
 def route_signal(ind_1h, ind_4h, ind_1d=None,
                  profile: str = "MIXED", symbol: str = "",
-                 mode: str = None):
+                 mode: Optional[str] = None):
     """
     Same shape as family modules' route_signal() — returns dict or None.
 
     Args:
       mode: strategy mode hint. None (default) is passed through to
             the family module, which treats it as "use defaults".
+            REV 19.19 — annotation aligned with generate_signal_live.
     """
     module = get_family_module(symbol)
     if module is None:
@@ -320,8 +374,10 @@ def route_signal(ind_1h, ind_4h, ind_1d=None,
             profile=profile, symbol=symbol, mode=mode,
         )
     except Exception as e:
-        print(f"[router] route_signal error for {symbol}: "
-              f"{type(e).__name__}: {e}")
+        logger.error(
+            f"[router] route_signal error for {symbol or '(empty)'}: "
+            f"{type(e).__name__}: {e}"
+        )
         return None
 
 
@@ -344,6 +400,8 @@ def is_family_coin(symbol: str) -> bool:
 if __name__ == "__main__":
     from core.coins_config import enabled_coins, all_coins
 
+    # NOTE: prints below are intentional — this is a user-facing
+    # diagnostic run via `python -m signals.router`.
     print("=" * 70)
     print("  ROUTER DIAGNOSTIC  (static — no hardcoded coins)")
     print("=" * 70)

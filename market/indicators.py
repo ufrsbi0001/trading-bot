@@ -1,58 +1,47 @@
 """
 indicators.py — V2.9.9 (2026-09-24) for BEST_SCALP_V2.
 
-REV 3.5 (2026-10-02) — DEAD IMPORT + LIVE FUNDING_Z READ:
-  ✅ Removed dead `from core.config import CONFIG` try/except block.
-     After REV 3.3 delegation, this module reads all trading config
-     from config_center — CONFIG was only referenced for a single
-     `use_funding_z` flag read, now migrated to live config_center.
-  ✅ Removed dead `GLOBAL as _CC_GLOBAL` import — never referenced.
-  ✅ `use_funding_z` flag now read LIVE via `_cc_get("use_funding_z")`
-     each call. Runtime/env overrides propagate immediately.
-     Zero behaviour change for default values.
+REV 3.6 (2026-10-03) — FLAG GATING + DIV-BY-ZERO + DEAD STUB CLEANUP:
+  ✅ Modern indicator flags now HONOURED (were declared in GLOBAL but
+     ignored here):
+       • use_taker_volume   → gates _taker_features()
+       • use_volume_profile → gates _volume_profile()
+       • use_anchored_vwap  → gates _anchored_vwap()
+     Matches the existing use_funding_z gate pattern (REV 3.5).
+     Output keys ALWAYS present (empty defaults when disabled) so
+     downstream .get() reads don't change shape.
+     ► NOTE for users: previous behaviour was "compute regardless of
+       flag". If you relied on real values while flag=False, set the
+       corresponding CC_USE_* env or .env flag to True.
+  ✅ FIXED: `dx` divide-by-zero — was `.fillna(0)` which does NOT
+     catch inf. Now `.replace(0, 1e-9).fillna(0)` matching the
+     pattern in _detect_regime().
+  ✅ Dead `liq` stub dict REMOVED (REV 3.4 removed the populating
+     functions). Three legacy output keys (`long_liq_usd`,
+     `short_liq_usd`, `liq_bias`) retained as 0.0/0.0/"BALANCED"
+     literals for backward compat with any downstream .get() readers.
+  ✅ Zero behaviour change for the current .env (all three flags True).
 
-REV 3.4 (2026-10-02) — DEAD FUNCTION CLEANUP:
-  ✅ Removed legacy functions (no live consumers, verified via grep):
-       • get_futures_sentiment()       — legacy, no callers
-       • get_liquidation_pressure()    — legacy, no callers
-     Also removed their module-level caches (_fut_*, _liq_*,
-     _LIQ_404_*) and the LIQUIDATION 401/404 GUARD block.
-     Zero behaviour change — nothing imported them.
-
-REV 3.3 (2026-10-02) — FULLY DELEGATED TO config_center:
-  ✅ `_BASE_CFG` module-level dict REMOVED (was dead code after
-     funding threshold migrated). All config reads now go through
-     config_center:
-       • get_trading_config() = config_center.get_config(include_family=False)
-       • _regime_config(r)    = config_center.get_regime_cfg(r)
-       • funding threshold    = config_center.GLOBAL["funding_extreme"]
-  ✅ Zero local dicts — runtime/env overrides propagate immediately.
-
-REV 3.2 (2026-10-02) — UNIFIED CONFIG (Option B):
-  ✅ `_BASE_CFG` / `_REGIME_CFG` literals DELETED. Now sourced from
-     core.config_center (single source of truth).
-  ✅ `get_trading_config()` / `get_regime_multipliers()` /
-     `_regime_config()` kept as thin public wrappers (API preserved).
-  ✅ config_center.REGIME values aligned to match old indicators
-     values (VOLATILE 1.4/1.3, QUIET 0.9, CHOP 1.1/1.0, UNKNOWN 1.0)
-     and rsi_period added — zero behaviour change.
-
+REV 3.5 (2026-10-02) — DEAD IMPORT + LIVE FUNDING_Z READ.
+REV 3.4 (2026-10-02) — DEAD FUNCTION CLEANUP.
+REV 3.3 (2026-10-02) — FULLY DELEGATED TO config_center.
+REV 3.2 (2026-10-02) — UNIFIED CONFIG (Option B).
 REV 1.4.14 (2026-10-01) — 3-LAYER 5m TREND FILTER.
 REV 1.4.13 (2026-10-01) — PHASE 1 ORDERBOOK ENABLE.
 REV 1.4.12 (2026-09-29) — 5M TREND CACHE TTL EXTENSION.
 REV 1.4.11 (2026-09-29) — DEAD HELPER REMOVAL.
 REV 1.4.10 (2026-09-29) — DEAD CODE CLEANUP.
-REV 1.4.9 (2026-09-29) — REGIME MOMENTUM OVERRIDE.
-REV 1.4.8 (2026-09-28) — REGIME MULTIPLIERS + SLOW DONCHIAN.
-REV 1.4.7 (2026-09-28) — GATED UNUSED API CALLS.
-REV 1.4.6 (2026-09-28) — LEGACY SIGNAL BLOCK DELETED.
-REV 1.4.5 (2026-09-28) — SHARED HTF ALIGNMENT FUNCTION.
-REV 1.4.1 (2026-09-26) — DEAD CONSTANT CLEANUP.
-REV 1.4.0 (2026-09-24) — MODERN INDICATOR PACK (Phase 1).
-REV 1.3.4 (2026-09-23) — MIN_RR FIX.
-REV 1.3.3 (2026-09-22) — SENTIMENT + DEAD CODE FIX.
-REV 1.3.2 (2026-09-22) — BE STOP FIXED.
-REV 1.3.1 (2026-09-22) — R-SCALED KEYS NOW FALLBACK-ONLY.
+REV 1.4.9  (2026-09-29) — REGIME MOMENTUM OVERRIDE.
+REV 1.4.8  (2026-09-28) — REGIME MULTIPLIERS + SLOW DONCHIAN.
+REV 1.4.7  (2026-09-28) — GATED UNUSED API CALLS.
+REV 1.4.6  (2026-09-28) — LEGACY SIGNAL BLOCK DELETED.
+REV 1.4.5  (2026-09-28) — SHARED HTF ALIGNMENT FUNCTION.
+REV 1.4.1  (2026-09-26) — DEAD CONSTANT CLEANUP.
+REV 1.4.0  (2026-09-24) — MODERN INDICATOR PACK (Phase 1).
+REV 1.3.4  (2026-09-23) — MIN_RR FIX.
+REV 1.3.3  (2026-09-22) — SENTIMENT + DEAD CODE FIX.
+REV 1.3.2  (2026-09-22) — BE STOP FIXED.
+REV 1.3.1  (2026-09-22) — R-SCALED KEYS NOW FALLBACK-ONLY.
 V2.9.3 (2026-09-21) — REV 15.0 (superseded).
 V2.8 FIXES (kept): frozen kline guard, cache TTL 300s.
 V2.7 FIXES (kept): MIN_SL_PCT floor, top-chase gate.
@@ -901,7 +890,10 @@ def calculate_pro_indicators(df: pd.DataFrame, tf: str,
     tr_s = tr.rolling(14).mean()
     plus_di = 100 * (plus_dm.rolling(14).mean() / tr_s)
     minus_di = 100 * (minus_dm.rolling(14).mean() / tr_s)
-    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).fillna(0)
+    # REV 3.6 — divide-by-zero fix: was `.fillna(0)` which does NOT
+    # catch inf. Matches the pattern used in _detect_regime().
+    dx = (100 * (plus_di - minus_di).abs() /
+          (plus_di + minus_di).replace(0, 1e-9)).fillna(0)
     adx = dx.rolling(14).mean()
 
     obv = (np.sign(delta.fillna(0)) * volume).fillna(0).cumsum()
@@ -949,11 +941,32 @@ def calculate_pro_indicators(df: pd.DataFrame, tf: str,
     vwap_v = _session_vwap(df)
     st = _supertrend(df)
 
-    taker = _taker_features(df)
-    vprofile = _volume_profile(df)
-    avwap = _anchored_vwap(df)
+    # ═══════════════════════════════════════════════════════════
+    #  REV 3.6 — FLAG-GATED MODERN INDICATORS
+    #  Previously these three ran UNCONDITIONALLY, ignoring their
+    #  config flags. Now gated to match the use_funding_z pattern.
+    #  Empty defaults are returned when the flag is off so the output
+    #  dict shape stays constant for downstream .get() readers.
+    # ═══════════════════════════════════════════════════════════
+    if bool(_cc_get("use_taker_volume", False)):
+        taker = _taker_features(df)
+    else:
+        taker = {"taker_buy_ratio": 0.5, "taker_ratio_z": 0.0}
 
-    liq = {"long_liq_usd": 0.0, "short_liq_usd": 0.0, "bias": "BALANCED"}
+    if bool(_cc_get("use_volume_profile", False)):
+        vprofile = _volume_profile(df)
+    else:
+        vprofile = {"poc": 0.0, "vah": 0.0, "val": 0.0, "poc_dist_pct": 0.0}
+
+    if bool(_cc_get("use_anchored_vwap", False)):
+        avwap = _anchored_vwap(df)
+    else:
+        avwap = {"anchored_vwap": 0.0, "avwap_dist_pct": 0.0}
+
+    # REV 3.6 — dead `liq` stub removed. REV 3.4 removed the populating
+    # function `get_liquidation_pressure`. The three legacy output keys
+    # below are retained as 0.0/0.0/"BALANCED" literals for backward
+    # compat, but they are NOT computed here.
     ob_imbalance = {"bid_vol": 0.0, "ask_vol": 0.0, "imbalance": 0.0, "bias": "BALANCED"}
     funding_z = {"funding_now": 0.0, "funding_mean": 0.0, "funding_z": 0.0}
 
@@ -1014,9 +1027,14 @@ def calculate_pro_indicators(df: pd.DataFrame, tf: str,
         "st_trend": st["st_trend"],
         "st_value": st["st_value"],
         "st_flips": st["st_flips"],
-        "long_liq_usd": liq["long_liq_usd"],
-        "short_liq_usd": liq["short_liq_usd"],
-        "liq_bias": liq["bias"],
+
+        # REV 3.6 — legacy liquidation keys (always 0/0/BALANCED).
+        # REV 3.4 removed the populating function; keys retained for
+        # backward-compat with downstream .get() reads.
+        "long_liq_usd": 0.0,
+        "short_liq_usd": 0.0,
+        "liq_bias": "BALANCED",
+
         "ob_imbalance": ob_imbalance["imbalance"],
         "ob_bias": ob_imbalance["bias"],
         "ob_bid_vol": ob_imbalance["bid_vol"],

@@ -4,43 +4,33 @@ positions, account cache, Telegram. Lowest layer of the trading engine.
 
 Does NOT know about strategies or trade lifecycle.
 
-REV 10.9 (2026-10-02) — COSMETIC CLEANUP:
-  ✅ `_position_amt()` — `refresh_timestamp()` moved OUTSIDE the
-     retry loop (matches `fetch_position_raw` pattern). Previously
-     it was called on every retry, causing redundant server-time
-     fetches under rate-limit.
-     Zero behaviour change in practice.
+REV 11.0 (2026-10-03) — KLINES CACHE + LOCK HYGIENE:
+  ✅ ADDED: _KLINES_CACHE with per-interval TTL. Previously every
+     get_binance_klines() call hit the API unconditionally. With 52
+     coins × up to 3 TFs × a 15 s scan cycle, that was ~156 API calls
+     per cycle just for klines (a real rate-limit risk). Adaptive TTLs
+     (1m=20s … 1d=900s) keep data fresh while absorbing scan-loop
+     re-reads. Cache returns the SAME DataFrame object — callers must
+     not mutate it in place (all current callers are read-only).
+  ✅ ADDED: _invalidate_klines_cache(symbol=None) helper for manual
+     busting after major news / on demand.
+  ✅ FIXED: fetch_position_raw() now calls refresh_timestamp() ONCE
+     before the retry loop — matching _position_amt(). The REV 10.9
+     comment claimed these matched but they didn't.
+  ✅ FIXED: set_client_keys() now guarded by _CLIENT_INIT_LOCK. Two
+     concurrent calls could otherwise race on the _global_client
+     assignment and leave partially-initialised state visible to
+     readers.
+  ✅ FIXED: _get_exchange_info() retries 3× with backoff on timeout
+     or transient error before giving up. Previously a single timeout
+     immediately degraded get_filters() to the fallback path.
+  ✅ FIXED: validate_symbols() now writes VALID_SYMBOLS under a lock,
+     so concurrent callers can't interleave and see a partial set.
 
-REV 10.8 (2026-09-30) — MAX_QTY FILTER SUPPORT (fix -4005 loop):
-  ✅ get_filters() now reads and exposes the LOT_SIZE.maxQty field
-     as `maxQty`. Previously only stepSize/minQty were read, so
-     orders above the exchange's max quantity per order were sent
-     blindly and rejected with Binance APIError -4005.
-
-     Live evidence (2026-09-30 12:32+): 1000BONK signal → base qty
-     143790 → vol-class 0.7x → 100653, but exchange maxQty for
-     1000BONKUSDT is ~100000 → -4005 every scan. The bot looped
-     forever trying to place the same oversized order.
-
-     Consumers (orders/entry.py REV 1.5.8) now cap qty at maxQty
-     before sending the market order, with a warning log so
-     post-mortems can see the cap happened.
-
-  ✅ _fallback_filters() also returns maxQty for both branches
-     (HARDCODED_FILTERS present + generic default). Uses the
-     same '1000000000' (1 billion) safe default so no false caps
-     on the fallback path.
-
-  ✅ HARDCODED_FILTERS values intentionally do NOT set maxQty —
-     the fallback path uses .get('maxQty', 1e9), and the primary
-     API path reads it from exchangeInfo. If a specific coin needs
-     a stricter hardcoded max, add it to the dict entry.
-
-REV 10.7 (2026-09-29) — BOOK TICKER / SPREAD HELPERS:
-  ✅ get_book_ticker / get_book_tickers / calc_spread_pct.
-
+REV 10.9 (2026-10-02) — COSMETIC CLEANUP.
+REV 10.8 (2026-09-30) — MAX_QTY FILTER SUPPORT (fix -4005 loop).
+REV 10.7 (2026-09-29) — BOOK TICKER / SPREAD HELPERS.
 REV 10.6 (2026-09-24) — TAKER COLUMNS FLOAT CONVERSION.
-
 REV 10.5 (2026-09-20) — HARDCODED_FILTERS extended from 17 → 38 coins.
 """
 
@@ -93,6 +83,7 @@ logger = logging.getLogger(__name__)
 # GLOBALS
 # ─────────────────────────────────────────────────────────────
 _global_client: Optional[Client] = None
+_CLIENT_INIT_LOCK = threading.RLock()   # REV 11.0 — guards _global_client setup
 _requests_lock = threading.RLock()
 _TS_LOCK = threading.Lock()
 _TS_OFFSET = {'value': 0, 'time': 0.0}
@@ -244,40 +235,77 @@ _EXCHANGE_INFO_CACHE = {'data': None, 'time': 0.0}
 _EXCHANGE_INFO_LOCK = threading.Lock()
 _EXCHANGE_INFO_TTL = 1800
 VALID_SYMBOLS: set[str] = set()
+_VALID_SYMBOLS_LOCK = threading.Lock()   # REV 11.0
 
 
 def _get_exchange_info() -> dict:
+    """
+    Fetch + cache exchangeInfo.
+
+    REV 11.0 — retries up to 3× with backoff on timeout / transient
+    error. Previously a single timeout degraded get_filters() to the
+    hardcoded fallback path, blocking live entries for a full TTL.
+    """
     now = time.time()
     with _EXCHANGE_INFO_LOCK:
         cached = _EXCHANGE_INFO_CACHE['data']
         if cached is not None and now - _EXCHANGE_INFO_CACHE['time'] < _EXCHANGE_INFO_TTL:
             return cached
 
-    def _fetch():
-        with _requests_lock:
-            return _global_client.futures_exchange_info()
+    if _global_client is None:
+        raise RuntimeError("_get_exchange_info: client not initialised")
 
-    info = _run_with_timeout(_fetch, 8, "exchange_info")
-    with _EXCHANGE_INFO_LOCK:
-        _EXCHANGE_INFO_CACHE['data'] = info
-        _EXCHANGE_INFO_CACHE['time'] = time.time()
-    return info
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            def _fetch():
+                with _requests_lock:
+                    return _global_client.futures_exchange_info()
+            info = _run_with_timeout(_fetch, 8, "exchange_info")
+            with _EXCHANGE_INFO_LOCK:
+                _EXCHANGE_INFO_CACHE['data'] = info
+                _EXCHANGE_INFO_CACHE['time'] = time.time()
+            return info
+        except concurrent.futures.TimeoutError as e:
+            last_err = e
+            logger.warning(f"exchangeInfo timeout (attempt {attempt+1}/3)")
+        except Exception as e:
+            last_err = e
+            logger.warning(f"exchangeInfo error (attempt {attempt+1}/3): {type(e).__name__}: {e}")
+        if attempt < 2:
+            time.sleep(1.0 + attempt * 0.5)
+
+    raise last_err or RuntimeError("exchangeInfo fetch failed after 3 attempts")
 
 
 def validate_symbols(coins: list[str]) -> list[str]:
+    """
+    Validate + memoise tradable symbols.
+
+    REV 11.0 — VALID_SYMBOLS written under lock so concurrent callers
+    can't observe a partially-populated set.
+    """
     global VALID_SYMBOLS
     try:
-        if VALID_SYMBOLS:
-            valid = [c for c in coins if c in VALID_SYMBOLS]
-            invalid = [c for c in coins if c not in VALID_SYMBOLS]
+        with _VALID_SYMBOLS_LOCK:
+            snapshot = set(VALID_SYMBOLS)
+
+        if snapshot:
+            valid = [c for c in coins if c in snapshot]
+            invalid = [c for c in coins if c not in snapshot]
             if invalid:
                 logger.warning(f"Skipping invalid symbols (cached): {invalid}")
             return valid
+
         logger.info("🔍 Validating symbols (cached exchangeInfo)...")
         info = _get_exchange_info()
-        VALID_SYMBOLS = {s['symbol'] for s in info['symbols'] if s['status'] == 'TRADING'}
-        valid = [c for c in coins if c in VALID_SYMBOLS]
-        invalid = [c for c in coins if c not in VALID_SYMBOLS]
+        fresh = {s['symbol'] for s in info['symbols'] if s['status'] == 'TRADING'}
+        with _VALID_SYMBOLS_LOCK:
+            VALID_SYMBOLS = fresh
+            snapshot = set(VALID_SYMBOLS)
+
+        valid = [c for c in coins if c in snapshot]
+        invalid = [c for c in coins if c not in snapshot]
         if invalid:
             logger.warning(f"Skipping invalid symbols: {invalid}")
         logger.info(f"✅ Validated {len(valid)} symbols")
@@ -286,13 +314,15 @@ def validate_symbols(coins: list[str]) -> list[str]:
         logger.warning("⚠️ Validation timeout — using coins as-is except known bad")
         invalid_demo = {'MATICUSDT', 'LUNAUSDT'}
         valid = [c for c in coins if c not in invalid_demo]
-        VALID_SYMBOLS = set(valid)
+        with _VALID_SYMBOLS_LOCK:
+            VALID_SYMBOLS = set(valid)
         return valid
     except Exception as e:
         logger.error(f"Validation error: {e}")
         invalid_demo = {'MATICUSDT', 'LUNAUSDT'}
         valid = [c for c in coins if c not in invalid_demo]
-        VALID_SYMBOLS = set(valid)
+        with _VALID_SYMBOLS_LOCK:
+            VALID_SYMBOLS = set(valid)
         return valid
 
 
@@ -408,9 +438,6 @@ def get_filters(pair: str) -> dict:
 
     Returns dict with keys: stepSize, minQty, maxQty, tickSize,
     minNotional, timestamp, verified.
-
-    LOT_SIZE (fallback) or MARKET_LOT_SIZE (preferred) filter from
-    Binance exchangeInfo provides stepSize / minQty / maxQty.
     """
     now = time.time()
     with FILTERS_CACHE_LOCK:
@@ -433,9 +460,6 @@ def get_filters(pair: str) -> dict:
         if not lot or not price_f:
             raise ValueError(f"missing filters for {pair}")
 
-        # REV 10.8 — read maxQty. Older Binance responses always
-        # include it for LOT_SIZE and MARKET_LOT_SIZE; the .get()
-        # default guards against schema drift.
         max_qty_raw = lot.get('maxQty', '1000000000')
         try:
             max_qty = Decimal(str(max_qty_raw))
@@ -499,11 +523,102 @@ def adjust_price(price, tick) -> str:
 
 # ─────────────────────────────────────────────────────────────
 # KLINES — REV 10.6: taker columns converted to float
+#           REV 11.0: added _KLINES_CACHE (rate-limit safety)
 # ─────────────────────────────────────────────────────────────
+#
+# Cache TTL per interval. Chosen so a 15 s scan cycle mostly reuses
+# cached data without staleness exceeding half the interval.
+_KLINES_TTL: dict[str, float] = {
+    '1m':  20,
+    '3m':  30,
+    '5m':  30,
+    '15m': 60,
+    '30m': 120,
+    '1h':  120,
+    '2h':  240,
+    '4h':  300,
+    '6h':  600,
+    '8h':  600,
+    '12h': 900,
+    '1d':  900,
+    '3d':  1800,
+    '1w':  3600,
+    '1M':  3600,
+}
+_KLINES_TTL_DEFAULT = 60.0
+
+# Key: (symbol, interval, limit). Value: (DataFrame, ts).
+# NOTE: the cached DataFrame is returned AS-IS. Callers must not
+# mutate it in place — all current callers are read-only views
+# (iloc slicing, column extraction).
+_KLINES_CACHE: dict[tuple[str, str, int], tuple[pd.DataFrame, float]] = {}
+_KLINES_CACHE_LOCK = threading.Lock()
+_KLINES_CACHE_MAX = 1000
+
+
+def _klines_cache_get(symbol: str, interval: str,
+                      limit: int) -> Optional[pd.DataFrame]:
+    key = (symbol, interval, limit)
+    ttl = _KLINES_TTL.get(interval, _KLINES_TTL_DEFAULT)
+    now = time.time()
+    with _KLINES_CACHE_LOCK:
+        hit = _KLINES_CACHE.get(key)
+        if hit is not None and now - hit[1] < ttl:
+            return hit[0]
+    return None
+
+
+def _klines_cache_set(symbol: str, interval: str,
+                      limit: int, df: pd.DataFrame) -> None:
+    key = (symbol, interval, limit)
+    with _KLINES_CACHE_LOCK:
+        _KLINES_CACHE[key] = (df, time.time())
+        if len(_KLINES_CACHE) > _KLINES_CACHE_MAX:
+            # Evict entries older than 1 h to keep the cache bounded.
+            now = time.time()
+            for k in list(_KLINES_CACHE.keys()):
+                _, ts = _KLINES_CACHE[k]
+                if now - ts > 3600:
+                    del _KLINES_CACHE[k]
+
+
+def invalidate_klines_cache(symbol: Optional[str] = None) -> None:
+    """
+    Bust the klines cache.
+
+    REV 11.0 — call with no args to clear all entries, or with a
+    symbol (e.g. 'BTCUSDT') to clear only that symbol's entries.
+    """
+    with _KLINES_CACHE_LOCK:
+        if symbol is None:
+            _KLINES_CACHE.clear()
+        else:
+            for k in list(_KLINES_CACHE.keys()):
+                if k[0] == symbol:
+                    del _KLINES_CACHE[k]
+
+
 @retry_on_rate_limit
 def get_binance_klines(symbol: str, interval: str, limit: int = 250):
+    """
+    Fetch klines, with per-interval TTL cache.
+
+    REV 11.0 — cache-first. Without it, the scan loop (52 coins ×
+    3 TFs × every 15 s) issued ~156 API calls per cycle for klines
+    alone. Cache absorbs scan-loop re-reads; TTL adapts to interval
+    so data stays fresh at short TFs and never goes stale by more
+    than half the interval.
+    """
+    # 1) Cache hit fast-path
+    cached = _klines_cache_get(symbol, interval, limit)
+    if cached is not None:
+        return cached
+
+    # 2) API fetch
     try:
-        klines = _global_client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        klines = _global_client.futures_klines(
+            symbol=symbol, interval=interval, limit=limit
+        )
         if not klines:
             return None
         df = pd.DataFrame(klines, columns=[
@@ -515,6 +630,9 @@ def get_binance_klines(symbol: str, interval: str, limit: int = 250):
             df[c] = pd.to_numeric(df[c], errors='coerce').astype(float)
         df['Datetime'] = pd.to_datetime(df['Open Time'], unit='ms')
         df.set_index('Datetime', inplace=True)
+
+        # 3) Populate cache and return
+        _klines_cache_set(symbol, interval, limit, df)
         return df
     except Exception as e:
         logger.debug(f"Klines error {symbol} {interval}: {type(e).__name__}")
@@ -622,10 +740,15 @@ def calc_spread_pct(bid: float, ask: float) -> float:
 # ─────────────────────────────────────────────────────────────
 @retry_on_rate_limit
 def fetch_position_raw(symbol_short: str):
+    """
+    REV 11.0 — refresh_timestamp() hoisted OUT of the retry loop
+    (was inside, causing a redundant server-time fetch on every retry
+    when already rate-limited). Now consistent with _position_amt().
+    """
     pair = symbol_short + 'USDT'
+    refresh_timestamp()
     for i in range(3):
         try:
-            refresh_timestamp()
             arr = _global_client.futures_position_information(symbol=pair)
             if arr and len(arr) > 0:
                 return arr[0]
@@ -640,9 +763,6 @@ def fetch_position_raw(symbol_short: str):
 
 
 def _position_amt(pair: str, retries: int = 3):
-    # REV 10.9 — refresh timestamp ONCE before retry loop (matches
-    # fetch_position_raw pattern; avoids re-fetching server time on
-    # every retry when the API is already rate-limited).
     refresh_timestamp()
     for attempt in range(retries):
         try:
@@ -691,23 +811,30 @@ def _cancel_algo_order(pair: str, algo_id) -> bool:
 # CLIENT SETUP
 # ─────────────────────────────────────────────────────────────
 def set_client_keys(api_key: str, api_secret: str) -> Client:
+    """
+    REV 11.0 — guarded by _CLIENT_INIT_LOCK so concurrent calls can't
+    race on the global assignment / see a partially-initialised client.
+    """
     global _global_client
     api_key = _clean_key(api_key)
     api_secret = _clean_key(api_secret)
     if len(api_key) < 20 or len(api_secret) < 20:
         logger.critical(f"❌ API key/secret too short (key={len(api_key)}, secret={len(api_secret)})")
         raise ValueError("API key/secret too short")
-    client_params = {'requests_params': {'timeout': 10}}
-    if CONFIG.demo_mode:
-        _global_client = Client(api_key, api_secret, demo=True, **client_params)
-        logger.info("DEMO MODE ACTIVE - demo.binance.com")
-    elif CONFIG.testnet:
-        _global_client = Client(api_key, api_secret, testnet=True, **client_params)
-        logger.info("TESTNET MODE ACTIVE - testnet.binance.vision")
-    else:
-        _global_client = Client(api_key, api_secret, **client_params)
-        logger.warning("MAINNET MODE - REAL MONEY!")
-    _install_pooled_session(_global_client)
+    with _CLIENT_INIT_LOCK:
+        client_params = {'requests_params': {'timeout': 10}}
+        if CONFIG.demo_mode:
+            _global_client = Client(api_key, api_secret, demo=True, **client_params)
+            logger.info("DEMO MODE ACTIVE - demo.binance.com")
+        elif CONFIG.testnet:
+            _global_client = Client(api_key, api_secret, testnet=True, **client_params)
+            logger.info("TESTNET MODE ACTIVE - testnet.binance.vision")
+        else:
+            _global_client = Client(api_key, api_secret, **client_params)
+            logger.warning("MAINNET MODE - REAL MONEY!")
+        _install_pooled_session(_global_client)
+    # refresh_timestamp outside the lock (it acquires _requests_lock,
+    # which is reentrant-safe but we prefer a short critical section)
     refresh_timestamp()
     send_telegram(f"✅ Bot started (Demo: {CONFIG.demo_mode}, Testnet: {CONFIG.testnet})")
     return _global_client

@@ -1,0 +1,72 @@
+==============================================================================
+  LEGACY CONFIG.<trading_param> READS
+  → migrate to: from core import config_center as CC; CC.get('<key>')
+==============================================================================
+
+Total matches: 26  |  Files affected: 2
+
+
+── C:\Users\ALAM PC\Downloads\Bot\core\config.py  (24 hits)
+   L28     CONFIG.leverage                      |  So existing code `CONFIG.leverage` continues to work, but the
+   L495    CONFIG.partial_close_usdt            |  pc = CONFIG.partial_close_usdt   # proxied → config_center
+   L502    CONFIG.use_spread_filter             |  if not CONFIG.use_spread_filter:
+   L505    CONFIG.max_spread_pct                |  f"ON (global {CONFIG.max_spread_pct:.2f}% | "
+   L506    CONFIG.max_spread_trend              |  f"trend {CONFIG.max_spread_trend:.2f}% | "
+   L507    CONFIG.max_spread_range              |  f"range {CONFIG.max_spread_range:.2f}% | "
+   L508    CONFIG.max_spread_volatility         |  f"vol {CONFIG.max_spread_volatility:.2f}%)"
+   L513    CONFIG.use_5m_trend_filter           |  if not CONFIG.use_5m_trend_filter:
+   L528    CONFIG.leverage                      |  f"  Leverage:       {CONFIG.leverage}×",
+   L529    CONFIG.risk_percent                  |  f"  Risk / trade:   {CONFIG.risk_percent}%",
+   L530    CONFIG.max_open_positions            |  f"  Max open:       {CONFIG.max_open_positions} "
+   L531    CONFIG.max_same_side_positions       |  f"(per-side: {CONFIG.max_same_side_positions})",
+   L532    CONFIG.max_daily_loss_trades         |  f"  Daily cap:      {CONFIG.max_daily_loss_trades} losses / "
+   L533    CONFIG.max_daily_drawdown_percent    |  f"{CONFIG.max_daily_drawdown_percent}% DD",
+   L535    CONFIG.min_adx                       |  f"  Min ADX:        {CONFIG.min_adx} "
+   L537    CONFIG.min_confidence                |  f"  Min confidence: {CONFIG.min_confidence}",
+   L538    CONFIG.max_hold_minutes              |  f"  Max hold:       {CONFIG.max_hold_minutes} min",
+   L540    CONFIG.use_taker_volume              |  f"  Modern flags:   taker={CONFIG.use_taker_volume} "
+   L541    CONFIG.use_volume_profile            |  f"vp={CONFIG.use_volume_profile} "
+   L542    CONFIG.use_anchored_vwap             |  f"avwap={CONFIG.use_anchored_vwap} "
+   L543    CONFIG.use_funding_z                 |  f"fz={CONFIG.use_funding_z} "
+   L544    CONFIG.use_mtf_confluence            |  f"mtf={CONFIG.use_mtf_confluence}",
+   L547    CONFIG.htf_align_relaxed             |  f"{'RELAXED (e20 OR price)' if CONFIG.htf_align_relaxed else 'STRICT (e20 AND price)'}",
+   L549    CONFIG.kz_bypass                     |  f"{'BYPASS (24/7)' if CONFIG.kz_bypass else 'ENFORCED (NY sessions only)'}",
+
+── C:\Users\ALAM PC\Downloads\Bot\scripts\audit_config_consumers.py  (2 hits)
+   L14     CONFIG.max_hold_minutes              |  • CONFIG.max_hold_minutes       → CC.get("hold_minutes")   [rename]
+   L15     CONFIG.use_1m_trend_filter           |  • CONFIG.use_1m_trend_filter    → CC.get("use_5m_trend_filter")  [rename]
+
+
+==============================================================================
+  DEAD SYMBOLS (should be ZERO hits)
+==============================================================================
+
+Total matches: 13  |  Files affected: 7
+
+
+── C:\Users\ALAM PC\Downloads\Bot\core\config_center.py  (2 hits)
+   L661    COOLDOWN_AFTER_SL_MIN             |  "cooldown_after_sl_min":       "COOLDOWN_AFTER_SL_MIN",
+   L662    COOLDOWN_AFTER_TP_MIN             |  "cooldown_after_tp_min":       "COOLDOWN_AFTER_TP_MIN",
+
+── C:\Users\ALAM PC\Downloads\Bot\core\state.py  (1 hits)
+   L17     COOLDOWN_AFTER_SL_MIN             |  ✅ Removed dead constants COOLDOWN_AFTER_SL_MIN / COOLDOWN_AFTER_TP_MIN
+
+── C:\Users\ALAM PC\Downloads\Bot\market\indicators.py  (2 hits)
+   L16     get_futures_sentiment             |  • get_futures_sentiment()       — legacy, no callers
+   L17     get_liquidation_pressure          |  • get_liquidation_pressure()    — legacy, no callers
+
+── C:\Users\ALAM PC\Downloads\Bot\orders\exit.py  (1 hits)
+   L5      COOLDOWN_AFTER_SL_MIN             |  ✅ Removed cached imports COOLDOWN_AFTER_SL_MIN, COOLDOWN_AFTER_TP_MIN
+
+── C:\Users\ALAM PC\Downloads\Bot\scripts\audit_config_consumers.py  (3 hits)
+   L15     use_1m_trend_filter               |  • CONFIG.use_1m_trend_filter    → CC.get("use_5m_trend_filter")  [rename]
+   L38     use_1m_trend_filter               |  "use_1m_trend_filter", "fg_enabled",
+   L51     use_1m_trend_filter               |  "use_1m_trend_filter":  "use_5m_trend_filter",
+
+── C:\Users\ALAM PC\Downloads\Bot\scripts\fix_config_consumers.py  (2 hits)
+   L24     use_1m_trend_filter               |  "use_1m_trend_filter", "fg_enabled",
+   L36     use_1m_trend_filter               |  "use_1m_trend_filter": "use_5m_trend_filter",
+
+── C:\Users\ALAM PC\Downloads\Bot\scripts\verify_dead_code.py  (2 hits)
+   L14     get_futures_sentiment             |  "get_futures_sentiment": "indicators.py item 4",
+   L15     get_liquidation_pressure          |  "get_liquidation_pressure": "indicators.py item 4",

@@ -1,12 +1,26 @@
 """
 orders/utils.py — Shared constants and low-level helpers.
 
-REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP:
-  ✅ Removed `_STRATEGY_HOLD_MIN` — now from config_center.
-  ✅ Removed `_PER_CLASS_CFG` — moved to config_center as
-     `VOL_CLASS_R_THRESHOLDS`.
-  ✅ `_r_thresholds_per_class()` reads from config_center.
+REV 23.1 (2026-10-03) — DEAD CONSTANT CLEANUP + SL SELECTION CLARITY:
+  ✅ Removed dead module-level config snapshots:
+       LEVERAGE, RISK_PERCENT, MAX_OPEN_POSITIONS,
+       MAX_TOTAL_MARGIN_PCT, PARTIAL_CLOSE_USDT, MAX_HOLD_MINUTES.
+     All were imported ONCE at module load — runtime update_runtime()
+     changes did not propagate. Every consumer (orders/entry.py
+     REV 1.8.0, orders/manage.py REV 1.9.0) already migrated to live
+     CC.get() reads. Verified dead via grep before removal.
+  ✅ Also removed now-unused `from core import config_center as CC`
+     module alias (only served the removed snapshots).
+  ✅ DRY_RUN retained — still consumed by orders/entry.py.
+  ✅ _pick_real_sl: algo-order fallback loop now skips empty-type
+     records (matches the primary regular-order loop's strictness).
+     Previously an empty type would slip through and could pick a
+     TP trigger price as an SL candidate.
+  ✅ _derive_sl_level: "no risk_unit" warning downgraded to debug —
+     the % fallback path is a designed graceful degradation, not an
+     error condition, and it fires frequently on legacy trades.
 
+REV 23.0 (2026-10-02) — UNIFIED CONFIG CLEANUP.
 REV 1.5.0 (2026-09-28) — SPLIT FROM orders.py.
 """
 from __future__ import annotations
@@ -15,7 +29,6 @@ import threading
 import time
 
 from core.config import CONFIG
-from core import config_center as CC
 
 from core.client import (
     get_client, refresh_timestamp, _run_with_timeout,
@@ -32,15 +45,11 @@ from core.config_center import (
 
 
 # ═════════════════════════════════════════════════════════════
-#  Constants (from CONFIG)
+#  Constants
 # ═════════════════════════════════════════════════════════════
-LEVERAGE             = CC.get('leverage')
-RISK_PERCENT         = CC.get('risk_percent')
-MAX_OPEN_POSITIONS   = CC.get('max_open_positions')
-MAX_TOTAL_MARGIN_PCT = CC.get('max_total_margin_pct')
-PARTIAL_CLOSE_USDT   = CC.get('partial_close_usdt')
-DRY_RUN              = CONFIG.dry_run
-MAX_HOLD_MINUTES     = CC.get('hold_minutes')
+# REV 23.1 — Only DRY_RUN remains here. All trading-parameter
+# snapshots were removed; consumers read LIVE via CC.get().
+DRY_RUN = CONFIG.dry_run
 
 
 # ═════════════════════════════════════════════════════════════
@@ -123,6 +132,17 @@ def _r_thresholds_per_class(symbol: str, cfg: dict) -> dict:
 #  SL discovery — most advanced SL on the book
 # ═════════════════════════════════════════════════════════════
 def _pick_real_sl(pair, entry, is_long):
+    """
+    Return the most-advanced SL on the book.
+
+    "Most advanced" = highest SL for a LONG, lowest SL for a SHORT
+    (i.e. closest to or past entry — reflects the current SL level).
+
+    REV 23.1 — algo-order fallback now skips empty-type records,
+    matching the primary regular-order loop. Otherwise an algo order
+    with no type field could contribute its trigger price (possibly
+    a TP) as an SL candidate.
+    """
     candidates = []
     client = _cl()
     if client is None:
@@ -150,7 +170,8 @@ def _pick_real_sl(pair, entry, is_long):
         try:
             for o in _get_open_algo_orders(pair):
                 otype = (o.get('type') or o.get('orderType') or '').upper()
-                if otype and otype not in ('STOP_MARKET', 'STOP'):
+                # REV 23.1 — strict type match (empty type excluded).
+                if otype not in ('STOP_MARKET', 'STOP'):
                     continue
                 try:
                     v = float(o.get('triggerPrice') or o.get('stopPrice') or 0)
@@ -188,7 +209,8 @@ def _derive_sl_level(is_long, actual_sl, entry, risk_unit=None, thresholds=None)
             if actual_sl >= lk1_stop - tol:  return 2
             if actual_sl >= be_stop  - tol:  return 1
             return 0
-        logger.warning(f"_derive_sl_level: no risk_unit for entry={entry}")
+        # REV 23.1 — debug not warning: % fallback is by-design graceful.
+        logger.debug(f"_derive_sl_level: no risk_unit for entry={entry}")
         if actual_sl >= entry * 1.005:   return 3
         elif actual_sl >= entry * 1.002: return 2
         elif actual_sl >= entry * 0.998: return 1
@@ -203,7 +225,7 @@ def _derive_sl_level(is_long, actual_sl, entry, risk_unit=None, thresholds=None)
             if actual_sl <= lk1_stop + tol:  return 2
             if actual_sl <= be_stop  + tol:  return 1
             return 0
-        logger.warning(f"_derive_sl_level: no risk_unit for entry={entry}")
+        logger.debug(f"_derive_sl_level: no risk_unit for entry={entry}")
         if actual_sl <= entry * 0.995:   return 3
         elif actual_sl <= entry * 0.998: return 2
         elif actual_sl <= entry * 1.002: return 1
