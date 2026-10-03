@@ -1,0 +1,26 @@
+{
+  "file_count": 97,
+  "legacy_reads": {
+    "total": 0,
+    "files_affected": 0,
+    "by_file": {}
+  },
+  "dead_symbols": {
+    "total": 2,
+    "files_affected": 1,
+    "by_file": {
+      "C:\\Users\\ALAM PC\\Downloads\\Bot\\core\\config_center.py": [
+        {
+          "line": 643,
+          "symbol": "COOLDOWN_AFTER_SL_MIN",
+          "text": "\"cooldown_after_sl_min\":       \"COOLDOWN_AFTER_SL_MIN\","
+        },
+        {
+          "line": 644,
+          "symbol": "COOLDOWN_AFTER_TP_MIN",
+          "text": "\"cooldown_after_tp_min\":       \"COOLDOWN_AFTER_TP_MIN\","
+        }
+      ]
+    }
+  }
+}
