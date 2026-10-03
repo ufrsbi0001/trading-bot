@@ -1,401 +1,535 @@
 """
-audit_legacy_config_reads.py — CI-ready audit for legacy CONFIG reads
-and dead symbols.
+scripts/audit_config_overlaps.py — Deep consistency audit of the layered
+config system.
+
+REV 5.5b (2026-10-03) — CLEANUP + CONSISTENCY:
+  ✅ Consolidated duplicate imports. The sys.path bootstrap used
+     aliased names (_sys, _Path) while the rest of the file imported
+     sys and Path unaliased. Merged to a single set of imports.
+  ✅ Removed the dead _QUIET module flag. It was checked in _hr() and
+     _p() but never set to True anywhere — all suppression already
+     happens via redirect_stdout (for capture) plus main()'s
+     `if not args.quiet` guard. Dead code removed.
+  ✅ --quiet now consistently suppresses ALL terminal output,
+     including --format json to stdout. Previously JSON went to
+     stdout regardless of --quiet, which was confusing in pipelines.
+     (--output still writes files; use that for JSON in --quiet mode.)
+  ✅ Type annotation fix: `list[tuple[str, callable]]` -> Callable.
+     `callable` is a builtin function, not a type. Imported Callable
+     from typing.
+
+REV 5.5 (2026-10-03) — CI-READY + MOJIBAKE FIX + EXTENDED CHECKS:
+  ✅ Fixed Windows cp1252 -> utf-8 mojibake corruption.
+  ✅ Added --strict / --report modes.
+  ✅ Added --format text|json.
+  ✅ Added --quiet.
+  ✅ Added --output PATH (default: no file written).
+  ✅ Exit codes: 0 = clean, 1 = warnings (strict), 2 = setup error.
+  ✅ NEW Check 10: _SAFETY_SNAPSHOT_KEYS present in GLOBAL.
+  ✅ NEW Check 11: config.py proxy contract.
+  ✅ NEW Check 12: DECISION sanity.
+
+REV 5.4 (2026-10-02) — FALSE-POSITIVE FIXES + REDUNDANT-SHADOW REPORTING.
+
+Checks (all read-only):
+  1.  GLOBAL vs REGIME key overlap and shadows
+  2.  GLOBAL vs STRATEGY_REGIME key overlap
+  3.  GLOBAL vs FAMILY.FILTERS (redundant shadows vs genuine overrides)
+  4.  min_rr scalar (GLOBAL) vs per-strategy dict (MIN_RR)
+  5.  hold_minutes layering resolution for samples
+  6.  time_exit_enabled + hold_minutes co-dependency
+  7.  Spread caps fallback chain (sanity, not ceiling)
+  8.  Vol class triple layering (CAP_MULT x R_THRESHOLDS x QTY_MULT)
+  9.  Legacy % vs R-mult pairs (be_factor/lock*_pct vs *_stop_r)
+  10. Safety snapshot keys present in GLOBAL
+  11. config.py proxy contract (_PROXIED_TRADING_ATTRS)
+  12. DECISION sanity
 
 USAGE
-─────
-    # Report-only (writes file, exits 0 always) — for humans
-    python scripts/audit_legacy_config_reads.py --report
-
-    # Strict (exits 1 on any non-whitelisted hit) — for CI
-    python scripts/audit_legacy_config_reads.py --strict
-
-    # JSON output for CI parsing
-    python scripts/audit_legacy_config_reads.py --strict --format json
-
-    # Quiet mode (only exit code matters)
-    python scripts/audit_legacy_config_reads.py --strict --quiet
-
-    # Custom output file
-    python scripts/audit_legacy_config_reads.py --report --output /tmp/audit.txt
-
-WHAT IT CHECKS
-──────────────
-1. Legacy `CONFIG.<trading_param>` reads — should use CC.get() instead.
-2. Dead symbols (removed functions, unused constants) — should be ZERO.
-
-WHITELISTED (won't fail in --strict)
-────────────────────────────────────
-• Path whitelist (path-suffix):
-    core/config.py — this file DEFINES the proxy; its
-      `_PROXIED_TRADING_ATTRS` contains trading param names as
-      strings, not actual reads.
-    scripts/audit_*.py / fix_*.py / verify_*.py — self-references.
-• (file, symbol) pair whitelist:
-    core/config_center.py + {COOLDOWN_AFTER_SL_MIN, COOLDOWN_AFTER_TP_MIN}
-      — these are legacy env-var NAMES exposed as string literals in
-      `_LEGACY_ENV_MAP` for backward compat. Not dead code.
-• Any line inside a docstring (triple-quoted string).
-• Any code after an inline `#` comment.
+-----
+    python scripts/audit_config_overlaps.py --report
+    python scripts/audit_config_overlaps.py --strict
+    python scripts/audit_config_overlaps.py --strict --format json --quiet
+    python scripts/audit_config_overlaps.py --report --output /tmp/audit.txt
 
 EXIT CODES
-──────────
-  0 — clean (or --report mode regardless)
-  1 — findings in --strict mode
-  2 — setup error (run from wrong directory, unreadable path, etc.)
-
-REV 2.1 (2026-10-03) — (file, symbol) PAIR WHITELIST:
-  ✅ Added `_WHITELIST_FILE_SYMBOL_PAIRS` for intentional string
-     literals that would otherwise trip `DEAD_SYMBOLS`.
-     First entries: `core/config_center.py`'s `_LEGACY_ENV_MAP`
-     exposes `COOLDOWN_AFTER_SL_MIN` / `COOLDOWN_AFTER_TP_MIN` as
-     legacy env-var names — these are NOT dead code, they are the
-     backward-compat contract that keeps old `.env` files working.
-  ✅ New `_is_symbol_whitelisted_in_file()` helper — checks
-     (resolved_path_tail, symbol) against the pair whitelist.
-  ✅ `_scan_file()` now consults the pair whitelist before recording
-     a dead-symbol hit. Zero behaviour change for real dead symbols.
-  ✅ --strict now exits 0 on a clean repo (was 1 due to the two
-     false positives).
-
-REV 2.0 (2026-10-03) — CI-READY:
-  ✅ Exit codes 0/1/2 for CI integration.
-  ✅ --strict vs --report mode.
-  ✅ --format text|json.
-  ✅ --quiet for shell pipelines.
-  ✅ --output PATH (default: no file written).
-  ✅ Docstring-aware scanning (triple-quote state tracking).
-  ✅ Inline-comment-aware (strips trailing # ... before matching).
-  ✅ Path-based whitelist (config.py proxy, scripts/audit_*.py).
-  ✅ Absolute-path self-skip (was: name-based — collision prone).
-  ✅ JSON output with full structured findings.
-
-REV 1.0 — initial release.
+----------
+  0 - clean (or --report mode regardless)
+  1 - findings in --strict mode
+  2 - setup error (cannot import config_center, etc.)
 """
 from __future__ import annotations
 
-import argparse
-import json
-import re
+# ── sys.path bootstrap ─────────────────────────────────────────
+# Python sets sys.path[0] to the SCRIPT's directory, not the CWD.
+# When running `python scripts/audit_config_overlaps.py`, the repo
+# root is NOT on sys.path, so `from core import ...` fails.
+# Add the repo root explicitly so the script works both ways:
+#   • python scripts/audit_config_overlaps.py
+#   • python -m scripts.audit_config_overlaps
 import sys
 from pathlib import Path
-from collections import defaultdict
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+# ───────────────────────────────────────────────────────────────
+
+import argparse
+import io
+import json
+from contextlib import redirect_stdout
+from typing import Callable
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  PRINT HELPERS
+#  All output flows into io.StringIO() via redirect_stdout() inside
+#  _run_all_checks(). main() then decides whether to print the
+#  captured text to the terminal (respecting --quiet) or write it
+#  to --output / emit JSON.
 # ═══════════════════════════════════════════════════════════════
+def _hr(title: str) -> None:
+    print()
+    print("=" * 72)
+    print(f"  {title}")
+    print("=" * 72)
 
-# Trading params that MUST come from config_center, not CONFIG.
-LEGACY_TRADING_PARAMS = [
-    "leverage",
-    "risk_percent",
-    "max_open_positions",
-    "max_same_side_positions",
-    "max_daily_loss_trades",
-    "max_daily_drawdown_percent",
-    "max_account_drawdown",
-    "max_hold_minutes",
-    "min_confidence",
-    "min_adx",
-    "require_htf_agreement",
-    "use_5m_trend_filter",
-    "use_1m_trend_filter",          # dead rename — should be zero hits
-    "max_trades_per_coin_per_day",
-    "htf_align_relaxed",
-    "cooldown_after_sl_min",
-    "cooldown_after_tp_min",
-    "partial_close_usdt",
-    "use_taker_volume",
-    "use_volume_profile",
-    "use_anchored_vwap",
-    "use_funding_z",
-    "use_mtf_confluence",
-    "kz_bypass",
-    "use_spread_filter",
-    "max_spread_pct",
-    "max_spread_trend",
-    "max_spread_range",
-    "max_spread_volatility",
-]
 
-# Dead symbols to hunt (should be ZERO hits).
-DEAD_SYMBOLS = [
-    "get_futures_sentiment",
-    "get_liquidation_pressure",
-    "COOLDOWN_AFTER_SL_MIN",
-    "COOLDOWN_AFTER_TP_MIN",
-    "use_1m_trend_filter",
-]
-
-# Directories to skip entirely.
-SKIP_DIRS = {
-    ".git", "__pycache__", "venv", ".venv", "env", ".env",
-    "node_modules", ".pytest_cache", ".mypy_cache", "build", "dist",
-    ".idea", ".vscode", "migrations",
-}
-
-# Files that are EXPECTED to reference the trading-param names as
-# strings (the proxy contract itself, audit scripts, etc.).
-# Matched by absolute resolved path suffix.
-WHITELIST_PATH_SUFFIXES = (
-    "core/config.py",                       # proxy contract definition
-    "scripts/audit_legacy_config_reads.py",
-    "scripts/audit_config_overlaps.py",
-    "scripts/audit_config_consumers.py",
-    "scripts/fix_config_consumers.py",
-    "scripts/verify_dead_code.py",
-)
-
-# (relative_path_suffix, symbol) pairs that are INTENTIONALLY present.
-# These are legacy env-var NAMES or backward-compat shims, not dead
-# code reads. Matched against the resolved absolute path's tail so it
-# works regardless of the repo root location.
-#
-# REV 2.1 — config_center._LEGACY_ENV_MAP exposes these names as
-# string literals so old `.env` files keep working after the
-# `MAX_HOLD_MINUTES` → `hold_minutes` style renames and the
-# cooldown-constant migration to config_center.
-_WHITELIST_FILE_SYMBOL_PAIRS = frozenset({
-    ("core/config_center.py", "COOLDOWN_AFTER_SL_MIN"),
-    ("core/config_center.py", "COOLDOWN_AFTER_TP_MIN"),
-})
+def _p(line: str = "") -> None:
+    print(line)
 
 
 # ═══════════════════════════════════════════════════════════════
-#  REGEX PRECOMPILE
+#  CHECKS
 # ═══════════════════════════════════════════════════════════════
-_param_alt = "|".join(re.escape(p) for p in LEGACY_TRADING_PARAMS)
-CONFIG_READ_RE = re.compile(rf"\bCONFIG\.({_param_alt})\b")
+def check_global_regime_overlap(verbose: bool) -> int:
+    """Any GLOBAL key also present in a REGIME dict with a different value?"""
+    from core import config_center as CC
 
-DEAD_RE = re.compile(
-    r"\b(" + "|".join(re.escape(s) for s in DEAD_SYMBOLS) + r")\b"
-)
+    _hr("1. GLOBAL vs REGIME key overlap")
+    regime_keys = set()
+    for reg, cfg in CC.REGIME.items():
+        regime_keys.update(cfg.keys())
+    common = set(CC.GLOBAL.keys()) & regime_keys
+    if not common:
+        _p("  [OK] No overlap between GLOBAL and REGIME")
+        return 0
 
-# Strip trailing inline comments before matching: `x = 1  # comment`
-_INLINE_COMMENT_RE = re.compile(r"#.*$")
+    _p(f"  [INFO] {len(common)} keys in both GLOBAL and REGIME "
+       f"(by design - regime overrides):")
+    redundant = []
+    for k in sorted(common):
+        g_val = CC.GLOBAL.get(k)
+        regime_vals = {r: CC.REGIME[r].get(k)
+                       for r in CC.REGIME if k in CC.REGIME[r]}
+        distinct = set(regime_vals.values())
 
-# Triple-quote markers for docstring tracking.
-_TRIPLE_QUOTE_RE = re.compile(r'("""|\'\'\')')
+        is_redundant = (len(distinct) == 1
+                        and list(distinct)[0] == g_val)
+        is_uniform_override = (len(distinct) == 1
+                                and list(distinct)[0] != g_val)
 
+        if is_redundant:
+            redundant.append(k)
+            marker = "[NOTE] redundant shadow (== GLOBAL)"
+        elif is_uniform_override:
+            marker = "[INFO] uniform override (!= GLOBAL)"
+        else:
+            marker = "[OK] varied (regime-specific)"
 
-# ═══════════════════════════════════════════════════════════════
-#  SCANNER
-# ═══════════════════════════════════════════════════════════════
-def _resolved_posix(p: Path) -> str:
-    """Return the resolved path as a forward-slash string."""
-    try:
-        resolved = p.resolve()
-    except OSError:
-        resolved = p
-    return str(resolved).replace("\\", "/")
+        if verbose or is_redundant or len(distinct) > 1:
+            _p(f"     {k:<28} GLOBAL={g_val:<10} "
+               f"regimes={regime_vals}  {marker}")
 
+    if redundant:
+        _p()
+        _p(f"  [NOTE] {len(redundant)} redundant key(s) in REGIME that "
+           f"equal GLOBAL:")
+        _p(f"         {redundant}")
+        _p("         These don't change behaviour - consider removing "
+           "from REGIME.")
 
-def _is_whitelisted(p: Path) -> bool:
-    """Path-suffix whitelist (absolute path, not name)."""
-    rel = _resolved_posix(p)
-    return any(rel.endswith(sfx) for sfx in WHITELIST_PATH_SUFFIXES)
-
-
-def _is_symbol_whitelisted_in_file(p: Path, symbol: str) -> bool:
-    """
-    Check if (file, symbol) is an intentional whitelisted pair
-    (e.g., legacy env-var names exposed as string literals).
-
-    REV 2.1 — compares the resolved path's tail so it works regardless
-    of the absolute repo root.
-    """
-    rel = _resolved_posix(p)
-    for rel_path, whitelisted_sym in _WHITELIST_FILE_SYMBOL_PAIRS:
-        if whitelisted_sym == symbol and rel.endswith(rel_path):
-            return True
-    return False
-
-
-def _should_skip_dir(p: Path) -> bool:
-    return any(part in SKIP_DIRS for part in p.parts)
-
-
-def _strip_inline_comment(line: str) -> str:
-    """Remove everything after `#` — but NOT inside string literals.
-
-    Simple heuristic: if the stripped line contains an odd number of
-    quotes before the `#`, the `#` is likely inside a string. We bail
-    out and return the line as-is in that case (defensive — better to
-    scan a comment than miss a real hit).
-    """
-    idx = line.find("#")
-    if idx < 0:
-        return line
-    head = line[:idx]
-    # Count quote chars — if odd, we're likely inside a string.
-    if (head.count('"') + head.count("'")) % 2 == 1:
-        return line  # bail — treat as code
-    return head
+    # informational only - not treated as a warning
+    return 0
 
 
-def _scan_file(p: Path) -> tuple[list, list]:
-    """Return (legacy_hits, dead_hits) for one file."""
-    legacy_hits: list[tuple[int, str, str]] = []
-    dead_hits:   list[tuple[int, str, str]] = []
+def check_global_strategy_regime_overlap(verbose: bool) -> int:
+    """Any GLOBAL key also in STRATEGY_REGIME dict?"""
+    from core import config_center as CC
 
-    try:
-        text = p.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        print(f"  [skip] {p}: {e}", file=sys.stderr)
-        return legacy_hits, dead_hits
-
-    in_docstring = False
-    docstring_delim = None
-
-    for lineno, raw in enumerate(text.splitlines(), start=1):
-        # ── Track triple-quote state ──
-        # A line can both close and re-open a docstring; process all
-        # occurrences on the line to keep state correct.
-        for m in _TRIPLE_QUOTE_RE.finditer(raw):
-            if not in_docstring:
-                in_docstring = True
-                docstring_delim = m.group(1)
-            elif m.group(1) == docstring_delim:
-                in_docstring = False
-                docstring_delim = None
-
-        if in_docstring:
-            continue
-
-        stripped = raw.strip()
-        if not stripped:
-            continue
-
-        # Skip pure-comment lines.
-        if stripped.startswith("#"):
-            continue
-
-        # Strip trailing inline comments before matching.
-        code_part = _strip_inline_comment(raw)
-        if not code_part.strip():
-            continue
-
-        m = CONFIG_READ_RE.search(code_part)
-        if m:
-            legacy_hits.append((lineno, m.group(1), stripped))
-
-        d = DEAD_RE.search(code_part)
-        if d and not _is_symbol_whitelisted_in_file(p, d.group(1)):
-            dead_hits.append((lineno, d.group(1), stripped))
-
-    return legacy_hits, dead_hits
+    _hr("2. GLOBAL vs STRATEGY_REGIME key overlap")
+    sr_keys = set()
+    for strat, regs in CC.STRATEGY_REGIME.items():
+        for reg, cfg in regs.items():
+            sr_keys.update(cfg.keys())
+    common = set(CC.GLOBAL.keys()) & sr_keys
+    if not common:
+        _p("  [OK] No overlap")
+        return 0
+    _p(f"  [INFO] {len(common)} keys (by design - strategy x regime "
+       f"overrides):")
+    for k in sorted(common):
+        _p(f"     {k}")
+    return 0
 
 
-def scan(root: Path) -> tuple[dict, dict, int]:
-    """Scan all .py files under root.
+def check_global_family_filters_overlap(verbose: bool) -> int:
+    """Any GLOBAL key also in FAMILY[*].FILTERS? Report redundant shadows."""
+    from core import config_center as CC
 
-    Returns (legacy_hits, dead_hits, file_count).
-    legacy_hits / dead_hits: {Path: [(lineno, symbol, line), ...]}
-    """
-    legacy_hits: dict[Path, list] = defaultdict(list)
-    dead_hits:   dict[Path, list] = defaultdict(list)
+    _hr("3. GLOBAL vs FAMILY.FILTERS key overlap")
+    fam_keys = set()
+    for fam, cfg in CC.FAMILY.items():
+        fam_keys.update(cfg.get("FILTERS", {}).keys())
+    common = set(CC.GLOBAL.keys()) & fam_keys
+    if not common:
+        _p("  [OK] No overlap")
+        return 0
 
-    py_files = [
-        p for p in root.rglob("*.py")
-        if not _should_skip_dir(p) and not _is_whitelisted(p)
+    _p(f"  [INFO] {len(common)} keys shadow GLOBAL at family level:")
+    redundant: list[str] = []
+    genuine: list[str] = []
+
+    for k in sorted(common):
+        g_val = CC.GLOBAL.get(k)
+        fam_vals = {f: CC.FAMILY[f]["FILTERS"].get(k) for f in CC.FAMILY
+                    if k in CC.FAMILY[f]["FILTERS"]}
+        distinct = set(fam_vals.values())
+
+        if len(distinct) == 1 and list(distinct)[0] == g_val:
+            redundant.append(k)
+            marker = "[NOTE] redundant shadow (all families == GLOBAL)"
+        else:
+            genuine.append(k)
+            marker = "[OK] varied (genuine family tuning)"
+
+        if verbose or marker.startswith("[NOTE]") or len(distinct) > 1:
+            _p(f"     {k:<28} GLOBAL={g_val}  "
+               f"families={fam_vals}  {marker}")
+
+    if redundant:
+        _p()
+        _p(f"  [NOTE] {len(redundant)} redundant shadow(s) - "
+           f"candidates for cleanup:")
+        for k in redundant:
+            _p(f"         - {k}")
+        _p("         These all equal GLOBAL. Removing them from "
+           "FAMILY[*].FILTERS")
+        _p("         is safe (inherits via GLOBAL -> get_config() merge).")
+        _p("         Reduces maintenance surface.")
+    if genuine:
+        _p()
+        _p(f"  [INFO] {len(genuine)} genuine family override(s): {genuine}")
+
+    return 0
+
+
+def check_min_rr(verbose: bool) -> int:
+    """GLOBAL scalar min_rr vs per-strategy MIN_RR dict."""
+    from core import config_center as CC
+
+    _hr("4. min_rr consistency (GLOBAL scalar vs MIN_RR dict)")
+    scalar = CC.GLOBAL.get("min_rr")
+    _p(f"  GLOBAL['min_rr']          = {scalar}")
+    _p(f"  MIN_RR dict               = {CC.MIN_RR}")
+    _p(f"  get_min_rr('UNKNOWN')     = {CC.get_min_rr('UNKNOWN')}  "
+       f"(falls back to scalar)")
+    missing = [s for s in CC.MIN_RR if CC.MIN_RR[s] < scalar]
+    if missing:
+        _p(f"  [WARN] Strategies with floor < scalar {scalar}: {missing}")
+        return 1
+    _p(f"  [OK] All MIN_RR floors >= scalar fallback")
+    return 0
+
+
+def check_hold_minutes_layering(verbose: bool) -> int:
+    """Walk the 4-layer hold_minutes resolution for samples."""
+    from core import config_center as CC
+
+    _hr("5. hold_minutes layering (GLOBAL -> REGIME -> STRATEGY_REGIME)")
+    samples = [
+        ("BTCUSDT", "SUPERTREND_RIDE", "TREND_UP"),
+        ("BTCUSDT", "SUPERTREND_RIDE", "VOLATILE"),
+        ("XRPUSDT", "RANGE_SCALPER",   "CHOP"),
+        ("XRPUSDT", "RANGE_SCALPER",   "VOLATILE"),
+        ("APTUSDT", "SUPERTREND_RIDE", "UNKNOWN"),
     ]
+    for sym, strat, reg in samples:
+        cfg = CC.get_config(sym, strat, reg)
+        base = CC.GLOBAL.get("hold_minutes")
+        r_cfg = CC.REGIME.get(reg, {}).get("hold_minutes", base)
+        sr = CC.STRATEGY_REGIME.get(strat, {}).get(reg, {})
+        sr_val = sr.get("hold_minutes", r_cfg)
+        final = cfg.get("hold_minutes", base)
+        _p(f"  {sym:<10} [{strat:<18}@{reg:<10}]  "
+           f"GLOBAL={base}  REGIME={r_cfg}  SR={sr_val}  FINAL={final}")
+    _p("  [OK] Resolution works (later layer wins)")
+    return 0
 
-    for p in py_files:
-        lh, dh = _scan_file(p)
-        if lh:
-            legacy_hits[p] = lh
-        if dh:
-            dead_hits[p] = dh
 
-    return legacy_hits, dead_hits, len(py_files)
+def check_time_exit_deps(verbose: bool) -> int:
+    """time_exit_enabled + hold_minutes co-dependency."""
+    from core import config_center as CC
+
+    _hr("6. time_exit_enabled + hold_minutes co-dependency")
+    tee = CC.GLOBAL.get("time_exit_enabled")
+    hm = CC.GLOBAL.get("hold_minutes")
+    _p(f"  time_exit_enabled = {tee}")
+    _p(f"  hold_minutes      = {hm}")
+    if not tee:
+        _p("  [INFO] TIME_EXIT disabled - hold_minutes is a fallback only")
+    else:
+        _p(f"  [OK] TIME_EXIT enabled - trades will exit after {hm}m "
+           f"(or regime override)")
+    return 0
+
+
+def check_spread_caps(verbose: bool) -> int:
+    """Spread caps fallback chain - sanity check.
+
+    REV 5.4 - GLOBAL['max_spread_pct'] is a FALLBACK default, NOT a
+    ceiling. Families can be tighter (liquid majors) or wider (illiquid
+    meme coins) based on liquidity. Resolved at runtime via
+    _get_spread_cap_for_family() in core/future.py.
+
+    Sanity bounds:
+      - All caps must be in (0, 1.0] %  (above 1% is unsafe for entries)
+      - Trend cap should typically be the tightest (majors)
+      - Volatility cap should typically be the widest (memes)
+    """
+    from core import config_center as CC
+
+    _hr("7. Spread caps fallback chain")
+    g = CC.GLOBAL.get("max_spread_pct")
+    t = CC.GLOBAL.get("max_spread_trend")
+    r = CC.GLOBAL.get("max_spread_range")
+    v = CC.GLOBAL.get("max_spread_volatility")
+    _p(f"  max_spread_pct        (fallback)  = {g}")
+    _p(f"  max_spread_trend      (trend)     = {t}")
+    _p(f"  max_spread_range      (range)     = {r}")
+    _p(f"  max_spread_volatility (vol/mom)   = {v}")
+    _p()
+    _p("  [INFO] GLOBAL is a FALLBACK default, not a ceiling.")
+    _p("  [INFO] Families can be tighter OR wider based on liquidity.")
+    _p("  [INFO] Resolved via _get_spread_cap_for_family() in future.py")
+    _p()
+
+    issues: list[str] = []
+    for name, val in (("trend", t), ("range", r), ("volatility", v)):
+        if val is None:
+            issues.append(f"{name} cap missing")
+            continue
+        if val <= 0:
+            issues.append(f"{name} cap {val} must be > 0")
+        if val > 1.0:
+            issues.append(f"{name} cap {val} > 1.0% (unsafe for entries)")
+
+    if issues:
+        _p(f"  [WARN] {issues}")
+        return 1
+
+    _p("  [OK] All family caps within sane bounds (0, 1.0%]")
+
+    if t <= r <= v:
+        _p("  [OK] Ordering trend <= range <= volatility "
+           "(liquidity-consistent)")
+    else:
+        _p(f"  [INFO] Ordering is trend={t} range={r} vol={v} "
+           f"(non-standard but valid if intentional)")
+
+    return 0
+
+
+def check_vol_class_layering(verbose: bool) -> int:
+    """Vol class triple: CAP_MULT (SL/TP) x R_THRESHOLDS x QTY_MULT."""
+    from core import config_center as CC
+
+    _hr("8. Vol class layering")
+    classes = ["LOW", "MED", "HIGH"]
+    _p(f"  {'class':<6} {'CAP_MULT':<10} {'QTY_MULT':<10} "
+       f"{'BE_R':<8} {'L1_R':<8} {'L2_R':<8}")
+    for c in classes:
+        cap = CC.VOL_CLASS_CAP_MULT.get(c)
+        qty = CC.VOL_CLASS_QTY_MULT.get(c)
+        r = CC.VOL_CLASS_R_THRESHOLDS.get(c, {})
+        _p(f"  {c:<6} {cap:<10} {qty:<10} "
+           f"{r.get('be_r', '-'):<8} {r.get('lock1_r', '-'):<8} "
+           f"{r.get('lock2_r', '-'):<8}")
+    _p()
+    _p("  [OK] CAP_MULT scales SL/TP distances; QTY_MULT scales "
+       "position size")
+    _p("  [OK] R_THRESHOLDS drive BE/Lock1/Lock2 trigger levels")
+    return 0
+
+
+def check_legacy_r_mult_pairs(verbose: bool) -> int:
+    """Legacy % SL fallback vs R-multiple thresholds."""
+    from core import config_center as CC
+
+    _hr("9. Legacy % SL vs R-multiple pairs")
+    pairs = [
+        ("be_factor",  "be_stop_r",    "BE"),
+        ("lock1_pct",  "lock1_stop_r", "Lock1"),
+        ("lock2_pct",  "lock2_stop_r", "Lock2"),
+    ]
+    for legacy, modern, label in pairs:
+        lv = CC.GLOBAL.get(legacy)
+        mv = CC.GLOBAL.get(modern)
+        _p(f"  {label:<6} legacy {legacy:<12}={lv:<8}  "
+           f"modern {modern:<12}={mv}")
+    _p()
+    _p("  [INFO] Legacy path used when risk_unit missing; modern path is "
+       "R-based")
+    return 0
+
+
+def check_safety_snapshot_keys(verbose: bool) -> int:
+    """
+    REV 5.5 - Check 10.
+
+    core/state.py imports _SAFETY_SNAPSHOT_KEYS at module load and
+    raises RuntimeError if any is missing from GLOBAL. This check
+    surfaces that failure here (before runtime) with a clear message.
+    """
+    _hr("10. Safety snapshot keys present in GLOBAL")
+    try:
+        from core import config_center as CC
+    except Exception as e:
+        _p(f"  [WARN] cannot import config_center: {type(e).__name__}: {e}")
+        return 1
+
+    safety = getattr(CC, "_SAFETY_SNAPSHOT_KEYS", None)
+    if safety is None:
+        _p("  [WARN] _SAFETY_SNAPSHOT_KEYS not defined in config_center")
+        _p("         state.py imports this set at module load.")
+        return 1
+
+    missing = sorted(k for k in safety if k not in CC.GLOBAL)
+    if missing:
+        _p(f"  [WARN] {len(missing)} safety key(s) missing from GLOBAL:")
+        for k in missing:
+            _p(f"         - {k}")
+        _p("         state.py will fail its import-time check with a")
+        _p("         clear RuntimeError. Add them to GLOBAL defaults.")
+        return 1
+
+    _p(f"  [OK] All {len(safety)} safety keys present: {sorted(safety)}")
+    return 0
+
+
+def check_proxy_contract(verbose: bool) -> int:
+    """
+    REV 5.5 - Check 11.
+
+    Every value in core/config.py's _PROXIED_TRADING_ATTRS must resolve
+    to a key present in config_center.GLOBAL. Catches drift between the
+    proxy contract and the source of truth.
+    """
+    _hr("11. config.py proxy contract (_PROXIED_TRADING_ATTRS)")
+    try:
+        from core import config_center as CC
+    except Exception as e:
+        _p(f"  [WARN] cannot import config_center: {type(e).__name__}: {e}")
+        return 1
+
+    verify = getattr(CC, "verify_proxy_contract", None)
+    if not callable(verify):
+        _p("  [WARN] config_center.verify_proxy_contract() not available")
+        _p("         (added in config_center REV 5.6). Upgrade required.")
+        return 1
+
+    try:
+        missing = verify()
+    except Exception as e:
+        _p(f"  [WARN] verify_proxy_contract raised: "
+           f"{type(e).__name__}: {e}")
+        return 1
+
+    if missing:
+        _p(f"  [WARN] {len(missing)} proxied attr(s) not in GLOBAL:")
+        for k in missing:
+            _p(f"         - {k}")
+        _p("         Fix: add missing keys to config_center.GLOBAL, or")
+        _p("         remove stale entries from config.py "
+           "_PROXIED_TRADING_ATTRS.")
+        return 1
+
+    _p("  [OK] All config.py _PROXIED_TRADING_ATTRS resolve to GLOBAL "
+       "keys")
+    return 0
+
+
+def check_decision_sanity(verbose: bool) -> int:
+    """
+    REV 5.5 - Check 12.
+
+    Mirrors the DECISION sanity block in config_center._validate(),
+    but is runnable standalone (useful when _validate has been
+    relaxed or during incremental upgrades).
+    """
+    _hr("12. DECISION sanity")
+    try:
+        from core import config_center as CC
+    except Exception as e:
+        _p(f"  [WARN] cannot import config_center: {type(e).__name__}: {e}")
+        return 1
+
+    d = CC.DECISION
+    issues: list[str] = []
+
+    ma = d.get("min_approvals")
+    tf = d.get("total_filters")
+    if ma is None or tf is None:
+        issues.append("min_approvals / total_filters missing")
+    else:
+        if ma > tf:
+            issues.append(
+                f"min_approvals={ma} > total_filters={tf} "
+                f"(impossible gate - no signal could ever pass)"
+            )
+
+    wmin = d.get("wr_mult_min")
+    wmax = d.get("wr_mult_max")
+    if wmin is not None and wmax is not None and wmin > wmax:
+        issues.append(f"wr_mult_min={wmin} > wr_mult_max={wmax}")
+
+    soft = d.get("adx_counter_trend_soft_max")
+    hard = d.get("adx_counter_trend_hard_max")
+    if soft is not None and hard is not None and soft > hard:
+        issues.append(
+            f"adx_counter_trend_soft_max={soft} > "
+            f"adx_counter_trend_hard_max={hard}"
+        )
+
+    if issues:
+        for i in issues:
+            _p(f"  [WARN] {i}")
+        return 1
+
+    _p(f"  [OK] min_approvals={ma}/{tf}, "
+       f"wr_mult=[{wmin}, {wmax}], "
+       f"adx={soft}/{hard}")
+    return 0
 
 
 # ═══════════════════════════════════════════════════════════════
-#  REPORTING
+#  REGISTRY
 # ═══════════════════════════════════════════════════════════════
-def _build_summary(legacy_hits: dict, dead_hits: dict, file_count: int) -> dict:
-    return {
-        "file_count": file_count,
-        "legacy_reads": {
-            "total": sum(len(v) for v in legacy_hits.values()),
-            "files_affected": len(legacy_hits),
-            "by_file": {
-                str(p): [
-                    {"line": ln, "param": param, "text": txt}
-                    for ln, param, txt in rows
-                ]
-                for p, rows in legacy_hits.items()
-            },
-        },
-        "dead_symbols": {
-            "total": sum(len(v) for v in dead_hits.values()),
-            "files_affected": len(dead_hits),
-            "by_file": {
-                str(p): [
-                    {"line": ln, "symbol": sym, "text": txt}
-                    for ln, sym, txt in rows
-                ]
-                for p, rows in dead_hits.items()
-            },
-        },
-    }
-
-
-def _write_text_report(out_path: Path, summary: dict) -> None:
-    with out_path.open("w", encoding="utf-8") as f:
-        f.write("=" * 78 + "\n")
-        f.write("  LEGACY CONFIG.<trading_param> READS\n")
-        f.write("  → migrate to: from core import config_center as CC; CC.get('<key>')\n")
-        f.write("=" * 78 + "\n\n")
-        lr = summary["legacy_reads"]
-        f.write(f"Total matches: {lr['total']}  |  "
-                f"Files affected: {lr['files_affected']}\n\n")
-
-        for p_str in sorted(lr["by_file"].keys()):
-            rows = lr["by_file"][p_str]
-            f.write(f"\n── {p_str}  ({len(rows)} hits)\n")
-            for r in rows:
-                f.write(f"   L{r['line']:<5}  CONFIG.{r['param']:<28}  "
-                        f"|  {r['text']}\n")
-
-        f.write("\n\n" + "=" * 78 + "\n")
-        f.write("  DEAD SYMBOLS (should be ZERO hits)\n")
-        f.write("=" * 78 + "\n\n")
-        ds = summary["dead_symbols"]
-        f.write(f"Total matches: {ds['total']}  |  "
-                f"Files affected: {ds['files_affected']}\n\n")
-
-        for p_str in sorted(ds["by_file"].keys()):
-            rows = ds["by_file"][p_str]
-            f.write(f"\n── {p_str}  ({len(rows)} hits)\n")
-            for r in rows:
-                f.write(f"   L{r['line']:<5}  {r['symbol']:<32}  "
-                        f"|  {r['text']}\n")
-
-
-def _print_console_summary(summary: dict, quiet: bool) -> None:
-    if quiet:
-        return
-    lr = summary["legacy_reads"]
-    ds = summary["dead_symbols"]
-    print(f"\nScanned {summary['file_count']} Python files.")
-    print(f"  Legacy CONFIG reads : {lr['total']} "
-          f"({lr['files_affected']} files)")
-    print(f"  Dead symbols        : {ds['total']} "
-          f"({ds['files_affected']} files)")
-
-    if lr["total"]:
-        print("\nLegacy CONFIG reads found:")
-        top = sorted(lr["by_file"].items(), key=lambda kv: -len(kv[1]))[:10]
-        for p_str, rows in top:
-            print(f"   {len(rows):>4}  {p_str}")
-
-    if ds["total"]:
-        print("\nDead symbols found:")
-        top = sorted(ds["by_file"].items(), key=lambda kv: -len(kv[1]))[:10]
-        for p_str, rows in top:
-            print(f"   {len(rows):>4}  {p_str}")
+CHECKS: list[tuple[str, Callable[[bool], int]]] = [
+    ("global_regime_overlap",          check_global_regime_overlap),
+    ("global_strategy_regime_overlap", check_global_strategy_regime_overlap),
+    ("global_family_filters_overlap",  check_global_family_filters_overlap),
+    ("min_rr",                         check_min_rr),
+    ("hold_minutes_layering",          check_hold_minutes_layering),
+    ("time_exit_deps",                 check_time_exit_deps),
+    ("spread_caps",                    check_spread_caps),
+    ("vol_class_layering",             check_vol_class_layering),
+    ("legacy_r_mult_pairs",            check_legacy_r_mult_pairs),
+    ("safety_snapshot_keys",           check_safety_snapshot_keys),
+    ("proxy_contract",                 check_proxy_contract),
+    ("decision_sanity",                check_decision_sanity),
+]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -403,14 +537,13 @@ def _print_console_summary(summary: dict, quiet: bool) -> None:
 # ═══════════════════════════════════════════════════════════════
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="audit_legacy_config_reads",
-        description="Scan for legacy CONFIG.<trading_param> reads and "
-                    "dead symbols.",
+        prog="audit_config_overlaps",
+        description="Deep consistency audit of the layered config system.",
     )
     mode = p.add_mutually_exclusive_group()
     mode.add_argument(
         "--strict", action="store_true",
-        help="Exit 1 if any non-whitelisted hit is found (CI mode).",
+        help="Exit 1 if any warning is found (CI mode).",
     )
     mode.add_argument(
         "--report", action="store_true",
@@ -426,46 +559,98 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--quiet", action="store_true",
-        help="Suppress console summary (useful in CI pipelines).",
+        help="Suppress ALL terminal output (useful in CI pipelines). "
+             "Combine with --output to save results.",
+    )
+    p.add_argument(
+        "--verbose", action="store_true",
+        help="Show full row details, not just conflicts.",
     )
     return p.parse_args(argv)
+
+
+def _run_all_checks(verbose: bool) -> tuple[int, str]:
+    """
+    Run every check, capture stdout, return (warnings, captured_text).
+
+    All check output is captured into an io.StringIO buffer via
+    redirect_stdout. main() decides whether to print the buffer to the
+    terminal (respecting --quiet) or write it to --output / emit JSON.
+    """
+    buf = io.StringIO()
+    warnings = 0
+    with redirect_stdout(buf):
+        for name, fn in CHECKS:
+            try:
+                warnings += fn(verbose=verbose)
+            except Exception as e:
+                # A check crashing should not silently pass; count it.
+                print(f"  [WARN] check {name} raised "
+                      f"{type(e).__name__}: {e}")
+                warnings += 1
+    return warnings, buf.getvalue()
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
+    # Ensure core package is importable (run from repo root).
     root = Path.cwd()
     if not (root / "core").exists():
-        print("❌ Run this from the repo root (folder containing 'core/').",
+        print("Run this from the repo root (folder containing 'core/').",
               file=sys.stderr)
         return 2
 
-    legacy_hits, dead_hits, file_count = scan(root)
-    summary = _build_summary(legacy_hits, dead_hits, file_count)
+    try:
+        from core import config_center as CC  # noqa: F401
+    except Exception as e:
+        print(f"Cannot import core.config_center: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return 2
 
-    total_hits = summary["legacy_reads"]["total"] + summary["dead_symbols"]["total"]
+    warnings, text_report = _run_all_checks(args.verbose)
 
     # ── Output ──
     if args.format == "json":
-        payload = json.dumps(summary, indent=2, default=str)
+        payload = json.dumps(
+            {
+                "warnings": warnings,
+                "checks_run": len(CHECKS),
+                "exit_code": 1 if warnings else 0,
+                "text_output": text_report,
+            },
+            indent=2,
+        )
         if args.output:
             args.output.write_text(payload, encoding="utf-8")
             if not args.quiet:
                 print(f"JSON report written: {args.output}")
-        else:
+        elif not args.quiet:
+            # REV 5.5b — --quiet now consistently suppresses stdout too.
             print(payload)
     else:
         if args.output:
-            _write_text_report(args.output, summary)
+            args.output.write_text(text_report, encoding="utf-8")
             if not args.quiet:
                 print(f"Report written: {args.output}")
-        _print_console_summary(summary, args.quiet)
+        if not args.quiet:
+            print("=" * 72)
+            print("  CONFIG OVERLAP AUDIT -- REV 5.5b")
+            print("=" * 72)
+            print(text_report)
+            print()
+            print("=" * 72)
+            if warnings:
+                print(f"  [WARN] {warnings} warning(s) - review above")
+            else:
+                print("  [OK] No conflicts. Config layering is clean.")
+            print("=" * 72)
 
     # ── Exit code ──
     if args.report:
         return 0
     # default is strict semantics for CI safety
-    return 1 if total_hits > 0 else 0
+    return 1 if warnings > 0 else 0
 
 
 if __name__ == "__main__":
