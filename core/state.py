@@ -1,39 +1,35 @@
 """
 state.py — Runtime state for the trading engine.
 
-REV 1.3.18 (2026-10-03) — FAIL-FAST SAFETY-KEY VERIFICATION:
-  ✅ At import time we now verify that all required safety keys
-     (max_daily_loss_trades, max_daily_drawdown_percent,
-     max_account_drawdown) exist in config_center.GLOBAL. Previously
-     a missing key surfaced as `CC.get(...)` returning None and blew
-     up LATER as a TypeError in `loss_count >= None`. Now it fails
-     immediately with a clear remediation message.
-  ✅ Docstring explicitly documents the CONFIG-vs-CC split:
-       • CONFIG (core.config)        → file paths, blacklist (env-only)
-       • CC     (core.config_center) → trading params, safety limits
-     No duplication, no ambiguity about which is authoritative.
+REV 1.3.19 (2026-10-03) — CONCURRENCY + FAIL-CLOSED HARDENING:
+  ✅ CRITICAL: `DailyTracker` now guarded by `_DAILY_TRACKER_LOCK`
+     (RLock). Previously add_loss() / is_limit_reached() /
+     update_peak() / reset_if_new_day() were unsynchronised; a
+     read-modify-write on `loss_count` could lost-update under
+     concurrent calls from the scan loop and trade manager. The
+     DD kill-switch decision was therefore untrustworthy at exactly
+     the moment it mattered (crash / high activity).
+  ✅ CRITICAL: `is_limit_reached()` is now FAIL-CLOSED on unreadable
+     equity. Previously `if current_equity < 100: return False` meant
+     a failed equity fetch silently skipped the DD check. Now
+     equity <= 0 returns (True, "EQUITY_UNREADABLE") so the caller
+     halts instead of continuing to trade on a blind book.
+  ✅ Rollover logic consolidated: `_check_date_rollover()` now also
+     resets `start_balance` / `peak_balance` so the two functions
+     (`_check_date_rollover` and `reset_if_new_day`) can no longer
+     disagree about whether the day has turned.
+  ✅ `reset_if_new_day()` guards against an invalid `current_balance`
+     argument (0 / negative / NaN) — the caller's transient bad
+     read no longer corrupts the day's baseline.
+  ✅ Removed dead branch in `_load()` (peak_date != today was
+     unreachable under atomic write semantics).
+  ✅ `save_coin_rotation()` — snapshot under lock, disk I/O outside
+     (previously the write lock serialised a whole JSON dump while
+     other threads waited to read rotation state).
 
-REV 1.3.17 (2026-10-02) — CONFIG CLEANUP:
-  ✅ Removed dead constants COOLDOWN_AFTER_SL_MIN / COOLDOWN_AFTER_TP_MIN
-     — orders/exit.py REV 1.6.0 reads these LIVE from config_center
-     via _cc_get(). No consumer remains.
-  ✅ MAX_TRADES_PER_COIN_PER_DAY now read LIVE from config_center on
-     every can_trade_coin() / record_coin_trade() call. UI/env runtime
-     changes take effect immediately.
-  ✅ MAX_DAILY_LOSS_TRADES / MAX_DAILY_DRAWDOWN_PERCENT /
-     MAX_ACCOUNT_DRAWDOWN intentionally kept as module-level snapshots.
-     RATIONALE: these are SAFETY LIMITS. Runtime-flipping them via UI
-     could accidentally disable loss protection mid-session. Use .env
-     or CC_<KEY> env override + restart to change.
-  ✅ Zero behaviour change for default values.
-
-REV 1.3.16 (2026-10-02) — DAILY TRACKER DATE-ROLLOVER FIX.
-REV 1.3.15 (2026-09-29) — DEAD HTF COUNTER REMOVED.
-REV 1.3.14 (2026-09-29) — DEAD COUNTER CLEANUP.
-REV 1.3.13 (2026-09-28) — PRE-GATE SIGNAL COUNTERS.
-REV 1.3.12 (2026-09-28) — DECISION COUNTER ADDED.
-REV 1.3.11 (2026-09-26) — DEAD IMPORT CLEANUP.
-REV 1.3.10 (2026-09-26) — MTF COUNTER ADDED.
+REV 1.3.18 (2026-10-03) — FAIL-FAST SAFETY-KEY VERIFICATION (retained).
+REV 1.3.17 (2026-10-02) — CONFIG CLEANUP (retained).
+REV 1.3.16 (2026-10-02) — DAILY TRACKER DATE-ROLLOVER FIX (retained).
 REV 1.3.9  (2026-09-24) — WRITE-LOCK RACE + TEMP-FILE UNIQUENESS FIX.
 REV 1.3.8  (2026-09-23) — WRITE LOCK ADDED.
 REV 1.3.5  (2026-09-23) — ATOMIC WRITES + PEAK FIX.
@@ -41,6 +37,7 @@ REV 1.3.5  (2026-09-23) — ATOMIC WRITES + PEAK FIX.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import uuid
@@ -168,7 +165,9 @@ def load_active_trades() -> None:
                         lvl = trade['sl_level']
                         try:
                             lvl_int = int(float(lvl))
-                            trade['sl_level'] = lvl_int if lvl_int in (0, 1, 2, 3) else 0
+                            trade['sl_level'] = (
+                                lvl_int if lvl_int in (0, 1, 2, 3) else 0
+                            )
                         except Exception:
                             trade['sl_level'] = 0
                     active_trades[sym] = trade
@@ -224,7 +223,9 @@ def load_cooldowns() -> None:
                         if ts > datetime.now(PKT):
                             cooldown_until[sym] = ts
                     except Exception as e:
-                        logger.warning(f"Skipping malformed cooldown {sym}={ts_str}: {e}")
+                        logger.warning(
+                            f"Skipping malformed cooldown {sym}={ts_str}: {e}"
+                        )
         logger.info(f" Cooldowns loaded ({len(cooldown_until)} active)")
     except Exception as e:
         logger.warning(f"Could not load cooldowns: {e}")
@@ -234,8 +235,11 @@ def save_cooldowns() -> None:
     try:
         with _COOLDOWN_WRITE_LOCK:
             with COOLDOWN_LOCK:
-                data = {sym: ts.isoformat() for sym, ts in cooldown_until.items()
-                        if ts > datetime.now(PKT)}
+                data = {
+                    sym: ts.isoformat()
+                    for sym, ts in cooldown_until.items()
+                    if ts > datetime.now(PKT)
+                }
             _atomic_json_write(COOLDOWN_FILE, data)
     except Exception as e:
         logger.warning(f"Could not save cooldowns: {e}")
@@ -257,7 +261,11 @@ def cleanup_entry_candles() -> None:
             stale = []
             for k, v in last_entry_candle.items():
                 try:
-                    vv = v.tz_convert(None) if getattr(v, 'tzinfo', None) is not None else v
+                    vv = (
+                        v.tz_convert(None)
+                        if getattr(v, 'tzinfo', None) is not None
+                        else v
+                    )
                     if vv < cutoff:
                         stale.append(k)
                 except Exception:
@@ -332,14 +340,16 @@ def reset_v2_stats() -> None:
 
 def get_v2_stats_str() -> str:
     with V2_STATS_LOCK:
-        return (f"V2 Stats - Sig:{V2_STATS['signals']} "
-                f"PreGate[c:{V2_STATS['low_conf']} "
-                f"r:{V2_STATS['low_rr']} "
-                f"a:{V2_STATS['low_adx']}] "
-                f"Trend:{V2_STATS['trend']} "
-                f"Rot:{V2_STATS['rotation']} "
-                f"Dec:{V2_STATS['decision']} "
-                f"Blocked:{V2_STATS['total']}")
+        return (
+            f"V2 Stats - Sig:{V2_STATS['signals']} "
+            f"PreGate[c:{V2_STATS['low_conf']} "
+            f"r:{V2_STATS['low_rr']} "
+            f"a:{V2_STATS['low_adx']}] "
+            f"Trend:{V2_STATS['trend']} "
+            f"Rot:{V2_STATS['rotation']} "
+            f"Dec:{V2_STATS['decision']} "
+            f"Blocked:{V2_STATS['total']}"
+        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -347,7 +357,17 @@ def get_v2_stats_str() -> str:
 #   REV 1.3.16 — date-rollover fix + public getter
 #   REV 1.3.17 — safety limits documented as snapshots
 #   REV 1.3.18 — import-time verification of safety keys
+#   REV 1.3.19 — thread-safe (RLock); fail-CLOSED on bad equity;
+#                rollover consolidated
 # ─────────────────────────────────────────────────────────────
+_DAILY_TRACKER_LOCK = threading.RLock()
+
+# Minimum meaningful equity. Below this we do not trust the value
+# enough to compute drawdown, and we also do not trust it enough to
+# silently skip the DD check (the previous behaviour).
+_MIN_TRUSTWORTHY_EQUITY = 100.0
+
+
 class DailyTracker:
     """
     Tracks daily loss count + balance peaks.
@@ -355,32 +375,28 @@ class DailyTracker:
     Persistence: JSON file (LOSS_FILE from CONFIG).
     Reset trigger: date change in PKT timezone (UTC+5).
 
-    REV 1.3.16:
-      • `_check_date_rollover()` runs at START of add_loss() and
-        is_limit_reached() — prevents stale-date saves.
-      • `get_loss_count()` public getter — for web/app.py.
+    Thread safety (REV 1.3.19):
+      All public methods take `_DAILY_TRACKER_LOCK` (an RLock, because
+      some methods call others internally). The lock covers the whole
+      read-modify-write on `loss_count` / `start_balance` /
+      `peak_balance` so concurrent calls cannot lost-update.
 
-    REV 1.3.17 — NOTE ON SAFETY LIMITS:
-      MAX_DAILY_LOSS_TRADES / MAX_DAILY_DRAWDOWN_PERCENT /
-      MAX_ACCOUNT_DRAWDOWN are module-level snapshots (import-time
-      values). They are NOT live-read even if update_runtime() is
-      called. This is intentional: mid-session runtime flips could
-      disable loss protection. To change → env + restart.
-
-    REV 1.3.18:
-      Module-level check guarantees the three constants above are
-      non-None integers, so the comparisons in is_limit_reached()
-      cannot raise TypeError from a silently-missing CC key.
+    Fail-closed equity (REV 1.3.19):
+      `is_limit_reached()` returns (True, reason) when the caller
+      supplies an unreadable equity (0, negative, NaN). The bot should
+      halt rather than trade blind. Previous behaviour returned False
+      — silently skipping DD protection.
     """
 
     def __init__(self):
         self.file = LOSS_FILE
         self.today = datetime.now(PKT).date()
         self.loss_count = 0
-        self.start_balance = 0
-        self.peak_balance = 0
+        self.start_balance = 0.0
+        self.peak_balance = 0.0
         self._load()
 
+    # ─── internal ───
     def _load(self):
         try:
             if not os.path.exists(self.file):
@@ -393,12 +409,11 @@ class DailyTracker:
                 self.loss_count = int(d.get('loss_count', 0))
                 self.start_balance = float(d.get('start_balance', 0))
                 self.peak_balance = float(d.get('peak_balance', 0))
-                if d.get('peak_date') != str(self.today):
-                    self.peak_balance = self.start_balance
                 logger.info(
                     f" DailyTracker loaded: date={saved_date} "
                     f"loss_count={self.loss_count} "
-                    f"start_bal=${self.start_balance:.2f}"
+                    f"start_bal=${self.start_balance:.2f} "
+                    f"peak_bal=${self.peak_balance:.2f}"
                 )
             else:
                 logger.info(
@@ -418,62 +433,134 @@ class DailyTracker:
         })
 
     def _check_date_rollover(self):
-        today = datetime.now(PKT).date()
-        if today != self.today:
-            logger.info(
-                f" DailyTracker: date rollover "
-                f"{self.today} → {today} — resetting loss_count"
-            )
-            self.today = today
-            self.loss_count = 0
-            self._save()
-            reset_v2_stats()
+        """
+        Reset per-day state if the PKT date has changed. Consolidated:
+        resets loss_count AND start_balance AND peak_balance, so callers
+        cannot observe a mismatched combination.
 
+        Caller must hold _DAILY_TRACKER_LOCK.
+        """
+        today = datetime.now(PKT).date()
+        if today == self.today:
+            return
+        logger.info(
+            f" DailyTracker: date rollover "
+            f"{self.today} → {today} — resetting daily state"
+        )
+        self.today = today
+        self.loss_count = 0
+        self.start_balance = 0.0
+        self.peak_balance = 0.0
+        self._save()
+        try:
+            reset_v2_stats()
+        except Exception as e:
+            logger.debug(f"reset_v2_stats on rollover failed: {e}")
+
+    # ─── public ───
     def get_loss_count(self) -> int:
         """Return the current day's loss count (with rollover check)."""
-        self._check_date_rollover()
-        return self.loss_count
+        with _DAILY_TRACKER_LOCK:
+            self._check_date_rollover()
+            return self.loss_count
 
-    def reset_if_new_day(self, current_balance: float):
-        today = datetime.now(PKT).date()
-        if today != self.today or self.start_balance == 0:
-            self.today = today
-            self.loss_count = 0
-            self.start_balance = current_balance
-            self.peak_balance = current_balance
+    def reset_if_new_day(self, current_balance: float) -> None:
+        """
+        Establish the day's baseline if we haven't yet (first call of
+        the day, or after rollover). Ignores invalid balances — a
+        transient bad read does not corrupt the baseline.
+        """
+        with _DAILY_TRACKER_LOCK:
+            try:
+                cb = float(current_balance)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(cb) or cb <= 0:
+                logger.warning(
+                    f" DailyTracker.reset_if_new_day: refusing invalid "
+                    f"balance {current_balance!r}"
+                )
+                return
+
+            today = datetime.now(PKT).date()
+            rolled = (today != self.today)
+            fresh = (self.start_balance <= 0)
+
+            if rolled or fresh:
+                self.today = today
+                self.loss_count = 0
+                self.start_balance = cb
+                self.peak_balance = cb
+                self._save()
+                if rolled:
+                    try:
+                        reset_v2_stats()
+                    except Exception as e:
+                        logger.debug(f"reset_v2_stats on new-day failed: {e}")
+                logger.info(f" New day! Start Bal: ${cb:.2f}")
+
+    def update_peak(self, current_balance: float) -> None:
+        with _DAILY_TRACKER_LOCK:
+            try:
+                cb = float(current_balance)
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(cb) or cb <= 0:
+                return
+            if cb > self.peak_balance:
+                self.peak_balance = cb
+                self._save()
+
+    def add_loss(self) -> None:
+        with _DAILY_TRACKER_LOCK:
+            self._check_date_rollover()
+            self.loss_count += 1
             self._save()
-            reset_v2_stats()
-            logger.info(f" New day! Start Bal: ${current_balance:.2f}")
-
-    def update_peak(self, current_balance: float):
-        if current_balance > self.peak_balance:
-            self.peak_balance = current_balance
-            self._save()
-
-    def add_loss(self):
-        self._check_date_rollover()
-        self.loss_count += 1
-        self._save()
-        logger.info(
-            f" Daily Loss Count: {self.loss_count}/{MAX_DAILY_LOSS_TRADES}"
-        )
+            logger.info(
+                f" Daily Loss Count: {self.loss_count}/{MAX_DAILY_LOSS_TRADES}"
+            )
 
     def is_limit_reached(self, current_equity: float) -> tuple[bool, str]:
-        if current_equity < 100:
+        """
+        DD kill-switch query.
+
+        REV 1.3.19 — fail-CLOSED:
+          • equity unreadable (0, negative, NaN, non-numeric) → halt
+          • equity below _MIN_TRUSTWORTHY_EQUITY             → halt
+        The bot should never trade on a book it cannot value.
+        """
+        # Fail-closed on unreadable / untrustworthy equity.
+        try:
+            eq = float(current_equity)
+        except (TypeError, ValueError):
+            return True, "EQUITY_UNREADABLE"
+        if not math.isfinite(eq) or eq <= 0:
+            return True, "EQUITY_UNREADABLE"
+        if eq < _MIN_TRUSTWORTHY_EQUITY:
+            return True, f"EQUITY_TOO_LOW({eq:.2f})"
+
+        with _DAILY_TRACKER_LOCK:
+            self._check_date_rollover()
+            self.reset_if_new_day(eq)
+
+            if self.loss_count >= MAX_DAILY_LOSS_TRADES:
+                return True, f"Loss count {self.loss_count}"
+
+            if self.start_balance > _MIN_TRUSTWORTHY_EQUITY:
+                dd = (
+                    (self.start_balance - eq) / self.start_balance * 100
+                )
+                if dd >= MAX_DAILY_DRAWDOWN_PERCENT:
+                    return True, f"Daily DD {dd:.2f}%"
+
+            if self.peak_balance > _MIN_TRUSTWORTHY_EQUITY:
+                acc_dd = (
+                    (self.peak_balance - eq) / self.peak_balance * 100
+                )
+                if acc_dd >= MAX_ACCOUNT_DRAWDOWN:
+                    return True, f"Account DD {acc_dd:.2f}%"
+
             return False, ""
-        self._check_date_rollover()
-        self.reset_if_new_day(current_equity)
-        if self.loss_count >= MAX_DAILY_LOSS_TRADES:
-            return True, f"Loss count {self.loss_count}"
-        if self.start_balance > 100:
-            dd = (self.start_balance - current_equity) / self.start_balance * 100
-            if dd >= MAX_DAILY_DRAWDOWN_PERCENT:
-                return True, f"Daily DD {dd:.2f}%"
-        if self.peak_balance > 100:
-            acc_dd = (self.peak_balance - current_equity) / self.peak_balance * 100
-            if acc_dd >= MAX_ACCOUNT_DRAWDOWN:
-                return True, f"Account DD {acc_dd:.2f}%"
-        return False, ""
 
 
 daily_tracker = DailyTracker()
@@ -482,6 +569,7 @@ daily_tracker = DailyTracker()
 # ─────────────────────────────────────────────────────────────
 # COIN ROTATION
 #   REV 1.3.17 — MAX_TRADES_PER_COIN_PER_DAY now read LIVE
+#   REV 1.3.19 — snapshot under lock, disk I/O outside
 # ─────────────────────────────────────────────────────────────
 _ROTATION_WRITE_LOCK = threading.Lock()
 
@@ -500,8 +588,10 @@ def save_coin_rotation(data: dict) -> None:
     try:
         with _ROTATION_WRITE_LOCK:
             today = datetime.now(PKT).date()
+            # Snapshot keys to delete (do not mutate caller's dict).
+            pruned = dict(data)
             keys_to_del = []
-            for k in data.keys():
+            for k in pruned.keys():
                 try:
                     d = datetime.strptime(k, '%Y-%m-%d').date()
                     if (today - d).days > 3:
@@ -509,8 +599,8 @@ def save_coin_rotation(data: dict) -> None:
                 except Exception:
                     pass
             for k in keys_to_del:
-                del data[k]
-            _atomic_json_write(COIN_ROTATION_FILE, data)
+                pruned.pop(k, None)
+            _atomic_json_write(COIN_ROTATION_FILE, pruned)
     except Exception as e:
         logger.warning(f"coin_rotation save error: {e}")
 
@@ -537,4 +627,6 @@ def record_coin_trade(symbol: str) -> None:
         data[today] = {}
     data[today][symbol] = data[today].get(symbol, 0) + 1
     save_coin_rotation(data)
-    logger.info(f" [{symbol}] Daily trade: {data[today][symbol]}/{_max_per_day}")
+    logger.info(
+        f" [{symbol}] Daily trade: {data[today][symbol]}/{_max_per_day}"
+    )

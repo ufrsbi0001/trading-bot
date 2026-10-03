@@ -1,63 +1,31 @@
 """
 future.py — Trading engine orchestrator + main scan loop.
 
-REV 1.4.29 (2026-10-03) — SNAPSHOT-TO-LIVE FIX:
-  ✅ CRITICAL: `min_confidence`, `use_5m_trend_filter`, `risk_percent`,
-     `min_adx` were read ONCE at import into module constants, then used
-     in LOGIC (not just banner). Runtime UI changes silently ignored.
-     Now every logic-path read goes LIVE via CC.get(...).
-       • _conf_ok   = conf >= _cc_get_num("min_confidence")   [was MIN_CONFIDENCE]
-       • 5m gate    = CC.get("use_5m_trend_filter")           [was USE_5M_TREND_FILTER]
-       • risk       = _cc_get_num("risk_percent")  in _compute_est_qty
-       • ADX floor  = _cc_get_num("min_adx")                  [was MIN_ADX]
-     Module snapshots RETAINED for banner/log at import (correct — a
-     one-time reflection of .env, any runtime drift is exposed by
-     config_center itself).
-  ✅ FIXED: active_trades_list now iterates POSITIONS (not coins). Any
-     open position whose symbol isn't in the coin universe (manual entry,
-     removed coin) is now counted by the same-side correlation gate.
-     Prevents silent over-exposure.
-  ✅ FIXED: _fetch_coin_indicators cached-1h path no longer refetches
-     klines twice. 1h df is fetched ONCE up front and reused for both
-     cache-hit and candle_time.
-  ✅ _update_btc_regime() reuses the indicator 1h cache when fresh
-     (TTL 300s vs scan cadence ~15s). Saves ~20 redundant API calls
-     per cycle when BTC is in the coin universe.
-  ✅ Removed @lru_cache on _get_min_adx_for_coin — it was caching a
-     now-live fallback read.
-  ✅ Module top comment corrected — snapshots are "banner only" and
-     the LIVE-read rule is documented inline.
+REV 1.4.30 (2026-10-03) — DD KILL-SWITCH + ORPHAN ADOPTION:
+  ✅ CRITICAL: DD kill-switch now ACTUALLY flattens positions.
+     Previously `is_limit_reached()` returning True only skipped new
+     entries — open positions kept bleeding. The limit existed for
+     the flash-crash scenario it could not protect against.
+     New `_execute_dd_halt()`:
+       • snapshots active_trades + queries exchange positions
+       • calls emergency_close_retry per symbol
+       • cancels all remaining reduce-only orders (belt + braces)
+       • writes PAUSE_FILE with DD_HALT marker
+       • request_stop() — main loop exits cleanly
+       • sends Telegram alert
+     Idempotent — safe to call repeatedly.
+  ✅ CRITICAL: `_reconcile_on_startup()` now ADOPTS orphan positions.
+     A position on the exchange with no active_trades entry (e.g.
+     from a lost-response entry) is registered as unverified and
+     added to bot_tracked_symbols, so the trade manager will place
+     its SL next cycle. Previously it was silently ignored — naked
+     forever.
+  ✅ startup_checks() called after set_client_keys — verifies SDK
+     methods + position mode before any trading begins.
 
-REV 1.4.28 (2026-10-02) — LIVE CONFIG READS (post-migration).
-REV 1.4.27 (2026-10-02) — DEAD RE-EXPORT CLEANUP.
-REV 1.4.26 (2026-10-02) — PHASE 3 CLEANUP.
-REV 1.4.25 (2026-10-02) — UNIFIED CONFIG CLEANUP.
-REV 1.4.24 (2026-09-30) — DYNAMIC STARTUP BANNER VALUES.
-REV 1.4.23 (2026-09-30) — FIX Bug #1: PRE-CHECKS BEFORE DECISION ENGINE.
-REV 1.4.22 (2026-09-30) — HOIST STRATEGY EXTRACT.
-REV 1.4.21 (2026-09-30) — CONDITIONAL 5M FILTER + RENAME.
-REV 1.4.20 (2026-09-29) — SAME-SIDE RACE FIX.
-REV 1.4.19 (2026-09-29) — FULL SCAN (PHASE 1 REMOVED).
-REV 1.4.18 (2026-09-29) — DIAGNOSTIC + SPREAD CAP WIRING.
-REV 1.4.17 (2026-09-29) — PER-FAMILY SPREAD + STARTUP RECONCILE.
-REV 1.4.16 (2026-09-29) — SPREAD FILTER WIRED IN.
-REV 1.4.15 (2026-09-29) — FAST-SKIP + PARALLEL FETCH + 5M PRE-GATE.
-REV 1.4.14 (2026-09-29) — SIGNAL_PRICE PROPAGATION.
-REV 1.4.13 (2026-09-29) — MTF GATE REMOVED (DUPLICATE FILTER).
-REV 1.4.12 (2026-09-29) — BTC REGIME WIRING FOR REV 1.0.5.
-REV 1.4.11 (2026-09-28) — PRE-GATE DIAGNOSTICS + MINADX BANNER.
-REV 1.4.10 (2026-09-28) — UNUSED RE-EXPORTS REMOVED.
-REV 1.4.9 (2026-09-28) — DEAD RE-EXPORTS REMOVED.
-REV 1.4.8 (2026-09-28) — DEAD MIN_ADX FLOOR FIX + GETATTR CLEANUP.
-REV 1.4.7 (2026-09-28) — LAZY STRATEGY EXTRACTION.
-REV 1.4.6 (2026-09-28) — DEAD __getattr__ PROXY REMOVED.
-REV 1.4.5 (2026-09-28) — HOISTED STRATEGY EXTRACTION.
-REV 1.4.4 (2026-09-28) — DECISION ENGINE GATE.
-REV 1.4.3 (2026-09-26) — MTF COUNTER FIX + DEAD IMPORTS.
-REV 1.4.2 (2026-09-26) — REMOVED DEAD CONFIG REFERENCE.
-REV 1.4.1 (2026-09-25) — IDIOMATIC FAMILY LOOKUP.
-REV 1.4.0 (2026-09-24) — PHASE 3 MTF CONFLUENCE GATE.
-REV 1.3.9 (2026-09-24) — N+1 API FIX IN SCAN LOOP.
+REV 1.4.29 (2026-10-03) — SNAPSHOT-TO-LIVE FIX (retained).
+REV 1.4.28 (2026-10-02) — LIVE CONFIG READS (retained).
+...
 """
 from __future__ import annotations
 
@@ -68,11 +36,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 
-from core.config import CONFIG           # env-only fields (api_key, bot_coins, ...)
-from core import config_center as CC     # trading params (live reads)
+from core.config import CONFIG
+from core import config_center as CC
 from core.coins_config import get_family
 
-# ── REV 1.4.25 — Unified config source for BE/LOCK banner ──
 from core.config_center import VOL_CLASS_R_THRESHOLDS as _VOL_CLASS_R_THRESHOLDS
 
 import core.client as _c
@@ -83,7 +50,6 @@ import signals.router as _fr
 
 from core.client import logger
 
-# ─── REV 1.4.21 — counter-trend classification for 5m filter ───
 try:
     from signals.decision_engine import COUNTER_TREND_STRATEGIES as _CT_STRATEGIES
 except Exception:
@@ -92,8 +58,6 @@ except Exception:
 
 # ═════════════════════════════════════════════════════════════
 #  REV 1.4.29 — 0-PRESERVING CC NUMERIC READ
-#  Mirrors orders/exit.py REV 1.6.1 / entry.py REV 1.8.1 /
-#  manage.py REV 1.9.1 / decision_engine.py REV 4.3.
 # ═════════════════════════════════════════════════════════════
 def _cc_get_num(key: str, default):
     v = CC.get(key, None)
@@ -101,7 +65,7 @@ def _cc_get_num(key: str, default):
 
 
 # ─────────────────────────────────────────────────────────────
-# RE-EXPORTS
+# RE-EXPORTS (unchanged)
 # ─────────────────────────────────────────────────────────────
 set_client_keys           = _c.set_client_keys
 _validate_api_credentials = _c._validate_api_credentials
@@ -180,11 +144,6 @@ cleanup_indicator_cache   = _i.cleanup_indicator_cache
 
 # ═════════════════════════════════════════════════════════════
 #  MODULE-LEVEL SNAPSHOTS — BANNER/LOG ONLY
-#  ►►► READ THEM ONLY IN print/log statements. ◄◄◄
-#  Any FILTER / GATE / LOGIC check must read LIVE via CC.get() so
-#  runtime update_runtime() takes effect without restart.
-#  See REV 1.4.29 — earlier revisions mistakenly used these in
-#  gates (min_confidence, use_5m_trend_filter).
 # ═════════════════════════════════════════════════════════════
 RISK_PERCENT               = CC.get('risk_percent')
 MAX_OPEN_POSITIONS         = CC.get('max_open_positions')
@@ -196,7 +155,6 @@ USE_5M_TREND_FILTER        = CC.get('use_5m_trend_filter')
 FG_ENABLED                 = CC.get('fg_enabled')
 LEVERAGE                   = CC.get('leverage')
 
-# ── Env-only flags (from core/config.py, NOT config_center) ──
 DRY_RUN                    = CONFIG.dry_run
 DEMO_MODE                  = CONFIG.demo_mode
 TESTNET                    = CONFIG.testnet
@@ -211,15 +169,14 @@ PAUSE_FILE        = _s.PAUSE_FILE
 _PARALLEL_FETCH_WORKERS = 8
 
 
-def _get_min_adx_for_coin(symbol: str) -> float:
-    """
-    Effective min-ADX gate for a symbol (family-loosest floor).
+# ═════════════════════════════════════════════════════════════
+#  REV 1.4.30 — DD KILL-SWITCH STATE
+#  Module-level guard so halt fires at most once per process.
+# ═════════════════════════════════════════════════════════════
+_DD_HALT_FLAG = {'halted': False, 'reason': ''}
 
-    REV 1.4.29 — fallback reads LIVE from config_center.
-    REMOVED @lru_cache: the function now reads a live value on the
-    fallback path, so caching would defeat runtime updates. The cost
-    is negligible (called once per coin per cycle).
-    """
+
+def _get_min_adx_for_coin(symbol: str) -> float:
     if not symbol:
         return float(_cc_get_num("min_adx", 22))
     sym_upper = symbol.upper()
@@ -237,7 +194,6 @@ def _get_min_adx_for_coin(symbol: str) -> float:
 
 
 def _get_spread_cap_for_family(family: str) -> float:
-    """Per-family spread cap — reads LIVE from config_center."""
     try:
         if family == "trend_coins":
             return float(CC.get('max_spread_trend', CC.get('max_spread_pct')))
@@ -250,8 +206,19 @@ def _get_spread_cap_for_family(family: str) -> float:
     return float(CC.get('max_spread_pct'))
 
 
+# ═════════════════════════════════════════════════════════════
+#  REV 1.4.30 — ORPHAN ADOPTION IN STARTUP RECONCILE
+# ═════════════════════════════════════════════════════════════
 def _reconcile_on_startup():
-    """Startup position reconcile (uses removesuffix)."""
+    """
+    Reconcile tracked state with real exchange positions.
+
+    REV 1.4.30 — ADOPTS orphan positions: any position on the exchange
+    with no active_trades entry (e.g. from a lost-response entry, or a
+    previous crash mid-fill) is registered as unverified and added to
+    bot_tracked_symbols so the trade manager will place its SL next
+    cycle. Previously these were silently ignored and stayed naked.
+    """
     try:
         client = _c.get_client()
         if client is None:
@@ -262,29 +229,212 @@ def _reconcile_on_startup():
             for p in (pos_all or [])
             if abs(float(p.get('positionAmt', 0) or 0)) > 0
         }
+
+        # 1) Drop tracked symbols with no real position AND no active file.
         with _s.BOT_TRACKED_LOCK:
             tracked = set(_s.bot_tracked_symbols)
             for sym in tracked:
                 if sym not in real_positions:
                     if not _s.get_active_trade(sym):
                         _s.bot_tracked_symbols.discard(sym)
-                        logger.info(f"[RECONCILE-STARTUP] {sym} tracked but no real pos -> removed")
-        with _s.BOT_TRACKED_LOCK:
-            for sym in real_positions:
-                if sym not in _s.bot_tracked_symbols:
-                    if _s.get_active_trade(sym):
-                        _s.bot_tracked_symbols.add(sym)
-                        logger.info(f"[RECONCILE-STARTUP] {sym} real pos + active file -> re-tracked")
-        logger.info(f"[RECONCILE-STARTUP] done — {len(real_positions)} real positions, {len(_s.bot_tracked_symbols)} tracked")
+                        logger.info(
+                            f"[RECONCILE-STARTUP] {sym} tracked but no "
+                            f"real pos -> removed"
+                        )
+
+        # 2) Re-track known positions / adopt orphans.
+        adopted = 0
+        retracked = 0
+        for sym, p in real_positions.items():
+            if sym in _s.bot_tracked_symbols:
+                continue
+            if _s.get_active_trade(sym):
+                with _s.BOT_TRACKED_LOCK:
+                    _s.bot_tracked_symbols.add(sym)
+                retracked += 1
+                logger.info(
+                    f"[RECONCILE-STARTUP] {sym} real pos + active file "
+                    f"-> re-tracked"
+                )
+                continue
+
+            # ─── ADOPT ORPHAN ───
+            try:
+                amt = float(p.get('positionAmt', 0) or 0)
+                entry_px = float(p.get('entryPrice', 0) or 0)
+                side_str = 'BUY' if amt > 0 else 'SELL'
+                qty_str = str(abs(amt))
+                _s.add_active_trade(sym, {
+                    'entry': entry_px,
+                    'qty': qty_str,
+                    'sl': '0', 'tp1': '0', 'tp2': '0',
+                    'side': side_str,
+                    'entry_time': datetime.now(PKT).strftime(
+                        '%Y-%m-%d %I:%M:%S %p'
+                    ),
+                    'sl_id': 0, 'sl_level': 0,
+                    'initial_sl': 0.0,
+                    'unverified': True,
+                    'adopted_at_startup': True,
+                    'strategy': 'ADOPTED',
+                })
+                with _s.BOT_TRACKED_LOCK:
+                    _s.bot_tracked_symbols.add(sym)
+                adopted += 1
+                logger.warning(
+                    f"[RECONCILE-STARTUP] ADOPTED orphan {sym} "
+                    f"(amt={amt}, entry={entry_px}) — will protect next cycle"
+                )
+                try:
+                    _c.send_telegram(
+                        f"⚠️ Adopted orphan {sym} (amt={amt}) — "
+                        f"placing SL shortly"
+                    )
+                except Exception:
+                    pass
+            except Exception as ae:
+                logger.error(f"[RECONCILE-STARTUP] adopt {sym} failed: {ae}")
+
+        logger.info(
+            f"[RECONCILE-STARTUP] done — {len(real_positions)} real "
+            f"positions | re-tracked={retracked} | adopted={adopted} | "
+            f"tracked={len(_s.bot_tracked_symbols)}"
+        )
     except Exception as e:
         logger.warning(f"[RECONCILE-STARTUP] failed: {e}")
 
 
+# ═════════════════════════════════════════════════════════════
+#  REV 1.4.30 — DD KILL-SWITCH (FLATTEN + HALT)
+# ═════════════════════════════════════════════════════════════
+def _execute_dd_halt(reason: str) -> None:
+    """
+    DD kill-switch: flatten ALL open positions, cancel remaining
+    orders, write PAUSE_FILE, request stop.
+
+    Idempotent — safe to call multiple times. Second call returns
+    immediately.
+    """
+    if _DD_HALT_FLAG['halted']:
+        return
+    _DD_HALT_FLAG['halted'] = True
+    _DD_HALT_FLAG['reason'] = reason
+
+    logger.critical(f"[DD-HALT] KILL-SWITCH TRIGGERED: {reason}")
+    try:
+        _c.send_telegram(
+            f"🛑 DD KILL-SWITCH: {reason}\n"
+            f"Flattening all positions and halting bot..."
+        )
+    except Exception:
+        pass
+
+    # Snapshot symbols from local state.
+    try:
+        with _s.ACTIVE_TRADES_LOCK:
+            symbols_to_close = list(_s.active_trades.keys())
+    except Exception as e:
+        logger.critical(f"[DD-HALT] snapshot active_trades failed: {e}")
+        symbols_to_close = []
+
+    # Also scan the exchange for any position we might be missing.
+    try:
+        client = _c.get_client()
+        if client is not None:
+            pos_all = client.futures_position_information()
+            for p in (pos_all or []):
+                try:
+                    amt = float(p.get('positionAmt', 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if amt == 0:
+                    continue
+                sym_short = (p.get('symbol') or '').removesuffix('USDT')
+                if sym_short and sym_short not in symbols_to_close:
+                    symbols_to_close.append(sym_short)
+    except Exception as e:
+        logger.warning(f"[DD-HALT] exchange position scan failed: {e}")
+
+    logger.critical(
+        f"[DD-HALT] closing {len(symbols_to_close)} position(s): "
+        f"{symbols_to_close}"
+    )
+
+    # ─── Flatten each position ───
+    closed = 0
+    failed = []
+    for sym in symbols_to_close:
+        pair = sym + 'USDT'
+        try:
+            pos = _c.fetch_position_raw(sym)
+            if pos is None:
+                logger.warning(
+                    f"[DD-HALT] {sym}: position fetch failed — cannot "
+                    f"determine side; marking for manual check"
+                )
+                failed.append(sym)
+                continue
+            amt = float(pos.get('positionAmt', 0) or 0)
+            if amt == 0:
+                closed += 1
+                continue
+            close_side = 'SELL' if amt > 0 else 'BUY'
+            try:
+                _o.emergency_close_retry(sym, pair, close_side)
+                closed += 1
+                logger.info(f"[DD-HALT] {sym} closed ({close_side})")
+            except Exception as ce:
+                logger.critical(f"[DD-HALT] close {sym} failed: {ce}")
+                failed.append(sym)
+        except Exception as e:
+            logger.critical(f"[DD-HALT] unexpected close failure {sym}: {e}")
+            failed.append(sym)
+
+    # ─── Cancel remaining reduce-only orders (belt + braces) ───
+    try:
+        for sym in symbols_to_close:
+            try:
+                _o.cancel_orphan_bot_orders(sym + 'USDT', force=True)
+            except Exception as _cbe:
+                logger.debug(f"[DD-HALT] cancel_orphan {sym}: {_cbe}")
+    except Exception:
+        pass
+
+    # ─── Persist halt so a restart does not resume trading ───
+    try:
+        with open(PAUSE_FILE, 'w', encoding='utf-8') as f:
+            f.write(
+                f"DD_HALT\n"
+                f"reason={reason}\n"
+                f"ts={datetime.now(PKT).isoformat()}\n"
+                f"closed={closed}\n"
+                f"failed={failed}\n"
+            )
+    except Exception as e:
+        logger.critical(f"[DD-HALT] write PAUSE_FILE failed: {e}")
+
+    # ─── Signal all loops to exit ───
+    try:
+        _s.request_stop()
+    except Exception:
+        pass
+
+    try:
+        _c.send_telegram(
+            f"🛑 DD HALT COMPLETE\n"
+            f"Reason: {reason}\n"
+            f"Closed: {closed}, Failed: {failed}\n"
+            f"Bot stopped. Remove {PAUSE_FILE} to resume."
+        )
+    except Exception:
+        pass
+
+    logger.critical(
+        f"[DD-HALT] halt complete. closed={closed} failed={failed}"
+    )
+
+
 def _format_be_lock_config() -> str:
-    """
-    Returns a single string like:
-        "BE/LOCK per-class [LOW BE0.7R L1@1.0R L2@1.6R | MED ...]"
-    """
     per_class = _VOL_CLASS_R_THRESHOLDS
     parts: list[str] = []
     for cls in ("LOW", "MED", "HIGH"):
@@ -309,7 +459,6 @@ def stop_bot() -> None:
 
 
 def _extract_family_rejection(reasons: list) -> str:
-    """Extract the raw family-router rejection summary."""
     for r in (reasons or []):
         if not isinstance(r, str):
             continue
@@ -322,13 +471,8 @@ def _extract_family_rejection(reasons: list) -> str:
     return ""
 
 
-def _format_skip_reasons(reasons, sig_1h, conf, lvl, min_rr, adx_v, min_adx) -> str:
-    """
-    Surface the ACTUAL family-router rejection reason.
-
-    REV 1.4.29 — reads min_confidence LIVE (was module snapshot; a UI
-    change to min_confidence would show a stale SKIP reason).
-    """
+def _format_skip_reasons(reasons, sig_1h, conf, lvl, min_rr,
+                         adx_v, min_adx) -> str:
     family_rej = _extract_family_rejection(reasons)
     if family_rej:
         return f"SKIP ({family_rej})"
@@ -369,18 +513,8 @@ def _display_tf_signal(ind: dict | None) -> str:
     return "NEUTRAL"
 
 
-def _compute_est_qty(balance: float, live_price: float, sl_price: float) -> float:
-    """
-    Pre-flight qty estimate for place_order_fixed's initial arg.
-
-    REV 1.4.29 — risk_percent read LIVE. (place_order_fixed
-    recalculates qty internally from the same live value; the value
-    we pass is a fallback if its internal calc fails. Still, reading
-    live keeps the log line accurate.)
-
-    NOTE: 0-preserving helper — risk_percent=0 is a valid (if
-    ill-advised) config and should not silently become the default.
-    """
+def _compute_est_qty(balance: float, live_price: float,
+                     sl_price: float) -> float:
     try:
         if live_price <= 0 or sl_price <= 0 or balance <= 0:
             return 0.0
@@ -409,10 +543,6 @@ def _extract_strategy(reasons: list) -> str:
 
 
 def _spread_label() -> str:
-    """
-    REV 1.4.28 — per-family spread filter state.
-    REV 1.4.29 — 0-preserving reads via _cc_get_num.
-    """
     if not CC.get("use_spread_filter", True):
         return "OFF"
     _g = _cc_get_num("max_spread_pct", 0.15)
@@ -424,17 +554,7 @@ def _spread_label() -> str:
 
 
 def _update_btc_regime() -> None:
-    """
-    Compute BTC 1h regime, push into decision_engine (once per cycle).
-
-    REV 1.4.29 — reuses the market.indicators 1h cache when fresh
-    (TTL 300s). If BTC is in the coin universe, its indicators were
-    already computed by the parallel fetch and cached — we reuse them
-    instead of recomputing. Fallback (BTC not in universe / cache cold)
-    fetches fresh and populates the cache for next cycle.
-    """
     try:
-        # Try the indicator cache first — likely populated by the scan.
         cached = _i.get_cached_indicator("BTCUSDT", "1h")
         if cached is not None:
             btc_ind = cached
@@ -448,7 +568,6 @@ def _update_btc_regime() -> None:
             )
             if not btc_ind:
                 return
-            # Cache the computed result so the next cycle can reuse it.
             try:
                 _i.set_cached_indicator("BTCUSDT", "1h", btc_ind)
             except Exception:
@@ -467,19 +586,9 @@ def _update_btc_regime() -> None:
 
 
 def _fetch_coin_indicators(coin: str) -> tuple:
-    """
-    Thread-safe klines fetch + indicator computation for one coin.
-
-    REV 1.4.29 — the 1h raw df is fetched ONCE up front and reused
-    for both the cache-hit path and candle_time downstream. The old
-    code refetched klines a second time when 1h was cached (cost:
-    ~1 extra API call per cached coin per cycle).
-    """
     dfs_closed: dict = {}
     results: dict = {}
     try:
-        # Fetch the 1h raw df ONCE. It's the only df downstream code
-        # actually reads (candle_time), so we never need to refetch.
         df_1h_raw = _c.get_binance_klines(coin, "1h")
         if df_1h_raw is not None and len(df_1h_raw) > 1:
             df_1h_closed = df_1h_raw.iloc[:-1]
@@ -534,7 +643,6 @@ def main_loop():
     _cfg = _i.get_trading_config()
     _be_lock_str = _format_be_lock_config()
 
-    # ── Banner block: module snapshots are FINE here (one-time log) ──
     logger.info(f"PRO TRADING v13.3.22 - {TRADING_MODE} | Risk {RISK_PERCENT}% | "
                 f"Max {MAX_OPEN_POSITIONS} | DD {MAX_DAILY_DRAWDOWN_PERCENT}% | "
                 f"Lev {LEVERAGE}x | MinADX {MIN_ADX}(fallback) | "
@@ -554,7 +662,9 @@ def main_loop():
         if _floor_parts:
             logger.info("MinADX per-family floors: " + " | ".join(_floor_parts))
         else:
-            logger.info(f"MinADX per-family floors: none — using fallback {MIN_ADX}")
+            logger.info(
+                f"MinADX per-family floors: none — using fallback {MIN_ADX}"
+            )
     except Exception as _mfe:
         logger.debug(f"per-family MinADX log failed: {_mfe}")
 
@@ -568,17 +678,17 @@ def main_loop():
 
     logger.info(f" {_be_lock_str}")
     logger.info(f"Signal engine: family_router (4 families)")
-
     logger.info(f"Spread filter: {_spread_label()}")
 
-    # ── Banner: module snapshot for USE_5M_TREND_FILTER is fine here ──
     logger.info(
-        f"5m trend filter: {'ON (trend-following only — counter-trend bypass)' if USE_5M_TREND_FILTER else 'OFF'}"
+        f"5m trend filter: "
+        f"{'ON (trend-following only — counter-trend bypass)' if USE_5M_TREND_FILTER else 'OFF'}"
     )
 
     _debug_flag = os.getenv("DEBUG_STRATEGY", "false").strip().lower() == "true"
     logger.info(
-        f"Strategy debug: {'✅ ON (per-coin rejections logged)' if _debug_flag else '⚠️ OFF'}"
+        f"Strategy debug: "
+        f"{'✅ ON (per-coin rejections logged)' if _debug_flag else '⚠️ OFF'}"
     )
 
     try:
@@ -595,22 +705,35 @@ def main_loop():
 
     try:
         import signals.decision_engine  # noqa: F401
-        logger.info(f"Decision engine: ✅ active (6-filter vote, {_MA_BANNER}/6 required)")
-        logger.info("BTC-bias gate:   ✅ ACTIVE (REV 1.0.5) — updated each scan cycle")
-        logger.info("MTF gate:        ✅ decision_engine only (REV 1.4.13 — hard-gate removed)")
+        logger.info(
+            f"Decision engine: ✅ active (6-filter vote, {_MA_BANNER}/6 required)"
+        )
+        logger.info(
+            "BTC-bias gate:   ✅ ACTIVE (REV 1.0.5) — updated each scan cycle"
+        )
+        logger.info(
+            "MTF gate:        ✅ decision_engine only "
+            "(REV 1.4.13 — hard-gate removed)"
+        )
     except Exception as e:
-        logger.warning(f"Decision engine: ❌ not loaded ({e}) — trade gate DISABLED")
+        logger.warning(
+            f"Decision engine: ❌ not loaded ({e}) — trade gate DISABLED"
+        )
 
     logger.info(f"Scan: parallel fetch (workers={_PARALLEL_FETCH_WORKERS})")
-    logger.info(f"Running in TUNED mode — MIN_APPROVALS={_MA_BANNER}/6, "
-                f"counter_trend_cutoff=35, st_rsi_sell_floor per-family")
+    logger.info(
+        f"Running in TUNED mode — MIN_APPROVALS={_MA_BANNER}/6, "
+        f"counter_trend_cutoff=35, st_rsi_sell_floor per-family"
+    )
 
     _o.sync_existing_positions()
 
     with _s.BOT_TRACKED_LOCK:
         startup_syms = list(_s.bot_tracked_symbols)
     if startup_syms:
-        logger.info(f" Startup reconciliation for {len(startup_syms)} symbols...")
+        logger.info(
+            f" Startup reconciliation for {len(startup_syms)} symbols..."
+        )
         for s in startup_syms:
             try:
                 _o.reconcile_active_trade(s)
@@ -626,7 +749,9 @@ def main_loop():
 
     try:
         _c.refresh_timestamp()
-        bal_init = float(_c.get_client().futures_account()['totalWalletBalance'])
+        bal_init = float(
+            _c.get_client().futures_account()['totalWalletBalance']
+        )
         _s.daily_tracker.reset_if_new_day(bal_init)
         _s.daily_tracker.update_peak(bal_init)
     except Exception as e:
@@ -644,8 +769,24 @@ def main_loop():
         while not _s.is_stopped():
             try:
                 if Path(PAUSE_FILE).exists():
-                    logger.info(" PAUSE file detected - paused 30s.")
-                    time.sleep(30); continue
+                    # REV 1.4.30 — surface DD_HALT files loudly.
+                    _pause_reason = "unknown"
+                    try:
+                        _pause_reason = Path(PAUSE_FILE).read_text(
+                            encoding='utf-8'
+                        ).strip().splitlines()[0]
+                    except Exception:
+                        pass
+                    if 'DD_HALT' in _pause_reason:
+                        logger.critical(
+                            f"⛔ PAUSE file present with DD_HALT marker — "
+                            f"bot will not resume trading. Remove "
+                            f"{PAUSE_FILE} manually after review."
+                        )
+                    else:
+                        logger.info(" PAUSE file detected - paused 30s.")
+                    time.sleep(30)
+                    continue
 
                 fg_value, fg_class = _i.get_fear_greed_index()
                 live_prices = _c.get_live_prices()
@@ -665,26 +806,28 @@ def main_loop():
                     if not degraded:
                         _s.daily_tracker.update_peak(balance)
                 except Exception as e:
-                    logger.error(f"Balance fetch failed (no last-good): {e} — pausing")
-                    time.sleep(30); continue
+                    logger.error(
+                        f"Balance fetch failed (no last-good): {e} — pausing"
+                    )
+                    time.sleep(30)
+                    continue
 
                 if degraded:
-                    logger.warning("🔶 Degraded mode — skipping new entries this cycle")
-                    time.sleep(30); continue
+                    logger.warning(
+                        "🔶 Degraded mode — skipping new entries this cycle"
+                    )
+                    time.sleep(30)
+                    continue
 
+                # ═══════════════════════════════════════════════════
+                #  REV 1.4.30 — DD KILL-SWITCH: FLATTEN, DO NOT SKIP
+                # ═══════════════════════════════════════════════════
                 is_limited, reason = _s.daily_tracker.is_limit_reached(balance)
                 if is_limited:
-                    logger.warning(f" Daily limit: {reason}. Paused 60s.")
-                    time.sleep(60); continue
+                    _execute_dd_halt(reason)
+                    break  # exit main loop; finally block saves cooldowns
 
-                # ═══════════════════════════════════════════════════════
-                #  REV 1.4.29 — active_trades_list from POSITIONS, not coins
-                #  Iterating coins silently dropped any open position whose
-                #  symbol wasn't in the coin universe (manual entry, removed
-                #  coin). The same-side correlation gate would then under-
-                #  count and permit over-exposure. Iterate the actual
-                #  position map — matches what the exchange sees.
-                # ═══════════════════════════════════════════════════════
+                # active_trades_list from POSITIONS (unchanged)
                 active_trades_list = []
                 try:
                     _positions_all = _c.get_client().futures_position_information()
@@ -702,7 +845,9 @@ def main_loop():
                         except TypeError:
                             st = _o.get_trade_status(_sym_short)
                         except Exception as _tse:
-                            logger.debug(f"get_trade_status({_sym_short}) failed: {_tse}")
+                            logger.debug(
+                                f"get_trade_status({_sym_short}) failed: {_tse}"
+                            )
                             st = None
                         if st:
                             active_trades_list.append(st)
@@ -710,7 +855,9 @@ def main_loop():
                     logger.debug(f"batch position fetch failed: {_pex}")
 
                 if active_trades_list:
-                    logger.info(f" {len(active_trades_list)} active | Bal ${balance:.2f}")
+                    logger.info(
+                        f" {len(active_trades_list)} active | Bal ${balance:.2f}"
+                    )
                 else:
                     logger.info(f" No active trades | Bal ${balance:.2f}")
 
@@ -719,9 +866,6 @@ def main_loop():
 
                 candidates = list(coins)
 
-                # ═══════════════════════════════════════════════════════
-                #  PHASE 2 — PARALLEL FETCH
-                # ═══════════════════════════════════════════════════════
                 indicators_by_coin: dict = {}
                 if candidates:
                     try:
@@ -757,9 +901,6 @@ def main_loop():
                             except Exception:
                                 continue
 
-                # ═══════════════════════════════════════════════════════
-                #  PHASE 3 — SERIAL EVALUATION
-                # ═══════════════════════════════════════════════════════
                 for coin in candidates:
                     results, dfs_closed = indicators_by_coin.get(coin, ({}, {}))
                     ind_1h = results.get('1h')
@@ -811,24 +952,18 @@ def main_loop():
                     trade_side = None
                     skip_reason = None
                     strategy_name = "UNKNOWN"
-
                     _strategy_name_for_check = "UNKNOWN"
 
                     _is_buy  = ("STRONG_BUY"  in sig_1h or sig_1h == "BUY")
                     _is_sell = ("STRONG_SELL" in sig_1h or sig_1h == "SELL")
 
                     if _is_buy or _is_sell:
-                        # ── REV 1.4.29 — LIVE reads for gates ──
                         _conf_ok = conf >= float(_cc_get_num("min_confidence", 60))
                         _rr_ok   = lvl.get('RR', 0) >= min_rr
                         _adx_ok  = ind_1h['adx'] >= min_adx_here
 
                         _side_temp = 'BUY' if _is_buy else 'SELL'
 
-                        # ═══════════════════════════════════════════════
-                        #  REV 1.4.21 — CONDITIONAL 5M TREND FILTER
-                        #  REV 1.4.29 — flag read LIVE (was snapshot)
-                        # ═══════════════════════════════════════════════
                         _trend_ok = True
                         _trend_reason = ""
                         _strategy_name_for_check = _extract_strategy(reasons)
@@ -958,9 +1093,11 @@ def main_loop():
                                 signal_price=_signal_price,
                             )
                         except Exception as order_err:
-                            logger.error(f"[{symbol}] place_order_fixed RAISED: "
-                                         f"{type(order_err).__name__}: {order_err}",
-                                         exc_info=True)
+                            logger.error(
+                                f"[{symbol}] place_order_fixed RAISED: "
+                                f"{type(order_err).__name__}: {order_err}",
+                                exc_info=True,
+                            )
                             order_succeeded = False
 
                         if order_succeeded:
@@ -982,7 +1119,8 @@ def main_loop():
                                     })
                             except Exception as _ase:
                                 logger.debug(
-                                    f"[{symbol}] local active_trades append failed: {_ase}"
+                                    f"[{symbol}] local active_trades append "
+                                    f"failed: {_ase}"
                                 )
                                 active_trades_list.append({
                                     'symbol': symbol,
@@ -1022,9 +1160,11 @@ def main_loop():
                     ts += f" | {len(_s.bot_tracked_symbols)} active"
                 _s.set_scan_results(scan_rows, ts)
 
-                logger.info(f" Scan completed {ts} | "
-                            f"Trade Executed: {trade_executed} | "
-                            f"{_s.get_v2_stats_str()}")
+                logger.info(
+                    f" Scan completed {ts} | "
+                    f"Trade Executed: {trade_executed} | "
+                    f"{_s.get_v2_stats_str()}"
+                )
                 _i.cleanup_indicator_cache()
                 _s.cleanup_entry_candles()
 
@@ -1047,6 +1187,9 @@ def main_loop():
             logger.warning(f"save_cooldowns on exit failed: {e}")
 
 
+# ═════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     from core.config import print_config_banner
     from getpass import getpass
@@ -1065,14 +1208,24 @@ if __name__ == "__main__":
         confirm = input(f"MAINNET with real funds (Lev {LEVERAGE}x, "
                         f"Risk {RISK_PERCENT}%). Type 'YES': ")
         if confirm != "YES":
-            logger.info("Exiting."); sys.exit()
+            logger.info("Exiting.")
+            sys.exit()
 
     api_key = CONFIG.api_key
     api_secret = CONFIG.api_secret
     if not api_key or not api_secret:
         api_key = getpass("Enter API Key: ").strip().strip('"').strip("'")
         api_secret = getpass("Enter Secret Key: ").strip().strip('"').strip("'")
+
     _c.set_client_keys(api_key, api_secret)
+
+    # REV 1.4.30 — startup integrity checks (SDK methods, position mode)
+    try:
+        _startup_checks = getattr(_c, 'startup_checks', None)
+        if callable(_startup_checks):
+            _startup_checks()
+    except Exception as _sce:
+        logger.warning(f"startup_checks failed: {_sce}")
 
     ok, bal = _c._validate_api_credentials(_c.get_client())
     if not ok:
